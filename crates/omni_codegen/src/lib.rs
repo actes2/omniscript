@@ -64,6 +64,9 @@ pub struct CodeGenerator<'a> {
     engine: &'a dyn InferenceEngine,
     cmp_re: Regex,
     bin_re: Regex,
+    idx_re: Regex,
+    len_re: Regex,
+    pop_re: Regex,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -72,7 +75,34 @@ impl<'a> CodeGenerator<'a> {
             engine,
             cmp_re: Regex::new(r#"^\s*(.*?)\s*(==|!=|<=|>=|<|>)\s*(.*?)\s*$"#).unwrap(),
             bin_re: Regex::new(r#"^\s*(.*?)\s*(\+|\-|\*|/|%)\s*(.*?)\s*$"#).unwrap(),
+            idx_re: Regex::new(r#"^([a-zA-Z_0-9]+)\[(.+?)\]$"#).unwrap(),
+            len_re: Regex::new(r#"^len\s*\(\s*([a-zA-Z_0-9]+)\s*\)$"#).unwrap(),
+            pop_re: Regex::new(r#"^([a-zA-Z_0-9]+)\.pop\s*\(\s*\)$"#).unwrap(),
         }
+    }
+
+    fn intern_string(
+        string_constants: &mut Vec<(String, String, usize)>,
+        counter: &mut usize,
+        text: &str,
+    ) {
+        if string_constants.iter().any(|(_, s, _)| s == text) {
+            return;
+        }
+        let const_name = format!("@.str.omni_{}", *counter);
+        *counter += 1;
+        let len_with_null = text.len() + 1; // \00
+        string_constants.push((const_name, text.to_string(), len_with_null));
+    }
+
+    fn find_string_constant<'b>(
+        string_constants: &'b [(String, String, usize)],
+        text: &str,
+    ) -> Option<(&'b str, usize)> {
+        string_constants
+            .iter()
+            .find(|(_, s, _)| s == text)
+            .map(|(c, _, len)| (c.as_str(), *len))
     }
 
     fn scan_strings_recursive(
@@ -81,6 +111,8 @@ impl<'a> CodeGenerator<'a> {
         string_constants: &mut Vec<(String, String, usize)>,
         counter: &mut usize,
     ) {
+        let quote_re = Regex::new(r#"["']([^"']+)["']"#).unwrap();
+
         for stmt in stmts {
             match stmt {
                 Statement::Print { expr } => {
@@ -88,11 +120,23 @@ impl<'a> CodeGenerator<'a> {
                     if (trimmed.starts_with('"') && trimmed.ends_with('"'))
                         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
                     {
-                        let text = trimmed[1..trimmed.len() - 1].to_string();
-                        let const_name = format!("@.str.print_{}", *counter);
-                        *counter += 1;
-                        let len_with_null = text.len() + 1; // \00
-                        string_constants.push((const_name, text, len_with_null));
+                        let text = &trimmed[1..trimmed.len() - 1];
+                        Self::intern_string(string_constants, counter, text);
+                    }
+                }
+                Statement::MapInit { entries, .. } => {
+                    for (k, _) in entries {
+                        Self::intern_string(string_constants, counter, k);
+                    }
+                }
+                Statement::IndexSet { index_expr, .. } => {
+                    for cap in quote_re.captures_iter(index_expr) {
+                        Self::intern_string(string_constants, counter, &cap[1]);
+                    }
+                }
+                Statement::Assign { expr, .. } => {
+                    for cap in quote_re.captures_iter(expr) {
+                        Self::intern_string(string_constants, counter, &cap[1]);
                     }
                 }
                 Statement::If { then_branch, else_branch, .. } => {
@@ -115,20 +159,136 @@ impl<'a> CodeGenerator<'a> {
         expr: &str,
         ir: &mut String,
         scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
     ) -> String {
         let trimmed = expr.trim();
 
-        // Integer constant
+        // 1. Integer constant
         if let Ok(num) = trimmed.parse::<i32>() {
             return num.to_string();
         }
 
-        // Binary arithmetic: a + b, x - 1, etc.
+        // 2. Builtin len(coll)
+        if let Some(caps) = self.len_re.captures(trimmed) {
+            let var_name = caps[1].trim();
+            if let Some(binding) = scope_tree.resolve(var_name) {
+                let loaded = format!("%col_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+
+                let len_res = format!("%len_res_{}", *temp_counter);
+                *temp_counter += 1;
+                if binding.type_hint.contains("omni_chan") {
+                    ir.push_str(&format!("  {} = call i64 @__omni_chan_len(i8* {})\n", len_res, loaded));
+                } else if binding.type_hint.contains("omni_map") {
+                    ir.push_str(&format!("  {} = call i64 @__omni_map_len(i8* {})\n", len_res, loaded));
+                } else {
+                    ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", len_res, loaded));
+                }
+
+                let len_32 = format!("%len_32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
+                return len_32;
+            }
+        }
+
+        // 3. Slice pop: items.pop()
+        if let Some(caps) = self.pop_re.captures(trimmed) {
+            let var_name = caps[1].trim();
+            if let Some(binding) = scope_tree.resolve(var_name) {
+                let loaded = format!("%slice_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+
+                let pop_res = format!("%pop_res_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i64 @__omni_slice_pop(i8* {})\n", pop_res, loaded));
+
+                let pop_32 = format!("%pop_32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", pop_32, pop_res));
+                return pop_32;
+            }
+        }
+
+        // 4. Index Lookup: items[i] or m["key"]
+        if let Some(caps) = self.idx_re.captures(trimmed) {
+            let var_name = caps[1].trim();
+            let idx_expr = caps[2].trim();
+            if let Some(binding) = scope_tree.resolve(var_name) {
+                let loaded = format!("%col_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+
+                if binding.type_hint.contains("omni_map") {
+                    let val_res = format!("%map_get_{}", *temp_counter);
+                    *temp_counter += 1;
+
+                    if (idx_expr.starts_with('"') && idx_expr.ends_with('"'))
+                        || (idx_expr.starts_with('\'') && idx_expr.ends_with('\''))
+                    {
+                        let text = &idx_expr[1..idx_expr.len() - 1];
+                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                str_ptr, len, len, const_name
+                            ));
+                            ir.push_str(&format!(
+                                "  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n",
+                                val_res, loaded, str_ptr
+                            ));
+                        } else {
+                            ir.push_str(&format!(
+                                "  {} = call i64 @__omni_map_get(i8* {}, i8* null)\n",
+                                val_res, loaded
+                            ));
+                        }
+                    } else {
+                        let idx_val = self.eval_val(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                        let idx_64 = format!("%idx_64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                        ir.push_str(&format!(
+                            "  {} = call i64 @__omni_map_get_int(i8* {}, i64 {})\n",
+                            val_res, loaded, idx_64
+                        ));
+                    }
+
+                    let val_32 = format!("%val_32_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val_32, val_res));
+                    return val_32;
+                } else {
+                    // Default to Slice
+                    let idx_val = self.eval_val(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                    let idx_64 = format!("%idx_64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+
+                    let val_res = format!("%slice_get_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n",
+                        val_res, loaded, idx_64
+                    ));
+
+                    let val_32 = format!("%val_32_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val_32, val_res));
+                    return val_32;
+                }
+            }
+        }
+
+        // 5. Binary arithmetic: a + b, x - 1, etc.
         if let Some(caps) = self.bin_re.captures(trimmed) {
-            let left = self.eval_val(&caps[1], ir, scope_tree, temp_counter);
+            let left = self.eval_val(&caps[1], ir, scope_tree, string_constants, temp_counter);
             let op = &caps[2];
-            let right = self.eval_val(&caps[3], ir, scope_tree, temp_counter);
+            let right = self.eval_val(&caps[3], ir, scope_tree, string_constants, temp_counter);
 
             let res_var = format!("%t_{}", *temp_counter);
             *temp_counter += 1;
@@ -146,12 +306,36 @@ impl<'a> CodeGenerator<'a> {
             return res_var;
         }
 
-        // Variable in symbol table
+        // 6. Variable in symbol table
         if let Some(binding) = scope_tree.resolve(trimmed) {
-            let res_var = format!("%t_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, binding.llvm_ptr));
-            return res_var;
+            if binding.type_hint.contains("omni_slice") {
+                let loaded = format!("%slice_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                let len_res = format!("%len_res_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", len_res, loaded));
+                let len_32 = format!("%len_32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
+                return len_32;
+            } else if binding.type_hint.contains("omni_map") {
+                let loaded = format!("%map_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                let len_res = format!("%len_res_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i64 @__omni_map_len(i8* {})\n", len_res, loaded));
+                let len_32 = format!("%len_32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
+                return len_32;
+            } else {
+                let res_var = format!("%t_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, binding.llvm_ptr));
+                return res_var;
+            }
         }
 
         "0".to_string()
@@ -163,14 +347,15 @@ impl<'a> CodeGenerator<'a> {
         cond: &str,
         ir: &mut String,
         scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
     ) -> String {
         let trimmed = cond.trim();
 
         if let Some(caps) = self.cmp_re.captures(trimmed) {
-            let left = self.eval_val(&caps[1], ir, scope_tree, temp_counter);
+            let left = self.eval_val(&caps[1], ir, scope_tree, string_constants, temp_counter);
             let op = &caps[2];
-            let right = self.eval_val(&caps[3], ir, scope_tree, temp_counter);
+            let right = self.eval_val(&caps[3], ir, scope_tree, string_constants, temp_counter);
 
             let cond_var = format!("%cond_{}", *temp_counter);
             *temp_counter += 1;
@@ -193,7 +378,7 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // Truthiness check on value != 0
-        let val = self.eval_val(trimmed, ir, scope_tree, temp_counter);
+        let val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
         let cond_var = format!("%cond_{}", *temp_counter);
         *temp_counter += 1;
         ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cond_var, val));
@@ -244,7 +429,7 @@ impl<'a> CodeGenerator<'a> {
                         scope_tree.resolve(target).unwrap().llvm_ptr.clone()
                     };
 
-                    let val = self.eval_val(expr, ir, scope_tree, temp_counter);
+                    let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
                     ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
                 }
 
@@ -261,7 +446,7 @@ impl<'a> CodeGenerator<'a> {
                     let else_lbl = format!("if_else_{}", id);
                     let merge_lbl = format!("if_merge_{}", id);
 
-                    let cond_var = self.eval_cond(condition, ir, scope_tree, temp_counter);
+                    let cond_var = self.eval_cond(condition, ir, scope_tree, string_constants, temp_counter);
 
                     if else_branch.is_some() {
                         ir.push_str(&format!(
@@ -334,7 +519,7 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
                     ir.push_str(&format!("{}:\n", cond_lbl));
 
-                    let cond_var = self.eval_cond(condition, ir, scope_tree, temp_counter);
+                    let cond_var = self.eval_cond(condition, ir, scope_tree, string_constants, temp_counter);
                     ir.push_str(&format!(
                         "  br i1 {}, label %{}, label %{}\n\n",
                         cond_var, body_lbl, exit_lbl
@@ -394,7 +579,7 @@ impl<'a> CodeGenerator<'a> {
                     let curr_val = format!("%curr_{}", id);
                     ir.push_str(&format!("  {} = load i32, i32* {}\n", curr_val, idx_ptr));
 
-                    let count_limit = self.eval_val(count, ir, scope_tree, temp_counter);
+                    let count_limit = self.eval_val(count, ir, scope_tree, string_constants, temp_counter);
                     let cmp_var = format!("%cmp_{}", id);
                     ir.push_str(&format!(
                         "  {} = icmp slt i32 {}, {}\n",
@@ -420,8 +605,12 @@ impl<'a> CodeGenerator<'a> {
                         temp,
                     )?;
 
-                    let next_val = format!("%next_{}", id);
-                    ir.push_str(&format!("  {} = add i32 {}, 1\n", next_val, curr_val));
+                    let load_for_inc = format!("%curr_inc_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load i32, i32* {}\n", load_for_inc, idx_ptr));
+                    let next_val = format!("%next_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = add i32 {}, 1\n", next_val, load_for_inc));
                     ir.push_str(&format!("  store i32 {}, i32* {}\n", next_val, idx_ptr));
 
                     scope_tree.exit_scope();
@@ -439,19 +628,19 @@ impl<'a> CodeGenerator<'a> {
                     if (trimmed.starts_with('"') && trimmed.ends_with('"'))
                         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
                     {
-                        // Print literal string via @__omni_print_str
-                        let (ref const_name, _, len) = string_constants[*cur_str_idx];
-                        *cur_str_idx += 1;
-                        let str_ptr = format!("%str_ptr_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!(
-                            "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
-                            str_ptr, len, len, const_name
-                        ));
-                        ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
+                        let text = &trimmed[1..trimmed.len() - 1];
+                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                str_ptr, len, len, const_name
+                            ));
+                            ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
+                        }
                     } else {
                         // Print integer / expression value via @__omni_print_int
-                        let val = self.eval_val(trimmed, ir, scope_tree, temp_counter);
+                        let val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
                         let val_64 = format!("%ext_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
@@ -495,7 +684,7 @@ impl<'a> CodeGenerator<'a> {
                 // 7. Return Statement
                 Statement::Return { expr } => {
                     let ret_val = if let Some(e) = expr {
-                        self.eval_val(e, ir, scope_tree, temp_counter)
+                        self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
                     } else {
                         "0".to_string()
                     };
@@ -547,7 +736,7 @@ impl<'a> CodeGenerator<'a> {
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
 
-                        let val = self.eval_val(expr, ir, scope_tree, temp_counter);
+                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
                         let val_64 = format!("%val_ext_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
@@ -604,6 +793,172 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  store i32 {}, i32* {}\n", recv_32, alloca_ptr));
                         }
                     }
+                }
+
+                // 9. Polyglot List / Slice Operations
+                Statement::ListInit {
+                    target,
+                    elements,
+                    is_scoped_decl,
+                } => {
+                    let ptr = format!("%slice_var_{}_{}", target, *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+
+                    let initial_cap = elements.len().max(4);
+                    let slice_res = format!("%slice_init_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i8* @__omni_slice_create(i64 {})\n",
+                        slice_res, initial_cap
+                    ));
+                    ir.push_str(&format!("  store i8* {}, i8** {}\n", slice_res, ptr));
+
+                    for elem in elements {
+                        let val = self.eval_val(elem, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = format!("%elem_ext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                        ir.push_str(&format!(
+                            "  call void @__omni_slice_append(i8* {}, i64 {})\n",
+                            slice_res, val_64
+                        ));
+                    }
+
+                    scope_tree.insert(
+                        target.clone(),
+                        SymbolBinding {
+                            name: target.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "i8* (omni_slice)".to_string(),
+                            is_scoped: *is_scoped_decl,
+                        },
+                    );
+                }
+
+                Statement::ListAppend { target, expr } => {
+                    if let Some(binding) = scope_tree.resolve(target) {
+                        let slice_loaded = format!("%slice_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", slice_loaded, binding.llvm_ptr));
+
+                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = format!("%app_ext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                        ir.push_str(&format!(
+                            "  call void @__omni_slice_append(i8* {}, i64 {})\n",
+                            slice_loaded, val_64
+                        ));
+                    }
+                }
+
+                // 10. Polyglot Index Assignment: `items[0] = 99`, `m["key"] = 10`
+                Statement::IndexSet {
+                    target,
+                    index_expr,
+                    val_expr,
+                } => {
+                    if let Some(binding) = scope_tree.resolve(target) {
+                        let col_loaded = format!("%col_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", col_loaded, binding.llvm_ptr));
+
+                        let val = self.eval_val(val_expr, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = format!("%val_ext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+
+                        if binding.type_hint.contains("omni_map") {
+                            let trimmed_idx = index_expr.trim();
+                            if (trimmed_idx.starts_with('"') && trimmed_idx.ends_with('"'))
+                                || (trimmed_idx.starts_with('\'') && trimmed_idx.ends_with('\''))
+                            {
+                                let text = &trimmed_idx[1..trimmed_idx.len() - 1];
+                                if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                                    let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                        str_ptr, len, len, const_name
+                                    ));
+                                    ir.push_str(&format!(
+                                        "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
+                                        col_loaded, str_ptr, val_64
+                                    ));
+                                }
+                            } else {
+                                let idx_val = self.eval_val(index_expr, ir, scope_tree, string_constants, temp_counter);
+                                let idx_64 = format!("%idx_ext_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                                ir.push_str(&format!(
+                                    "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
+                                    col_loaded, idx_64, val_64
+                                ));
+                            }
+                        } else {
+                            // Default to slice
+                            let idx_val = self.eval_val(index_expr, ir, scope_tree, string_constants, temp_counter);
+                            let idx_64 = format!("%idx_ext_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                            ir.push_str(&format!(
+                                "  call void @__omni_slice_set(i8* {}, i64 {}, i64 {})\n",
+                                col_loaded, idx_64, val_64
+                            ));
+                        }
+                    }
+                }
+
+                // 11. Polyglot Map / Dict Operations: `m = {"k": 10}`
+                Statement::MapInit {
+                    target,
+                    entries,
+                    is_scoped_decl,
+                } => {
+                    let ptr = format!("%map_var_{}_{}", target, *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+
+                    let initial_cap = entries.len().max(8);
+                    let map_res = format!("%map_init_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i8* @__omni_map_create(i64 {})\n",
+                        map_res, initial_cap
+                    ));
+                    ir.push_str(&format!("  store i8* {}, i8** {}\n", map_res, ptr));
+
+                    for (k, v) in entries {
+                        let val = self.eval_val(v, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = format!("%map_val_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+
+                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                str_ptr, len, len, const_name
+                            ));
+                            ir.push_str(&format!(
+                                "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
+                                map_res, str_ptr, val_64
+                            ));
+                        }
+                    }
+
+                    scope_tree.insert(
+                        target.clone(),
+                        SymbolBinding {
+                            name: target.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "i8* (omni_map)".to_string(),
+                            is_scoped: *is_scoped_decl,
+                        },
+                    );
                 }
 
                 // 9. Go Concurrency Spawn: `go <call_expr>`
@@ -880,5 +1235,44 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("}\n");
 
         Ok(ir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_engine::MockSynthesisEngine;
+    use omni_parser::OmniParser;
+    use omni_verify::LlvmVerifier;
+
+    #[test]
+    fn test_codegen_collections_verify() {
+        let src = r#"
+def main():
+    items = [10, 20, 30]
+    items.append(40)
+    items[0] = 99
+    scores = {"alice": 100, "bob": 200}
+    scores["carol"] = 300
+    for i in len(items):
+        print(items[i])
+    print(scores["alice"])
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("coll_codegen_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        assert!(ir.contains("__omni_slice_create"));
+        assert!(ir.contains("__omni_slice_append"));
+        assert!(ir.contains("__omni_slice_get"));
+        assert!(ir.contains("__omni_map_create"));
+        assert!(ir.contains("__omni_map_set"));
+        assert!(ir.contains("__omni_map_get"));
+
+        let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        verifier.verify_ir(&ir).expect("LLVM IR verification failed for collections");
     }
 }

@@ -1,0 +1,33 @@
+def main():
+    print("=== Testing Polyglot Slices / Lists ===")
+    items = [10, 20, 30]
+    items.append(40)
+    items[0] = 99
+
+    print("First item:")
+    print(items[0])
+    print("Second item:")
+    print(items[1])
+    print("Appended item:")
+    print(items[3])
+    print("Slice length:")
+    print(len(items))
+
+    print("Iterating over slice:")
+    for i in len(items):
+        print(items[i])
+
+    print("=== Testing Polyglot Maps / Dictionaries ===")
+    scores = {"alpha": 100, "beta": 200}
+    scores["gamma"] = 300
+
+    print("Alpha score:")
+    print(scores["alpha"])
+    print("Beta score:")
+    print(scores["beta"])
+    print("Gamma score:")
+    print(scores["gamma"])
+    print("Map length:")
+    print(len(scores))
+
+    return 0

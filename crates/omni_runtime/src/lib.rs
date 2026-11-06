@@ -9,6 +9,8 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
         native_dir.join("omni_chan.c"),
         native_dir.join("omni_value.c"),
         native_dir.join("omni_fiber.c"),
+        native_dir.join("omni_slice.c"),
+        native_dir.join("omni_map.c"),
     ]
 }
 
@@ -44,6 +46,27 @@ declare i8* @__omni_fiber_create(void (i8*)*, i8*, i64)
 declare void @__omni_fiber_yield()
 declare void @__omni_fiber_destroy(i8*)
 declare void @__omni_go_spawn(void (i8*)*, i8*)
+
+; Polyglot Collections (Slices / Lists)
+declare i8* @__omni_slice_create(i64)
+declare void @__omni_slice_append(i8*, i64)
+declare i64 @__omni_slice_get(i8*, i64)
+declare void @__omni_slice_set(i8*, i64, i64)
+declare i64 @__omni_slice_len(i8*)
+declare i64 @__omni_slice_pop(i8*)
+declare void @__omni_slice_destroy(i8*)
+
+; Polyglot Collections (Hash Maps / Dicts)
+declare i8* @__omni_map_create(i64)
+declare void @__omni_map_set(i8*, i8*, i64)
+declare i64 @__omni_map_get(i8*, i8*)
+declare i1 @__omni_map_contains(i8*, i8*)
+declare void @__omni_map_delete(i8*, i8*)
+declare i64 @__omni_map_len(i8*)
+declare void @__omni_map_destroy(i8*)
+declare void @__omni_map_set_int(i8*, i64, i64)
+declare i64 @__omni_map_get_int(i8*, i64)
+declare i1 @__omni_map_contains_int(i8*, i64)
 "#
 }
 
@@ -54,7 +77,7 @@ mod tests {
     #[test]
     fn test_runtime_sources_exist() {
         let sources = runtime_c_sources();
-        assert_eq!(sources.len(), 4);
+        assert_eq!(sources.len(), 6);
         for s in sources {
             assert!(s.exists(), "Source does not exist: {}", s.display());
         }

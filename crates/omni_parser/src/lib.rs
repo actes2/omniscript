@@ -111,6 +111,29 @@ pub enum Statement {
         channel: String,
         is_scoped_decl: bool,
     },
+    /// Polyglot List / Slice creation: `items = [10, 20, 30]`, `items := []`
+    ListInit {
+        target: String,
+        elements: Vec<String>,
+        is_scoped_decl: bool,
+    },
+    /// Polyglot List append: `items.append(40)`, `items.push(40)`
+    ListAppend {
+        target: String,
+        expr: String,
+    },
+    /// Polyglot index assignment: `items[0] = 99`, `m["key"] = 10`
+    IndexSet {
+        target: String,
+        index_expr: String,
+        val_expr: String,
+    },
+    /// Polyglot Map / Dict creation: `m = {"a": 10, "b": 20}`, `m := {}`
+    MapInit {
+        target: String,
+        entries: Vec<(String, String)>,
+        is_scoped_decl: bool,
+    },
     /// Abstract intent block awaiting model synthesis
     Intent {
         instruction: String,
@@ -142,7 +165,9 @@ pub struct OmniParser {
     elif_re: Regex,
     else_re: Regex,
     while_re: Regex,
-    for_re: Regex,
+    plain_for_re: Regex,
+    paren_for_re: Regex,
+    c_for_re: Regex,
     print_re: Regex,
     return_re: Regex,
     walrus_assign_re: Regex,
@@ -150,6 +175,10 @@ pub struct OmniParser {
     make_chan_re: Regex,
     chan_send_re: Regex,
     chan_recv_re: Regex,
+    list_init_re: Regex,
+    list_append_re: Regex,
+    index_set_re: Regex,
+    map_init_re: Regex,
 }
 
 impl Default for OmniParser {
@@ -174,9 +203,19 @@ impl OmniParser {
             else_re: Regex::new(r#"^else\s*(?::|\{)?$"#).unwrap(),
             // Matches while (x > 0) {, while x > 0 {, while x > 0:
             while_re: Regex::new(r#"^while\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
-            // Matches for (i in 10) {, for (int i = 0; i < 10; i++) {, for i in 10:
-            for_re: Regex::new(
-                r#"^for\s*(?:\((?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+(?:in|:=|=)\s+(?:0\s*;\s*[a-zA-Z_0-9]+\s*<\s*)?(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?(?:;\s*[^)]*)?\)|(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?)\s*(?::|\{)?$"#,
+            // Matches for i in len(items):, for i in range(10):, for i in 10:
+            plain_for_re: Regex::new(
+                r#"^for\s+(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*(?::|\{)?$"#,
+            )
+            .unwrap(),
+            // Matches for (i in 10), for (i in items)
+            paren_for_re: Regex::new(
+                r#"^for\s*\(\s*(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*\)\s*(?::|\{)?$"#,
+            )
+            .unwrap(),
+            // Matches for (int i = 0; i < 10; i++) {
+            c_for_re: Regex::new(
+                r#"^for\s*\(\s*(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s*=\s*0\s*;\s*[a-zA-Z_0-9]+\s*<\s*(.+?)\s*;\s*[^)]*\)\s*(?::|\{)?$"#,
             )
             .unwrap(),
             print_re: Regex::new(r#"^print\s*\(\s*(.*)\s*\)$"#).unwrap(),
@@ -203,6 +242,26 @@ impl OmniParser {
                 r#"^(?:(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))$"#,
             )
             .unwrap(),
+            // Matches items = [10, 20, 30], items := []
+            list_init_re: Regex::new(
+                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\[(.*)\]$"#,
+            )
+            .unwrap(),
+            // Matches items.append(40), items.push(50)
+            list_append_re: Regex::new(
+                r#"^([a-zA-Z_0-9]+)\.(?:append|push)\s*\(\s*(.+)\s*\)$"#,
+            )
+            .unwrap(),
+            // Matches items[0] = 99, m["key"] = 10
+            index_set_re: Regex::new(
+                r#"^([a-zA-Z_0-9]+)\[(.+?)\]\s*=\s*(.+)$"#,
+            )
+            .unwrap(),
+            // Matches m = {"alice": 100, "bob": 200}, m := {}
+            map_init_re: Regex::new(
+                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\{(.*)\}$"#,
+            )
+            .unwrap(),
         }
     }
 
@@ -211,12 +270,26 @@ impl OmniParser {
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
         let raw_lines = source.lines();
-        let has_explicit_blocks = source.contains('{')
-            || source.contains('}')
-            || source.lines().any(|l| {
-                let t = l.trim();
-                t == "end" || t == "end;"
-            });
+        let has_explicit_blocks = source.lines().any(|l| {
+            let t = l.trim();
+            t == "{"
+                || t == "}"
+                || t == "end"
+                || t == "end;"
+                || (t.ends_with('{')
+                    && (t.starts_with("def ")
+                        || t.starts_with("fn ")
+                        || t.starts_with("func ")
+                        || t.starts_with("function ")
+                        || t.starts_with("if ")
+                        || t.starts_with("if(")
+                        || t.starts_with("while ")
+                        || t.starts_with("while(")
+                        || t.starts_with("for ")
+                        || t.starts_with("for(")
+                        || t.starts_with("int ")
+                        || t.starts_with("void ")))
+        });
 
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
@@ -582,9 +655,19 @@ impl OmniParser {
             }
 
             // 3. For loop
-            if let Some(caps) = self.for_re.captures(text) {
-                let var = caps.get(1).or_else(|| caps.get(3)).unwrap().as_str().to_string();
-                let count = caps.get(2).or_else(|| caps.get(4)).unwrap().as_str().to_string();
+            let for_match = if let Some(caps) = self.c_for_re.captures(text) {
+                Some((caps[1].to_string(), caps[2].trim().to_string()))
+            } else if let Some(caps) = self.paren_for_re.captures(text) {
+                let cnt = caps.get(2).or_else(|| caps.get(3)).unwrap().as_str().trim().to_string();
+                Some((caps[1].to_string(), cnt))
+            } else if let Some(caps) = self.plain_for_re.captures(text) {
+                let cnt = caps.get(2).or_else(|| caps.get(3)).unwrap().as_str().trim().to_string();
+                Some((caps[1].to_string(), cnt))
+            } else {
+                None
+            };
+
+            if let Some((var, count)) = for_match {
                 let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 stmts.push(Statement::ForLoop { var, count, body });
                 i = next_i;
@@ -660,7 +743,93 @@ impl OmniParser {
                 continue;
             }
 
-            // 10. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
+            // 10. Polyglot List / Slice Init: `items = [10, 20, 30]`, `items := []`
+            if let Some(caps) = self.list_init_re.captures(text) {
+                let is_scoped = caps.get(1).is_some() || text.contains(":=");
+                let target = caps[2].trim().to_string();
+                let inner = caps[3].trim();
+                let elements = if inner.is_empty() {
+                    Vec::new()
+                } else {
+                    inner
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+                stmts.push(Statement::ListInit {
+                    target,
+                    elements,
+                    is_scoped_decl: is_scoped,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 11. Polyglot Map / Dict Init: `m = {"k": 10, "v": 20}`, `m := {}`
+            if let Some(caps) = self.map_init_re.captures(text) {
+                let is_scoped = caps.get(1).is_some() || text.contains(":=");
+                let target = caps[2].trim().to_string();
+                let inner = caps[3].trim();
+                let entries = if inner.is_empty() {
+                    Vec::new()
+                } else {
+                    inner
+                        .split(',')
+                        .filter_map(|pair| {
+                            let pair = pair.trim();
+                            if pair.is_empty() {
+                                return None;
+                            }
+                            if let Some((k, v)) = pair.split_once(':') {
+                                Some((
+                                    k.trim().trim_matches('"').trim_matches('\'').to_string(),
+                                    v.trim().to_string(),
+                                ))
+                            } else if let Some((k, v)) = pair.split_once("=>") {
+                                Some((
+                                    k.trim().trim_matches('"').trim_matches('\'').to_string(),
+                                    v.trim().to_string(),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+                stmts.push(Statement::MapInit {
+                    target,
+                    entries,
+                    is_scoped_decl: is_scoped,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 12. Polyglot List Append: `items.append(40)`, `items.push(50)`
+            if let Some(caps) = self.list_append_re.captures(text) {
+                let target = caps[1].trim().to_string();
+                let expr = caps[2].trim().to_string();
+                stmts.push(Statement::ListAppend { target, expr });
+                i += 1;
+                continue;
+            }
+
+            // 13. Polyglot Index Assignment: `items[0] = 99`, `m["key"] = 10`
+            if let Some(caps) = self.index_set_re.captures(text) {
+                let target = caps[1].trim().to_string();
+                let index_expr = caps[2].trim().to_string();
+                let val_expr = caps[3].trim().to_string();
+                stmts.push(Statement::IndexSet {
+                    target,
+                    index_expr,
+                    val_expr,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 14. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
             if let Some(caps) = self.walrus_assign_re.captures(text) {
                 stmts.push(Statement::Assign {
                     target: caps[1].trim().to_string(),
@@ -874,6 +1043,71 @@ def main() {
             Statement::GoSpawn {
                 call_expr: "worker(ch)".to_string(),
                 idiom: IdiomFamily::GoScopedDeclaration,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_collections() {
+        let src = r#"
+def main():
+    items = [10, 20, 30]
+    items.append(40)
+    items[0] = 99
+    scores = {"alice": 100, "bob": 200}
+    scores["carol"] = 300
+    for i in len(items):
+        print(items[i])
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("coll_test", src);
+
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.name, "main");
+        assert_eq!(f.body.len(), 7);
+
+        assert_eq!(
+            f.body[0],
+            Statement::ListInit {
+                target: "items".to_string(),
+                elements: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+                is_scoped_decl: false,
+            }
+        );
+        assert_eq!(
+            f.body[1],
+            Statement::ListAppend {
+                target: "items".to_string(),
+                expr: "40".to_string(),
+            }
+        );
+        assert_eq!(
+            f.body[2],
+            Statement::IndexSet {
+                target: "items".to_string(),
+                index_expr: "0".to_string(),
+                val_expr: "99".to_string(),
+            }
+        );
+        assert_eq!(
+            f.body[3],
+            Statement::MapInit {
+                target: "scores".to_string(),
+                entries: vec![
+                    ("alice".to_string(), "100".to_string()),
+                    ("bob".to_string(), "200".to_string()),
+                ],
+                is_scoped_decl: false,
+            }
+        );
+        assert_eq!(
+            f.body[4],
+            Statement::IndexSet {
+                target: "scores".to_string(),
+                index_expr: "\"carol\"".to_string(),
+                val_expr: "300".to_string(),
             }
         );
     }
