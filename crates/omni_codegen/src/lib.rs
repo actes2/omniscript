@@ -110,7 +110,9 @@ impl<'a> CodeGenerator<'a> {
                         custom_return = true;
                         break;
                     } else {
-                        ir.push_str(&format!("  ; [Concrete]: {}\n", code));
+                        // Un-notated or non-standard syntax -> route to AI lowering engine!
+                        let synthesized = self.engine.lower_intent(fn_name, code, temp)?;
+                        ir.push_str(&synthesized);
                     }
                 }
                 _ => {}
