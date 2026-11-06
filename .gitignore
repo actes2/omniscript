@@ -1,0 +1,6 @@
+/target/
+/.omnicache/
+**/*.rs.bk
+*.swp
+*.orig
+.venv/

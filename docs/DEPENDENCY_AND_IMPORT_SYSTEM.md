@@ -1,0 +1,236 @@
+# OmniScript: Universal Dependency & Polyglot Import System
+
+## 1. Vision: Zero-Impedance Foreign Ingestion
+
+Traditional compilers force languages into isolated silos:
+- In Go, you are bound by package directory structures, GOPATH/modules, and exported uppercase naming rules (`Parser` vs `parser`).
+- In C/C++, you must wrangle header guards, `extern "C"`, CMake targets, and link flags.
+- In Node.js/Python, you wrestle with CommonJS vs ESM and CPython ABI extensions.
+
+**OmniScript dissolves language boundaries at the import level.** You can import any source file (`.js`, `.c`, `.go`, `.py`, `.rs`) or entire directory directly into your namespace, access its methods and objects natively, and compile the entire polyglot dependency tree down to a single unified LLVM bitcode module.
+
+---
+
+## 2. Universal Import Syntax
+
+OmniScript defines a uniform, quote-delimited import schema:
+
+```python
+# 1. Direct file import with namespace aliasing
+import "foo.js" as Foo
+import "./query_runner.c" as qr
+import "telemetry/agent.go" as Agent
+
+# 2. Directory-wide wildcard import
+import "drivers/sensors" as Sensors
+
+# 3. Targeted symbol hunting from directory or package
+from "stuff" import Parser
+from "engine/crypto" import SHA256Signer, KeyPair
+from "./network" import fetch_async as fetch
+```
+
+---
+
+## 3. Two-Tier Symbol Resolution Engine
+
+Import resolution operates in two complementary stages:
+1. **Tier 1: Deterministic Symbol Carving (Preamble Assembly)**
+   - High-speed heuristic pass using regex, ripgrep algorithms, and lightweight Tree-sitter parsers.
+   - Extracts symbol tables, class names, function signatures, and exported tokens in **< 10ms**.
+2. **Tier 2: AI Compiler Semantic Extraction**
+   - Engaged when foreign code uses unconventional constructs (e.g., Go internal packages, C macros, dynamic JS prototypes, complex nested modules).
+   - Generates exact LLVM ABI contracts and FFI wrappers automatically.
+
+```
+                      from "stuff" import Parser
+                                   |
+                                   v
+             +-------------------------------------------+
+             |         Directory Existence Check         |
+             |       Does directory "stuff" exist?       |
+             +---------------------+---------------------+
+                                   |
+                        +----------+----------+
+                        |                     |
+                      [No]                  [Yes]
+                        |                     |
+                        v                     v
+              [COMPILER ERROR]     +---------------------+
+           Directory not found     |  Preamble Assembly: |
+                                   |   Symbol Carving    |
+                                   +----------+----------+
+                                              |
+               +------------------------------+------------------------------+
+               |                                                             |
+         [File Match]                                                 [Symbol Search]
+   Does `stuff/parser.*` exist?                                 Search contents of `stuff/**/*`
+   (e.g., parser.go, parser.c, parser.py)                       (Regex / Tree-sitter query)
+               |                                                             |
+               +------------------------------+------------------------------+
+                                              |
+                                     +--------v--------+
+                                     | Candidate Match |
+                                     +--------+--------+
+                                              |
+                             +----------------+----------------+
+                             |                                 |
+                      [Single Match]                  [Ambiguous / Hidden]
+                             |                                 |
+                             v                                 v
+                 [Bind Symbol Directly]            [AI Compiler Ingestion]
+                 Extract signature & bind          - Deconstruct AST / Macro
+                 to local scope                    - Synthesize LLVM ABI contract
+                                                   - Verify with llvm-as
+```
+
+---
+
+## 4. Symbol Carving Pipeline (The Preamble Pass)
+
+During compiler initialization, before full AST construction or LLVM lowering, the **Preamble Assembler** runs across all declared imports:
+
+### 4.1 Carving Rules & Heuristics
+1. **Exact File Precedence**:
+   If importing `from "stuff" import Parser`:
+   - Check `stuff/parser.omni`, `stuff/parser.py`, `stuff/parser.go`, `stuff/parser.c`, `stuff/parser.js`, `stuff/parser.rs`.
+   - If found, carve all public/top-level declarations from that file.
+
+2. **Regex & Tree-Sitter Symbol Sweeper**:
+   If no exact file match, run parallel regex/AST queries across all files in the target directory:
+   - **Go**: `func (\(.*\)\s+)?Parser\(`, `type Parser struct`, `type Parser interface`
+   - **Python**: `class Parser\b`, `def Parser\b`
+   - **C / C++**: `typedef struct .* Parser;`, `class Parser\b`, `struct Parser\b`, `void\* Parser\(`
+   - **JS / TS**: `class Parser`, `function Parser`, `export const Parser`, `module.exports = { Parser`
+
+3. **Go Module "Un-caging"**:
+   In standard Go, uncapitalized symbols (`func parse()`) cannot be exported outside their package. OmniScript's carver strips package visibility gates:
+   - Any function or struct in a `.go` file can be ingested directly regardless of case.
+   - Go runtime runtime dependencies (goroutine runtime, GC) are either stubbed or lowered into lightweight native pthreads/LLVM coroutines.
+
+---
+
+## 5. Polyglot Lowering Strategies by File Extension
+
+| Source Type | Resolution Strategy | Generated LLVM Artifact |
+| :--- | :--- | :--- |
+| **`.c` / `.h`** | Clang AST parsing (`libclang`) or Clang `-emit-llvm` | Native LLVM IR bitcode linked directly |
+| **`.go`** | Symbol carver extracts function body; lowered via Go-to-LLVM or synthesized via model | Un-caged Go structs & functions lowered to C ABI |
+| **`.js` / `.ts`**| Strips dynamic prototype fluff; monomorphizes functions into typed LLVM functions | Compiled native functions (zero V8/Node.js overhead) |
+| **`.py`** | Ingests classes, functions, and decorators; infers types via AST data-flow | Native LLVM structs & function symbols |
+| **Directory** | Recursively indexes all supported files into an aggregate virtual namespace | Composite LLVM module containing all extracted symbols |
+
+---
+
+## 6. Real-World Polyglot Ingestion Example
+
+### The Project Structure
+```
+my_service/
+├── main.omni
+├── native/
+│   └── crypto_hasher.c
+└── helpers/
+    ├── token_bucket.go
+    └── json_utils.js
+```
+
+### `native/crypto_hasher.c`
+```c
+#include <stdint.h>
+
+void fast_hash_block(const uint8_t* data, uint64_t len, uint8_t* out_digest) {
+    // low-level C implementation
+    for (uint64_t i = 0; i < len; i++) {
+        out_digest[i % 32] ^= data[i];
+    }
+}
+```
+
+### `helpers/token_bucket.go`
+```go
+package helpers
+
+type RateLimiter struct {
+    tokens    int64
+    maxTokens int64
+}
+
+// Notice lowercase: unexported in standard Go!
+func (r *RateLimiter) allow() bool {
+    if r.tokens > 0 {
+        r.tokens--
+        return true
+    }
+    return false
+}
+```
+
+### `main.omni` (OmniScript Source)
+```python
+# Direct polyglot imports:
+import "./native/crypto_hasher.c" as Crypto
+from "helpers" import RateLimiter, fast_json_parse
+
+@dataclass
+class GatewayService:
+    limiter: RateLimiter
+    hash_buf: *mut u8
+
+    def __init__(self, max_req_per_sec: i64):
+        # Using Go struct constructor directly
+        self.limiter = RateLimiter(tokens=max_req_per_sec, maxTokens=max_req_per_sec)
+        self.hash_buf = alloc(32)
+
+    def handle_request(self, payload: *const u8, length: usize):
+        # 1. Call unexported Go method directly
+        if not self.limiter.allow():
+            return {"status": 429, "error": "Too Many Requests"}
+
+        # 2. Call C function without header files or extern "C"
+        Crypto.fast_hash_block(payload, length, self.hash_buf)
+
+        # 3. Call JS utility function compiled to native code
+        parsed_doc = fast_json_parse(payload)
+        
+        return {"status": 200, "digest": self.hash_buf}
+```
+
+---
+
+## 7. Compiler Diagnostics & Failure Handling
+
+When an import fails, the compiler emits structured, actionable diagnostics:
+
+### 1. Directory Not Found
+```
+[ERROR] omnic: Import Resolution Failure
+  --> main.omni:2:1
+   |
+ 2 | from "invalid_path" import Worker
+   | ^^^^^^^^^^^^^^^^^^^ Directory 'invalid_path' does not exist in workspace or module search paths.
+```
+
+### 2. Ambiguous Symbol Match
+If `from "helpers" import Parser` matches both `helpers/xml/parser.c` and `helpers/json/parser.py`:
+```
+[ERROR] omnic: Ambiguous Symbol 'Parser' in directory 'helpers/'
+  Matches discovered:
+    1) helpers/xml/parser.c:14      (struct Parser)
+    2) helpers/json/parser.py:8     (class Parser)
+  Fix: Disambiguate import path:
+    from "helpers/xml" import Parser
+    from "helpers/json" import Parser
+```
+
+### 3. Symbol Not Found in Directory
+```
+[ERROR] omnic: Symbol 'NonExistent' not found
+  --> main.omni:3:1
+   |
+ 3 | from "helpers" import NonExistent
+   |                       ^^^^^^^^^^^
+   Searched 12 files in 'helpers/':
+   Found symbols: [RateLimiter, TokenBucket, fast_json_parse, format_log]
+   Did you mean: 'TokenBucket'?
+```

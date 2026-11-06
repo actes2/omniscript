@@ -1,0 +1,17 @@
+# OmniScript Polyglot Ingestion Example
+import "native/hasher.c" as Crypto
+from "pkg" import RateLimiter, allow
+
+@dataclass
+class TelemetryGateway:
+    def __init__(self, limit: i64):
+        self.limiter = RateLimiter(tokens=limit, maxTokens=limit)
+
+    def handle_packet(self, data: *const u8, len: usize):
+        let temp_buf = alloc(64)
+        if not self.limiter.allow():
+            return -1
+        
+        intent: hash data using Crypto.fast_hash_block into temp_buf and return status
+        free(temp_buf)
+        return 0

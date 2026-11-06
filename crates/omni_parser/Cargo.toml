@@ -1,0 +1,14 @@
+[package]
+name = "omni_parser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+serde.workspace = true
+omni_preamble = { path = "../omni_preamble" }
+omni_mem = { path = "../omni_mem" }

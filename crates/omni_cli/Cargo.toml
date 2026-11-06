@@ -1,0 +1,19 @@
+[package]
+name = "omni_cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omnic"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+omni_preamble = { path = "../omni_preamble" }
+omni_mem = { path = "../omni_mem" }
+omni_parser = { path = "../omni_parser" }
