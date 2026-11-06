@@ -164,11 +164,37 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "omni_codegen",
+ "omni_engine",
  "omni_mem",
  "omni_parser",
  "omni_preamble",
+ "omni_verify",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omni_codegen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "omni_engine",
+ "omni_mem",
+ "omni_parser",
+ "omni_verify",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "omni_engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -204,6 +230,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "omni_verify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

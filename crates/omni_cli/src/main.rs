@@ -1,6 +1,9 @@
 use clap::Parser as ClapParser;
+use omni_codegen::CodeGenerator;
+use omni_engine::MockSynthesisEngine;
 use omni_parser::OmniParser;
 use omni_preamble::{ImportDirective, SymbolCarver};
+use omni_verify::LlvmVerifier;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     let base_dir = args.source.parent().unwrap_or_else(|| Path::new("."));
 
     // 1. Parse AST & Memory Instructions
-    println!("\n[1/3] Parsing resilient AST and UMO memory instructions...");
+    println!("\n[1/5] Parsing resilient AST and UMO memory instructions...");
     let parser = OmniParser::new();
     let module = parser.parse_module(module_name, &source_content);
 
@@ -65,8 +68,9 @@ fn main() -> anyhow::Result<()> {
     println!("  -> Discovered {} import directive(s)", module.imports.len());
 
     // 2. Preamble Assembly & Symbol Carving
-    println!("\n[2/3] Executing Preamble Symbol Carving across polyglot targets...");
+    println!("\n[2/5] Executing Preamble Symbol Carving across polyglot targets...");
     let carver = SymbolCarver::new();
+    let mut foreign_c_files = Vec::new();
 
     for import in &module.imports {
         match import {
@@ -80,6 +84,12 @@ fn main() -> anyhow::Result<()> {
                     );
                     std::process::exit(1);
                 }
+                
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "c" || ext == "cpp" {
+                    foreign_c_files.push(full_path.clone());
+                }
+
                 println!(
                     "  -> Bound foreign file '{}' as alias '{:?}'",
                     path.display(),
@@ -118,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 3. Memory & Lifetime Normalization Summary
-    println!("\n[3/3] Auditing memory lifecycles & autonomous borrow-checking...");
+    println!("\n[3/5] Auditing memory lifecycles & autonomous borrow-checking...");
     for f in &module.functions {
         if !f.memory_ops.is_empty() {
             println!("  -> Function '{}' declared {} UMO operation(s):", f.name, f.memory_ops.len());
@@ -128,6 +138,25 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("\n[SUCCESS] Front-end verification complete. Ready for LLVM IR lowering pass.");
+    // 4. Code Generation & Intent Synthesis
+    println!("\n[4/5] Synthesizing intent blocks and generating unified LLVM IR...");
+    let mock_engine = MockSynthesisEngine::new();
+    let codegen = CodeGenerator::new(&mock_engine);
+    let llvm_ir = codegen.generate_module_ir(&module, args.temp)?;
+
+    if args.verbose {
+        println!("\n--- Generated LLVM IR ---\n{}\n-------------------------", llvm_ir);
+    }
+
+    // 5. Verification & Native Compilation
+    println!("\n[5/5] Verifying LLVM IR and linking native ELF binary...");
+    let verifier = LlvmVerifier::new()?;
+    verifier.verify_ir(&llvm_ir)?;
+    println!("  -> LLVM IR syntax & type verifier passed cleanly.");
+
+    verifier.compile_ir_to_binary(&llvm_ir, &args.output, args.opt_level, &foreign_c_files)?;
+    println!("  -> Successfully compiled and linked native binary: {}", args.output.display());
+
+    println!("\n[BUILD COMPLETE] Run binary with: ./{}", args.output.display());
     Ok(())
 }
