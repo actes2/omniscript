@@ -18,25 +18,117 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    fn scan_strings_recursive(
+        &self,
+        stmts: &[Statement],
+        string_constants: &mut Vec<(String, String, usize)>,
+        counter: &mut usize,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Concrete { code } => {
+                    if let Some(caps) = self.print_re.captures(code.trim()) {
+                        let text = caps[1].to_string();
+                        let const_name = format!("@.str.print_{}", *counter);
+                        *counter += 1;
+                        let len_with_null_and_newline = text.len() + 2; // \0A\00
+                        string_constants.push((const_name, text, len_with_null_and_newline));
+                    }
+                }
+                Statement::ForLoop { body, .. } => {
+                    self.scan_strings_recursive(body, string_constants, counter);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lower_statements(
+        &self,
+        stmts: &[Statement],
+        ir: &mut String,
+        string_constants: &[(String, String, usize)],
+        cur_str_idx: &mut usize,
+        loop_counter: &mut usize,
+        fn_name: &str,
+        temp: f32,
+    ) -> anyhow::Result<bool> {
+        let mut custom_return = false;
+
+        for stmt in stmts {
+            match stmt {
+                Statement::ForLoop { var, count, body } => {
+                    let loop_id = *loop_counter;
+                    *loop_counter += 1;
+
+                    let count_num: i32 = count.parse().unwrap_or(10);
+                    let idx_var = format!("%loop_idx_{}", loop_id);
+                    let cond_lbl = format!("loop_cond_{}", loop_id);
+                    let body_lbl = format!("loop_body_{}", loop_id);
+                    let exit_lbl = format!("loop_exit_{}", loop_id);
+
+                    ir.push_str(&format!("  ; --- Begin ForLoop {} in {} ---\n", var, count));
+                    ir.push_str(&format!("  {} = alloca i32\n", idx_var));
+                    ir.push_str(&format!("  store i32 0, i32* {}\n", idx_var));
+                    ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+                    ir.push_str(&format!("{}:\n", cond_lbl));
+                    ir.push_str(&format!("  %curr_{} = load i32, i32* {}\n", loop_id, idx_var));
+                    ir.push_str(&format!("  %cmp_{} = icmp slt i32 %curr_{}, {}\n", loop_id, loop_id, count_num));
+                    ir.push_str(&format!("  br i1 %cmp_{}, label %{}, label %{}\n\n", loop_id, body_lbl, exit_lbl));
+
+                    ir.push_str(&format!("{}:\n", body_lbl));
+                    self.lower_statements(body, ir, string_constants, cur_str_idx, loop_counter, fn_name, temp)?;
+                    
+                    ir.push_str(&format!("  %next_{} = add i32 %curr_{}, 1\n", loop_id, loop_id));
+                    ir.push_str(&format!("  store i32 %next_{}, i32* {}\n", loop_id, idx_var));
+                    ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+                    ir.push_str(&format!("{}:\n", exit_lbl));
+                    ir.push_str(&format!("  ; --- End ForLoop {} ---\n", var));
+                }
+                Statement::Intent { instruction } => {
+                    let synthesized = self.engine.lower_intent(fn_name, instruction, temp)?;
+                    ir.push_str(&synthesized);
+                }
+                Statement::Concrete { code } => {
+                    let trimmed = code.trim();
+                    if let Some(_) = self.print_re.captures(trimmed) {
+                        let (ref const_name, _, len) = string_constants[*cur_str_idx];
+                        *cur_str_idx += 1;
+                        ir.push_str(&format!(
+                            "  %str_ptr_{} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                            *cur_str_idx, len, len, const_name
+                        ));
+                        ir.push_str(&format!(
+                            "  call i32 (i8*, ...) @printf(i8* %str_ptr_{})\n",
+                            *cur_str_idx
+                        ));
+                    } else if let Some(caps) = self.return_re.captures(trimmed) {
+                        let ret_val = &caps[1];
+                        ir.push_str(&format!("  ret i32 {}\n", ret_val));
+                        custom_return = true;
+                        break;
+                    } else {
+                        ir.push_str(&format!("  ; [Concrete]: {}\n", code));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(custom_return)
+    }
+
     /// Generate unified LLVM IR text from OmniModule
     pub fn generate_module_ir(&self, module: &OmniModule, temp: f32) -> anyhow::Result<String> {
         let mut ir = String::new();
         let mut string_constants: Vec<(String, String, usize)> = Vec::new();
         let mut str_counter = 0;
 
-        // Pre-scan statements for print("...") to extract string constants
+        // Pre-scan statements for print("...") recursively to extract string constants
         for func in &module.functions {
-            for stmt in &func.body {
-                if let Statement::Concrete { code } = stmt {
-                    if let Some(caps) = self.print_re.captures(code.trim()) {
-                        let text = caps[1].to_string();
-                        let const_name = format!("@.str.print_{}", str_counter);
-                        str_counter += 1;
-                        let len_with_null_and_newline = text.len() + 2; // \0A\00
-                        string_constants.push((const_name, text, len_with_null_and_newline));
-                    }
-                }
-            }
+            self.scan_strings_recursive(&func.body, &mut string_constants, &mut str_counter);
         }
 
         ir.push_str("; ModuleID = '");
@@ -69,9 +161,10 @@ impl<'a> CodeGenerator<'a> {
             ir.push_str(&format!("%struct.{} = type {{ i8* }}\n\n", cls.name));
         }
 
-        // 2. Functions (namespaced as @__omni_fn_<name> to avoid C @main collision)
+        // 2. Functions (namespaced as @__omni_fn_<name>)
         let mut has_user_main = false;
         let mut cur_str_idx = 0;
+        let mut loop_counter = 0;
 
         for func in &module.functions {
             if func.name == "main" {
@@ -99,42 +192,17 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
 
-            let mut custom_return = false;
+            let custom_ret = self.lower_statements(
+                &func.body,
+                &mut ir,
+                &string_constants,
+                &mut cur_str_idx,
+                &mut loop_counter,
+                &func.name,
+                temp,
+            )?;
 
-            // Lower body statements
-            for stmt in &func.body {
-                match stmt {
-                    Statement::Intent { instruction } => {
-                        let synthesized = self.engine.lower_intent(&func.name, instruction, temp)?;
-                        ir.push_str(&synthesized);
-                    }
-                    Statement::Concrete { code } => {
-                        let trimmed = code.trim();
-                        if let Some(_) = self.print_re.captures(trimmed) {
-                            let (ref const_name, _, len) = string_constants[cur_str_idx];
-                            cur_str_idx += 1;
-                            ir.push_str(&format!(
-                                "  %str_ptr_{} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
-                                cur_str_idx, len, len, const_name
-                            ));
-                            ir.push_str(&format!(
-                                "  call i32 (i8*, ...) @printf(i8* %str_ptr_{})\n",
-                                cur_str_idx
-                            ));
-                        } else if let Some(caps) = self.return_re.captures(trimmed) {
-                            let ret_val = &caps[1];
-                            ir.push_str(&format!("  ret i32 {}\n", ret_val));
-                            custom_return = true;
-                            break;
-                        } else {
-                            ir.push_str(&format!("  ; [Concrete]: {}\n", code));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !custom_return {
+            if !custom_ret {
                 ir.push_str("  ret i32 0\n");
             }
             ir.push_str("}\n\n");
@@ -144,11 +212,9 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("define i32 @main(i32 %argc, i8** %argv) {\nentry:\n");
 
         if has_user_main {
-            // User defined `def main():`: delegate directly to user main!
             ir.push_str("  %exit_code = call i32 @__omni_fn_main(i8* null, i64 0)\n");
             ir.push_str("  ret i32 %exit_code\n");
         } else if let Some(f) = module.functions.first() {
-            // Call the first available function
             ir.push_str(&format!(
                 "  %res = call i32 @__omni_fn_{}(i8* null, i64 0)\n",
                 f.name

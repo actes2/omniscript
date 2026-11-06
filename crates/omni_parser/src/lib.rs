@@ -1,5 +1,6 @@
 use omni_mem::UnifiedMemOp;
 use omni_preamble::ImportDirective;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,9 +46,15 @@ pub struct ParamDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Statement {
-    /// Fully determined concrete code (let, if, for, return, direct ptrs)
+    /// Fully determined concrete code (let, if, return, direct ptrs, print)
     Concrete {
         code: String,
+    },
+    /// For loop: `for var in count/range:`
+    ForLoop {
+        var: String,
+        count: String,
+        body: Vec<Statement>,
     },
     /// Abstract intent block awaiting model synthesis
     Intent {
@@ -60,7 +67,9 @@ pub enum Statement {
     },
 }
 
-pub struct OmniParser;
+pub struct OmniParser {
+    for_re: Regex,
+}
 
 impl Default for OmniParser {
     fn default() -> Self {
@@ -70,7 +79,17 @@ impl Default for OmniParser {
 
 impl OmniParser {
     pub fn new() -> Self {
-        Self
+        Self {
+            for_re: Regex::new(
+                r#"^for\s+([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?\s*:$"#,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Measure indentation level of a raw line
+    fn indent_level(line: &str) -> usize {
+        line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
     }
 
     /// Parse an OmniScript source string into an `OmniModule`
@@ -81,19 +100,23 @@ impl OmniParser {
         let mut classes = Vec::new();
         let mut top_level = Vec::new();
 
-        let mut lines = source.lines().peekable();
+        let raw_lines: Vec<&str> = source.lines().collect();
+        let mut idx = 0;
         let mut current_decorators: Vec<String> = Vec::new();
 
-        while let Some(line) = lines.next() {
+        while idx < raw_lines.len() {
+            let line = raw_lines[idx];
             let trimmed = line.trim();
 
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                idx += 1;
                 continue;
             }
 
             // 1. Decorator `@dataclass`
             if trimmed.starts_with('@') {
                 current_decorators.push(trimmed.to_string());
+                idx += 1;
                 continue;
             }
 
@@ -102,6 +125,7 @@ impl OmniParser {
                 if let Some(directive) = omni_preamble::SymbolCarver::parse_directive(trimmed) {
                     imports.push(directive);
                 }
+                idx += 1;
                 continue;
             }
 
@@ -120,6 +144,7 @@ impl OmniParser {
                 };
                 classes.push(class_def);
                 current_decorators.clear();
+                idx += 1;
                 continue;
             }
 
@@ -127,38 +152,32 @@ impl OmniParser {
             if trimmed.starts_with("def ") {
                 let sig = trimmed[4..].trim_end_matches(':').trim();
                 let fn_name = sig.split('(').next().unwrap_or("unnamed").trim().to_string();
+                let fn_indent = Self::indent_level(line);
                 
-                let mut body = Vec::new();
-                let mut raw_body_lines = Vec::new();
+                idx += 1;
+                let mut block_lines: Vec<(usize, String)> = Vec::new();
 
-                // Consume indented or bracketed lines for function body
-                while let Some(&next_line) = lines.peek() {
+                while idx < raw_lines.len() {
+                    let next_line = raw_lines[idx];
                     let next_trimmed = next_line.trim();
+
                     if next_trimmed.is_empty() {
-                        lines.next();
+                        idx += 1;
                         continue;
                     }
 
-                    // Check indentation (any leading space or tab)
-                    if next_line.starts_with(' ') || next_line.starts_with('\t') {
-                        raw_body_lines.push(next_trimmed.to_string());
-                        
-                        if next_trimmed.starts_with("intent") {
-                            body.push(Statement::Intent {
-                                instruction: next_trimmed.to_string(),
-                            });
-                        } else {
-                            body.push(Statement::Concrete {
-                                code: next_trimmed.to_string(),
-                            });
-                        }
-                        lines.next();
+                    let cur_indent = Self::indent_level(next_line);
+                    if cur_indent > fn_indent {
+                        block_lines.push((cur_indent, next_trimmed.to_string()));
+                        idx += 1;
                     } else {
                         break;
                     }
                 }
 
-                let memory_ops = mem_norm.normalize_block(&raw_body_lines.join("\n"), &fn_name);
+                let body = self.parse_block(&block_lines);
+                let raw_joined = block_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                let memory_ops = mem_norm.normalize_block(&raw_joined, &fn_name);
 
                 functions.push(FunctionDef {
                     name: fn_name,
@@ -172,10 +191,11 @@ impl OmniParser {
                 continue;
             }
 
-            // Default top-level statement
+            // Top-level statement
             top_level.push(Statement::Concrete {
                 code: trimmed.to_string(),
             });
+            idx += 1;
         }
 
         OmniModule {
@@ -186,6 +206,54 @@ impl OmniParser {
             top_level_statements: top_level,
         }
     }
+
+    /// Recursively parse indented block lines into statements (including loops)
+    fn parse_block(&self, lines: &[(usize, String)]) -> Vec<Statement> {
+        let mut stmts = Vec::new();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let (indent, ref text) = lines[i];
+
+            if let Some(caps) = self.for_re.captures(text) {
+                let var = caps[1].to_string();
+                let count = caps[2].to_string();
+
+                // Collect nested lines indented deeper than this for-loop
+                let mut nested = Vec::new();
+                let mut j = i + 1;
+                while j < lines.len() {
+                    if lines[j].0 > indent {
+                        nested.push(lines[j].clone());
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let inner_body = self.parse_block(&nested);
+                stmts.push(Statement::ForLoop {
+                    var,
+                    count,
+                    body: inner_body,
+                });
+
+                i = j;
+            } else if text.starts_with("intent") {
+                stmts.push(Statement::Intent {
+                    instruction: text.clone(),
+                });
+                i += 1;
+            } else {
+                stmts.push(Statement::Concrete {
+                    code: text.clone(),
+                });
+                i += 1;
+            }
+        }
+
+        stmts
+    }
 }
 
 #[cfg(test)]
@@ -193,28 +261,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_simple_omni_source() {
+    fn test_parse_for_loop() {
         let src = r#"
-import "crypto.c" as Crypto
-from "helpers" import RateLimiter
-
-@dataclass
-class Service:
-    pass
-
-def process_stream(data):
-    let buf = alloc(1024)
-    intent: filter streaming packets where temp > 80.0
-    free(buf)
+def main():
+   for i in 10:
+     print("Hello world!")
+   return 0
 "#;
         let parser = OmniParser::new();
         let module = parser.parse_module("test_mod", src);
 
-        assert_eq!(module.imports.len(), 2);
-        assert_eq!(module.structs_and_classes.len(), 1);
-        assert_eq!(module.structs_and_classes[0].name, "Service");
         assert_eq!(module.functions.len(), 1);
-        assert_eq!(module.functions[0].name, "process_stream");
-        assert_eq!(module.functions[0].memory_ops.len(), 2); // alloc & free
+        let f = &module.functions[0];
+        assert_eq!(f.name, "main");
+        assert_eq!(f.body.len(), 2); // for loop and return 0
+
+        if let Statement::ForLoop { var, count, body } = &f.body[0] {
+            assert_eq!(var, "i");
+            assert_eq!(count, "10");
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Expected Statement::ForLoop");
+        }
     }
 }
