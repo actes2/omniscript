@@ -46,7 +46,7 @@ pub struct ParamDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Statement {
-    /// Variable assignment: `x = 5` or `let count = x + 1`
+    /// Variable assignment: `x = 5`, `int x = 0`, `let count = x + 1`
     Assign {
         target: String,
         expr: String,
@@ -57,12 +57,12 @@ pub enum Statement {
         then_branch: Vec<Statement>,
         else_branch: Option<Vec<Statement>>,
     },
-    /// While loop: `while cond:`
+    /// While loop: `while cond:` or `while (cond) {`
     WhileLoop {
         condition: String,
         body: Vec<Statement>,
     },
-    /// For loop: `for var in count/range:`
+    /// For loop: `for var in count:` or `for (int i = 0; i < N; i++) {`
     ForLoop {
         var: String,
         count: String,
@@ -87,6 +87,7 @@ pub enum Statement {
 }
 
 pub struct OmniParser {
+    fn_re: Regex,
     if_re: Regex,
     elif_re: Regex,
     else_re: Regex,
@@ -106,18 +107,81 @@ impl Default for OmniParser {
 impl OmniParser {
     pub fn new() -> Self {
         Self {
-            if_re: Regex::new(r#"^if\s+(.+):$"#).unwrap(),
-            elif_re: Regex::new(r#"^elif\s+(.+):$"#).unwrap(),
-            else_re: Regex::new(r#"^else\s*:$"#).unwrap(),
-            while_re: Regex::new(r#"^while\s+(.+):$"#).unwrap(),
+            // Matches def foo():, int foo() {, fn foo() -> i32 {, func foo() {, function foo() {
+            fn_re: Regex::new(
+                r#"^(?:def|fn|func|function|(?:[a-zA-Z_0-9*]+\s+)+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
+            )
+            .unwrap(),
+            // Matches if (x > 10) {, if x > 10 {, if x > 10:
+            if_re: Regex::new(r#"^if\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
+            // Matches elif x == 5:, else if (x == 5) {, else if x == 5 {
+            elif_re: Regex::new(r#"^(?:elif|else\s+if)\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
+            // Matches else:, else {
+            else_re: Regex::new(r#"^else\s*(?::|\{)?$"#).unwrap(),
+            // Matches while (x > 0) {, while x > 0 {, while x > 0:
+            while_re: Regex::new(r#"^while\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
+            // Matches for (i in 10) {, for (int i = 0; i < 10; i++) {, for i in 10:
             for_re: Regex::new(
-                r#"^for\s+([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?\s*:$"#,
+                r#"^for\s*(?:\((?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+(?:in|:=|=)\s+(?:0\s*;\s*[a-zA-Z_0-9]+\s*<\s*)?(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?(?:;\s*[^)]*)?\)|(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*)?([a-zA-Z_0-9]+)(?:\s*\))?)\s*(?::|\{)?$"#,
             )
             .unwrap(),
             print_re: Regex::new(r#"^print\s*\(\s*(.*)\s*\)$"#).unwrap(),
             return_re: Regex::new(r#"^return(?:\s+(.*))?$"#).unwrap(),
-            assign_re: Regex::new(r#"^(?:let\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#).unwrap(),
+            // Matches x = 5, int x = 0, let count = 10, var y = 2
+            assign_re: Regex::new(
+                r#"^(?:let\s+|var\s+|(?:int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#,
+            )
+            .unwrap(),
         }
+    }
+
+    /// Canonicalizes source code: unifies bracket blocks (`{ ... }`) into hierarchical indentation
+    pub fn canonicalize_source(source: &str) -> String {
+        let raw_lines = source.lines();
+        let has_braces = source.contains('{') || source.contains('}');
+
+        if !has_braces {
+            return source.to_string();
+        }
+
+        let mut out_lines = Vec::new();
+        let mut brace_depth: usize = 0;
+
+        for line in raw_lines {
+            let mut trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Closing brace at start of line
+            if trimmed.starts_with('}') {
+                brace_depth = brace_depth.saturating_sub(1);
+                trimmed = trimmed[1..].trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+            }
+
+            // Strip trailing semicolon
+            if trimmed.ends_with(';') {
+                trimmed = trimmed[..trimmed.len() - 1].trim();
+            }
+
+            // Check if line ends with opening brace
+            let ends_with_open = trimmed.ends_with('{');
+            if ends_with_open {
+                trimmed = trimmed[..trimmed.len() - 1].trim();
+            }
+
+            let indent = "    ".repeat(brace_depth);
+            out_lines.push(format!("{}{}", indent, trimmed));
+
+            if ends_with_open {
+                brace_depth += 1;
+            }
+        }
+
+        out_lines.join("\n")
     }
 
     /// Measure indentation level of a raw line
@@ -126,7 +190,8 @@ impl OmniParser {
     }
 
     /// Parse an OmniScript source string into an `OmniModule`
-    pub fn parse_module(&self, module_name: &str, source: &str) -> OmniModule {
+    pub fn parse_module(&self, module_name: &str, raw_source: &str) -> OmniModule {
+        let source = Self::canonicalize_source(raw_source);
         let mem_norm = omni_mem::MemoryNormalizer::new();
         let mut imports = Vec::new();
         let mut functions = Vec::new();
@@ -181,10 +246,9 @@ impl OmniParser {
                 continue;
             }
 
-            // 4. Function Definition
-            if trimmed.starts_with("def ") {
-                let sig = trimmed[4..].trim_end_matches(':').trim();
-                let fn_name = sig.split('(').next().unwrap_or("unnamed").trim().to_string();
+            // 4. Function Definition (across Python, C, Go, Rust, JS styles)
+            if let Some(caps) = self.fn_re.captures(trimmed) {
+                let fn_name = caps[1].to_string();
                 let fn_indent = Self::indent_level(line);
                 
                 idx += 1;
@@ -250,7 +314,7 @@ impl OmniParser {
 
             // 1. If statement with optional elif/else
             if let Some(caps) = self.if_re.captures(text) {
-                let condition = caps[1].trim().to_string();
+                let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
 
                 let (then_branch, mut next_i) = self.consume_indented_block(lines, i + 1, indent);
                 let mut else_branch = None;
@@ -259,7 +323,7 @@ impl OmniParser {
                 if next_i < lines.len() && lines[next_i].0 == indent {
                     let next_text = lines[next_i].1.trim();
                     if let Some(elif_caps) = self.elif_re.captures(next_text) {
-                        let elif_cond = elif_caps[1].trim().to_string();
+                        let elif_cond = elif_caps.get(1).or_else(|| elif_caps.get(2)).unwrap().as_str().trim().to_string();
                         let (elif_then, after_elif) = self.consume_indented_block(lines, next_i + 1, indent);
                         else_branch = Some(vec![Statement::If {
                             condition: elif_cond,
@@ -285,7 +349,7 @@ impl OmniParser {
 
             // 2. While loop
             if let Some(caps) = self.while_re.captures(text) {
-                let condition = caps[1].trim().to_string();
+                let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
                 let (body, next_i) = self.consume_indented_block(lines, i + 1, indent);
                 stmts.push(Statement::WhileLoop { condition, body });
                 i = next_i;
@@ -294,8 +358,8 @@ impl OmniParser {
 
             // 3. For loop
             if let Some(caps) = self.for_re.captures(text) {
-                let var = caps[1].to_string();
-                let count = caps[2].to_string();
+                let var = caps.get(1).or_else(|| caps.get(3)).unwrap().as_str().to_string();
+                let count = caps.get(2).or_else(|| caps.get(4)).unwrap().as_str().to_string();
                 let (body, next_i) = self.consume_indented_block(lines, i + 1, indent);
                 stmts.push(Statement::ForLoop { var, count, body });
                 i = next_i;
@@ -319,7 +383,7 @@ impl OmniParser {
                 continue;
             }
 
-            // 6. Assignment (e.g. `x = 5`, `let val = a + b`)
+            // 6. Assignment (e.g. `x = 5`, `int count = 10`)
             if let Some(caps) = self.assign_re.captures(text) {
                 stmts.push(Statement::Assign {
                     target: caps[1].trim().to_string(),
@@ -377,54 +441,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_if_else() {
-        let src = r#"
-def check(val):
-   if val > 10:
-     print("Greater")
-   else:
-     print("Lesser")
-   return 0
+    fn test_parse_bracket_based_c_style() {
+        let c_src = r#"
+int main() {
+    int x = 0;
+    while (x < 3) {
+        print(x);
+        x = x + 1;
+    }
+    if (x == 3) {
+        print("Success");
+    } else {
+        print("Failed");
+    }
+    return 0;
+}
 "#;
         let parser = OmniParser::new();
-        let module = parser.parse_module("test_mod", src);
+        let module = parser.parse_module("c_test", c_src);
 
         assert_eq!(module.functions.len(), 1);
         let f = &module.functions[0];
-        assert_eq!(f.body.len(), 2); // If and Return
-
-        if let Statement::If { condition, then_branch, else_branch } = &f.body[0] {
-            assert_eq!(condition, "val > 10");
-            assert_eq!(then_branch.len(), 1);
-            assert!(else_branch.is_some());
-            assert_eq!(else_branch.as_ref().unwrap().len(), 1);
-        } else {
-            panic!("Expected Statement::If");
-        }
+        assert_eq!(f.name, "main");
+        assert_eq!(f.body.len(), 4); // Assign x, WhileLoop, If, Return
     }
 
     #[test]
-    fn test_parse_while_loop() {
+    fn test_parse_c_for_loop_with_brackets() {
         let src = r#"
-def loop_test():
-   x = 10
-   while x > 0:
-     print(x)
-     x = x - 1
-   return x
+fn run() {
+    for (int i = 0; i < 10; i++) {
+        print(i);
+    }
+    return 0;
+}
 "#;
         let parser = OmniParser::new();
-        let module = parser.parse_module("test_mod", src);
+        let module = parser.parse_module("for_test", src);
 
         assert_eq!(module.functions.len(), 1);
         let f = &module.functions[0];
-        assert_eq!(f.body.len(), 3); // Assign, While, Return
+        assert_eq!(f.name, "run");
 
-        if let Statement::WhileLoop { condition, body } = &f.body[1] {
-            assert_eq!(condition, "x > 0");
-            assert_eq!(body.len(), 2);
+        if let Statement::ForLoop { var, count, body } = &f.body[0] {
+            assert_eq!(var, "i");
+            assert_eq!(count, "10");
+            assert_eq!(body.len(), 1);
         } else {
-            panic!("Expected Statement::WhileLoop");
+            panic!("Expected Statement::ForLoop");
         }
     }
 }

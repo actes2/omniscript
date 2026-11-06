@@ -1,0 +1,22 @@
+int main() {
+    print("=== Testing Bracket-Based C/Java/Rust Syntax ===");
+    
+    int count = 0;
+    while (count < 3) {
+        print("Count is:");
+        print(count);
+        count = count + 1;
+    }
+
+    if (count == 3) {
+        print("Brackets Verified!");
+    } else {
+        print("Failed!");
+    }
+
+    for (int i = 0; i < 4; i++) {
+        print(i);
+    }
+
+    return 0;
+}
