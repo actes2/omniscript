@@ -1,8 +1,64 @@
-use omni_engine::InferenceEngine;
+use omni_engine::{InferenceEngine, SsaContextEnvelope, SsaVariable};
 use omni_mem::UnifiedMemOp;
 use omni_parser::{OmniModule, Statement};
 use regex::Regex;
 use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct SymbolBinding {
+    pub name: String,
+    pub llvm_ptr: String,
+    pub type_hint: String,
+    pub is_scoped: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScopeTree {
+    scopes: Vec<HashMap<String, SymbolBinding>>,
+}
+
+impl ScopeTree {
+    pub fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    pub fn enter_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    pub fn exit_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    pub fn insert(&mut self, name: String, binding: SymbolBinding) {
+        if let Some(curr) = self.scopes.last_mut() {
+            curr.insert(name, binding);
+        }
+    }
+
+    pub fn resolve(&self, name: &str) -> Option<&SymbolBinding> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(b) = scope.get(name) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    pub fn active_bindings(&self) -> Vec<SymbolBinding> {
+        let mut map = HashMap::new();
+        for scope in &self.scopes {
+            for (k, v) in scope {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        map.into_values().collect()
+    }
+}
 
 pub struct CodeGenerator<'a> {
     engine: &'a dyn InferenceEngine,
@@ -58,7 +114,7 @@ impl<'a> CodeGenerator<'a> {
         &self,
         expr: &str,
         ir: &mut String,
-        sym_table: &HashMap<String, String>,
+        scope_tree: &ScopeTree,
         temp_counter: &mut usize,
     ) -> String {
         let trimmed = expr.trim();
@@ -70,9 +126,9 @@ impl<'a> CodeGenerator<'a> {
 
         // Binary arithmetic: a + b, x - 1, etc.
         if let Some(caps) = self.bin_re.captures(trimmed) {
-            let left = self.eval_val(&caps[1], ir, sym_table, temp_counter);
+            let left = self.eval_val(&caps[1], ir, scope_tree, temp_counter);
             let op = &caps[2];
-            let right = self.eval_val(&caps[3], ir, sym_table, temp_counter);
+            let right = self.eval_val(&caps[3], ir, scope_tree, temp_counter);
 
             let res_var = format!("%t_{}", *temp_counter);
             *temp_counter += 1;
@@ -91,10 +147,10 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // Variable in symbol table
-        if let Some(alloca_ptr) = sym_table.get(trimmed) {
+        if let Some(binding) = scope_tree.resolve(trimmed) {
             let res_var = format!("%t_{}", *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, alloca_ptr));
+            ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, binding.llvm_ptr));
             return res_var;
         }
 
@@ -106,15 +162,15 @@ impl<'a> CodeGenerator<'a> {
         &self,
         cond: &str,
         ir: &mut String,
-        sym_table: &HashMap<String, String>,
+        scope_tree: &ScopeTree,
         temp_counter: &mut usize,
     ) -> String {
         let trimmed = cond.trim();
 
         if let Some(caps) = self.cmp_re.captures(trimmed) {
-            let left = self.eval_val(&caps[1], ir, sym_table, temp_counter);
+            let left = self.eval_val(&caps[1], ir, scope_tree, temp_counter);
             let op = &caps[2];
-            let right = self.eval_val(&caps[3], ir, sym_table, temp_counter);
+            let right = self.eval_val(&caps[3], ir, scope_tree, temp_counter);
 
             let cond_var = format!("%cond_{}", *temp_counter);
             *temp_counter += 1;
@@ -137,7 +193,7 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // Truthiness check on value != 0
-        let val = self.eval_val(trimmed, ir, sym_table, temp_counter);
+        let val = self.eval_val(trimmed, ir, scope_tree, temp_counter);
         let cond_var = format!("%cond_{}", *temp_counter);
         *temp_counter += 1;
         ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cond_var, val));
@@ -149,35 +205,55 @@ impl<'a> CodeGenerator<'a> {
         &self,
         stmts: &[Statement],
         ir: &mut String,
-        sym_table: &mut HashMap<String, String>,
+        scope_tree: &mut ScopeTree,
+        deferred_frees: &mut Vec<String>,
         string_constants: &[(String, String, usize)],
         cur_str_idx: &mut usize,
         lbl_counter: &mut usize,
         temp_counter: &mut usize,
         fn_name: &str,
+        struct_defs: &[String],
         temp: f32,
     ) -> anyhow::Result<bool> {
         let mut custom_return = false;
 
         for stmt in stmts {
             match stmt {
-                // 1. Variable Assignment: `x = 5`, `count = x + 1`
-                Statement::Assign { target, expr } => {
-                    let alloca_ptr = if let Some(p) = sym_table.get(target) {
-                        p.clone()
-                    } else {
-                        let ptr = format!("%var_{}", target);
+                // 1. Variable Assignment or Scoped Declaration: `x = 5`, `count := 0`
+                Statement::Assign {
+                    target,
+                    expr,
+                    idiom: _,
+                    is_scoped_decl,
+                } => {
+                    let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                        let ptr = format!("%var_{}_{}", target, *temp_counter);
+                        *temp_counter += 1;
                         ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        sym_table.insert(target.clone(), ptr.clone());
+                        scope_tree.insert(
+                            target.clone(),
+                            SymbolBinding {
+                                name: target.clone(),
+                                llvm_ptr: ptr.clone(),
+                                type_hint: "i32".to_string(),
+                                is_scoped: *is_scoped_decl,
+                            },
+                        );
                         ptr
+                    } else {
+                        scope_tree.resolve(target).unwrap().llvm_ptr.clone()
                     };
 
-                    let val = self.eval_val(expr, ir, sym_table, temp_counter);
+                    let val = self.eval_val(expr, ir, scope_tree, temp_counter);
                     ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
                 }
 
                 // 2. If Statement with optional Else
-                Statement::If { condition, then_branch, else_branch } => {
+                Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
                     let id = *lbl_counter;
                     *lbl_counter += 1;
 
@@ -185,19 +261,37 @@ impl<'a> CodeGenerator<'a> {
                     let else_lbl = format!("if_else_{}", id);
                     let merge_lbl = format!("if_merge_{}", id);
 
-                    let cond_var = self.eval_cond(condition, ir, sym_table, temp_counter);
-                    
+                    let cond_var = self.eval_cond(condition, ir, scope_tree, temp_counter);
+
                     if else_branch.is_some() {
-                        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cond_var, then_lbl, else_lbl));
+                        ir.push_str(&format!(
+                            "  br i1 {}, label %{}, label %{}\n\n",
+                            cond_var, then_lbl, else_lbl
+                        ));
                     } else {
-                        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cond_var, then_lbl, merge_lbl));
+                        ir.push_str(&format!(
+                            "  br i1 {}, label %{}, label %{}\n\n",
+                            cond_var, then_lbl, merge_lbl
+                        ));
                     }
 
                     // Then branch
                     ir.push_str(&format!("{}:\n", then_lbl));
+                    scope_tree.enter_scope();
                     let then_ret = self.lower_statements(
-                        then_branch, ir, sym_table, string_constants, cur_str_idx, lbl_counter, temp_counter, fn_name, temp
+                        then_branch,
+                        ir,
+                        scope_tree,
+                        deferred_frees,
+                        string_constants,
+                        cur_str_idx,
+                        lbl_counter,
+                        temp_counter,
+                        fn_name,
+                        struct_defs,
+                        temp,
                     )?;
+                    scope_tree.exit_scope();
                     if !then_ret {
                         ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
                     }
@@ -205,9 +299,21 @@ impl<'a> CodeGenerator<'a> {
                     // Else branch
                     if let Some(eb) = else_branch {
                         ir.push_str(&format!("{}:\n", else_lbl));
+                        scope_tree.enter_scope();
                         let else_ret = self.lower_statements(
-                            eb, ir, sym_table, string_constants, cur_str_idx, lbl_counter, temp_counter, fn_name, temp
+                            eb,
+                            ir,
+                            scope_tree,
+                            deferred_frees,
+                            string_constants,
+                            cur_str_idx,
+                            lbl_counter,
+                            temp_counter,
+                            fn_name,
+                            struct_defs,
+                            temp,
                         )?;
+                        scope_tree.exit_scope();
                         if !else_ret {
                             ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
                         }
@@ -228,13 +334,28 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
                     ir.push_str(&format!("{}:\n", cond_lbl));
 
-                    let cond_var = self.eval_cond(condition, ir, sym_table, temp_counter);
-                    ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cond_var, body_lbl, exit_lbl));
+                    let cond_var = self.eval_cond(condition, ir, scope_tree, temp_counter);
+                    ir.push_str(&format!(
+                        "  br i1 {}, label %{}, label %{}\n\n",
+                        cond_var, body_lbl, exit_lbl
+                    ));
 
                     ir.push_str(&format!("{}:\n", body_lbl));
+                    scope_tree.enter_scope();
                     let body_ret = self.lower_statements(
-                        body, ir, sym_table, string_constants, cur_str_idx, lbl_counter, temp_counter, fn_name, temp
+                        body,
+                        ir,
+                        scope_tree,
+                        deferred_frees,
+                        string_constants,
+                        cur_str_idx,
+                        lbl_counter,
+                        temp_counter,
+                        fn_name,
+                        struct_defs,
+                        temp,
                     )?;
+                    scope_tree.exit_scope();
                     if !body_ret {
                         ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
                     }
@@ -251,10 +372,21 @@ impl<'a> CodeGenerator<'a> {
                     let body_lbl = format!("for_body_{}", id);
                     let exit_lbl = format!("for_exit_{}", id);
 
-                    let idx_ptr = format!("%var_{}", var);
+                    let idx_ptr = format!("%var_{}_{}", var, *temp_counter);
+                    *temp_counter += 1;
                     ir.push_str(&format!("  {} = alloca i32\n", idx_ptr));
                     ir.push_str(&format!("  store i32 0, i32* {}\n", idx_ptr));
-                    sym_table.insert(var.clone(), idx_ptr.clone());
+
+                    scope_tree.enter_scope();
+                    scope_tree.insert(
+                        var.clone(),
+                        SymbolBinding {
+                            name: var.clone(),
+                            llvm_ptr: idx_ptr.clone(),
+                            type_hint: "i32".to_string(),
+                            is_scoped: true,
+                        },
+                    );
 
                     ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
                     ir.push_str(&format!("{}:\n", cond_lbl));
@@ -262,22 +394,37 @@ impl<'a> CodeGenerator<'a> {
                     let curr_val = format!("%curr_{}", id);
                     ir.push_str(&format!("  {} = load i32, i32* {}\n", curr_val, idx_ptr));
 
-                    let count_limit = self.eval_val(count, ir, sym_table, temp_counter);
+                    let count_limit = self.eval_val(count, ir, scope_tree, temp_counter);
                     let cmp_var = format!("%cmp_{}", id);
                     ir.push_str(&format!(
                         "  {} = icmp slt i32 {}, {}\n",
                         cmp_var, curr_val, count_limit
                     ));
-                    ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cmp_var, body_lbl, exit_lbl));
+                    ir.push_str(&format!(
+                        "  br i1 {}, label %{}, label %{}\n\n",
+                        cmp_var, body_lbl, exit_lbl
+                    ));
 
                     ir.push_str(&format!("{}:\n", body_lbl));
                     let body_ret = self.lower_statements(
-                        body, ir, sym_table, string_constants, cur_str_idx, lbl_counter, temp_counter, fn_name, temp
+                        body,
+                        ir,
+                        scope_tree,
+                        deferred_frees,
+                        string_constants,
+                        cur_str_idx,
+                        lbl_counter,
+                        temp_counter,
+                        fn_name,
+                        struct_defs,
+                        temp,
                     )?;
 
                     let next_val = format!("%next_{}", id);
                     ir.push_str(&format!("  {} = add i32 {}, 1\n", next_val, curr_val));
                     ir.push_str(&format!("  store i32 {}, i32* {}\n", next_val, idx_ptr));
+
+                    scope_tree.exit_scope();
 
                     if !body_ret {
                         ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
@@ -304,7 +451,7 @@ impl<'a> CodeGenerator<'a> {
                         ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
                     } else {
                         // Print integer / expression value via @__omni_print_int
-                        let val = self.eval_val(trimmed, ir, sym_table, temp_counter);
+                        let val = self.eval_val(trimmed, ir, scope_tree, temp_counter);
                         let val_64 = format!("%ext_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
@@ -312,27 +459,109 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
 
-                // 6. Return Statement
+                // 6. Unified Memory Operations (Alloc / Free / Defer)
+                Statement::MemOp { op, is_deferred } => match op {
+                    UnifiedMemOp::Alloc {
+                        target,
+                        size_bytes,
+                        ..
+                    } => {
+                        let sz: u64 = size_bytes.parse().unwrap_or(64);
+                        ir.push_str(&format!("  ; [UMO Inline Alloc: {} bytes]\n", sz));
+                        let ptr_name = format!("%{}", target);
+                        ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr_name, sz));
+                        scope_tree.insert(
+                            target.clone(),
+                            SymbolBinding {
+                                name: target.clone(),
+                                llvm_ptr: ptr_name,
+                                type_hint: "i8*".to_string(),
+                                is_scoped: false,
+                            },
+                        );
+                    }
+                    UnifiedMemOp::Free { target } => {
+                        if *is_deferred {
+                            ir.push_str(&format!("  ; [UMO Registered Defer Free: %{}]\n", target));
+                            deferred_frees.push(target.clone());
+                        } else {
+                            ir.push_str(&format!("  ; [UMO Inline Free: %{}]\n", target));
+                            ir.push_str(&format!("  call void @free(i8* %{})\n", target));
+                        }
+                    }
+                    _ => {}
+                },
+
+                // 7. Return Statement
                 Statement::Return { expr } => {
                     let ret_val = if let Some(e) = expr {
-                        self.eval_val(e, ir, sym_table, temp_counter)
+                        self.eval_val(e, ir, scope_tree, temp_counter)
                     } else {
                         "0".to_string()
                     };
+
+                    // Execute any deferred frees before returning
+                    for def_target in deferred_frees.iter().rev() {
+                        ir.push_str(&format!("  ; [Deferred Free at Return: %{}]\n", def_target));
+                        ir.push_str(&format!("  call void @free(i8* %{})\n", def_target));
+                    }
+
                     ir.push_str(&format!("  ret i32 {}\n", ret_val));
                     custom_return = true;
                     break;
                 }
 
-                // 7. Intent Statement
+                // 8. Intent Statement -> packed into SsaContextEnvelope
                 Statement::Intent { instruction } => {
-                    let synthesized = self.engine.lower_intent(fn_name, instruction, temp)?;
+                    let active_symbols: Vec<SsaVariable> = scope_tree
+                        .active_bindings()
+                        .into_iter()
+                        .map(|b| SsaVariable {
+                            name: b.name,
+                            llvm_name: b.llvm_ptr,
+                            type_hint: b.type_hint,
+                        })
+                        .collect();
+
+                    let envelope = SsaContextEnvelope {
+                        target_abi: "x86_64-pc-linux-gnu".to_string(),
+                        enclosing_fn: fn_name.to_string(),
+                        return_type: "i32".to_string(),
+                        next_ssa_idx: *temp_counter,
+                        active_symbols,
+                        struct_definitions: struct_defs.to_vec(),
+                        raw_intent: instruction.clone(),
+                        idiom_hint: None,
+                    };
+
+                    let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     ir.push_str(&synthesized);
                 }
 
-                // 8. Fallback Concrete / Polyglot Statement -> routed to AI Lowering
-                Statement::Concrete { code } => {
-                    let synthesized = self.engine.lower_intent(fn_name, code, temp)?;
+                // 9. Fallback Concrete / Polyglot Statement -> packed with Idiom hint
+                Statement::Concrete { code, idiom } => {
+                    let active_symbols: Vec<SsaVariable> = scope_tree
+                        .active_bindings()
+                        .into_iter()
+                        .map(|b| SsaVariable {
+                            name: b.name,
+                            llvm_name: b.llvm_ptr,
+                            type_hint: b.type_hint,
+                        })
+                        .collect();
+
+                    let envelope = SsaContextEnvelope {
+                        target_abi: "x86_64-pc-linux-gnu".to_string(),
+                        enclosing_fn: fn_name.to_string(),
+                        return_type: "i32".to_string(),
+                        next_ssa_idx: *temp_counter,
+                        active_symbols,
+                        struct_definitions: struct_defs.to_vec(),
+                        raw_intent: code.clone(),
+                        idiom_hint: Some(format!("{:?}", idiom)),
+                    };
+
+                    let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     ir.push_str(&synthesized);
                 }
             }
@@ -377,9 +606,12 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("\n");
 
         // 1. Classes -> Struct Types
+        let mut struct_defs = Vec::new();
         for cls in &module.structs_and_classes {
             ir.push_str(&format!("; Class: {}\n", cls.name));
-            ir.push_str(&format!("%struct.{} = type {{ i8* }}\n\n", cls.name));
+            let s_def = format!("%struct.{} = type {{ i8* }}", cls.name);
+            ir.push_str(&format!("{}\n\n", s_def));
+            struct_defs.push(s_def);
         }
 
         // 2. Functions (namespaced as @__omni_fn_<name>)
@@ -398,37 +630,28 @@ impl<'a> CodeGenerator<'a> {
                 func.name
             ));
 
-            let mut sym_table = HashMap::new();
-
-            // Allocate local buffers from UMO
-            for op in &func.memory_ops {
-                match op {
-                    UnifiedMemOp::Alloc { target, size_bytes, .. } => {
-                        let sz: u64 = size_bytes.parse().unwrap_or(64);
-                        ir.push_str(&format!("  ; [UMO Alloc: {} bytes]\n", sz));
-                        ir.push_str(&format!("  %{} = call i8* @malloc(i64 {})\n", target, sz));
-                    }
-                    UnifiedMemOp::Free { target } => {
-                        ir.push_str(&format!("  ; [UMO Free: %{}]\n", target));
-                        ir.push_str(&format!("  call void @free(i8* %{})\n", target));
-                    }
-                    _ => {}
-                }
-            }
+            let mut scope_tree = ScopeTree::new();
+            let mut deferred_frees = Vec::new();
 
             let custom_ret = self.lower_statements(
                 &func.body,
                 &mut ir,
-                &mut sym_table,
+                &mut scope_tree,
+                &mut deferred_frees,
                 &string_constants,
                 &mut cur_str_idx,
                 &mut lbl_counter,
                 &mut temp_counter,
                 &func.name,
+                &struct_defs,
                 temp,
             )?;
 
             if !custom_ret {
+                for def_target in deferred_frees.iter().rev() {
+                    ir.push_str(&format!("  ; [Deferred Free at Function Exit: %{}]\n", def_target));
+                    ir.push_str(&format!("  call void @free(i8* %{})\n", def_target));
+                }
                 ir.push_str("  ret i32 0\n");
             }
             ir.push_str("}\n\n");

@@ -1,4 +1,4 @@
-use omni_mem::UnifiedMemOp;
+use omni_mem::{MemoryNormalizer, UnifiedMemOp};
 use omni_preamble::ImportDirective;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -44,12 +44,24 @@ pub struct ParamDef {
     pub type_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdiomFamily {
+    Standard,
+    GoScopedDeclaration,
+    PythonWalrus,
+    ClosureLambda,
+    PatternArm,
+    Unknown(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Statement {
-    /// Variable assignment: `x = 5`, `int x = 0`, `let count = x + 1`
+    /// Variable assignment or scoped declaration: `x = 5`, `int x = 0`, `count := 10`
     Assign {
         target: String,
         expr: String,
+        idiom: IdiomFamily,
+        is_scoped_decl: bool,
     },
     /// If statement with optional else
     If {
@@ -76,6 +88,11 @@ pub enum Statement {
     Return {
         expr: Option<String>,
     },
+    /// Explicit Unified Memory Operation embedded in statement sequence
+    MemOp {
+        op: UnifiedMemOp,
+        is_deferred: bool,
+    },
     /// Abstract intent block awaiting model synthesis
     Intent {
         instruction: String,
@@ -83,6 +100,7 @@ pub enum Statement {
     /// Fallback concrete or polyglot statement
     Concrete {
         code: String,
+        idiom: IdiomFamily,
     },
 }
 
@@ -95,6 +113,7 @@ pub struct OmniParser {
     for_re: Regex,
     print_re: Regex,
     return_re: Regex,
+    walrus_assign_re: Regex,
     assign_re: Regex,
 }
 
@@ -127,16 +146,19 @@ impl OmniParser {
             .unwrap(),
             print_re: Regex::new(r#"^print\s*\(\s*(.*)\s*\)$"#).unwrap(),
             return_re: Regex::new(r#"^return(?:\s+(.*))?$"#).unwrap(),
+            // Go scoped declaration: count := 0
+            walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+)$"#).unwrap(),
             // Matches x = 5, int x = 0, let count = 10, var y = 2
             assign_re: Regex::new(
-                r#"^(?:let\s+|var\s+|(?:int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#,
+                r#"^(?:(let|var|int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#,
             )
             .unwrap(),
         }
     }
 
     /// Canonicalizes source code: unifies bracket blocks (`{ ... }`), `end` blocks, postfix conditionals,
-    /// increments (`i++`), and walrus operators (`:=`) into hierarchical canonical AST lines.
+    /// and increments (`i++`) into hierarchical canonical AST lines.
+    /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
         let raw_lines = source.lines();
         let has_explicit_blocks = source.contains('{') || source.contains('}') || source.contains("end");
@@ -182,10 +204,7 @@ impl OmniParser {
                 line_str = line_str[..line_str.len() - 3].trim().to_string();
             }
 
-            // 5. Replace Go walrus `:=` with `=`
-            line_str = line_str.replace(":=", "=");
-
-            // 6. Handle C-style increment/decrement: `i++` -> `i = i + 1`
+            // 5. Handle C-style increment/decrement: `i++` -> `i = i + 1`
             if let Some(caps) = inc_re.captures(&line_str) {
                 let var = &caps[1];
                 line_str = format!("{} = {} + 1", var, var);
@@ -194,7 +213,7 @@ impl OmniParser {
                 line_str = format!("{} = {} - 1", var, var);
             }
 
-            // 7. Check if line ends with opening brace
+            // 6. Check if line ends with opening brace
             let ends_with_open = line_str.ends_with('{');
             if ends_with_open {
                 line_str = line_str[..line_str.len() - 1].trim().to_string();
@@ -207,7 +226,7 @@ impl OmniParser {
                 " ".repeat(count)
             };
 
-            // 8. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
+            // 7. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
             if !line_str.starts_with("if ") && !line_str.starts_with("if(") {
                 if let Some(caps) = postfix_if_re.captures(&line_str) {
                     let stmt = caps[1].trim();
@@ -236,7 +255,7 @@ impl OmniParser {
     /// Parse an OmniScript source string into an `OmniModule`
     pub fn parse_module(&self, module_name: &str, raw_source: &str) -> OmniModule {
         let source = Self::canonicalize_source(raw_source);
-        let mem_norm = omni_mem::MemoryNormalizer::new();
+        let mem_norm = MemoryNormalizer::new();
         let mut imports = Vec::new();
         let mut functions = Vec::new();
         let mut classes = Vec::new();
@@ -255,14 +274,14 @@ impl OmniParser {
                 continue;
             }
 
-            // 1. Decorator `@dataclass`
+            // Decorators
             if trimmed.starts_with('@') {
                 current_decorators.push(trimmed.to_string());
                 idx += 1;
                 continue;
             }
 
-            // 2. Import Directive
+            // Import directives
             if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
                 if let Some(directive) = omni_preamble::SymbolCarver::parse_directive(trimmed) {
                     imports.push(directive);
@@ -271,32 +290,110 @@ impl OmniParser {
                 continue;
             }
 
-            // 3. Class Definition
+            // Class definitions: `class DataPipeline:` or `class Foo(Bar):`
             if trimmed.starts_with("class ") {
-                let class_name = trimmed[6..]
-                    .trim_end_matches(':')
-                    .trim()
-                    .to_string();
-                let class_def = ClassDef {
+                let class_line = trimmed.trim_start_matches("class ").trim_end_matches(':').trim();
+                let (class_name, bases) = if let Some(open) = class_line.find('(') {
+                    let name = class_line[..open].trim().to_string();
+                    let end = class_line.rfind(')').unwrap_or(class_line.len());
+                    let base_str = &class_line[open + 1..end];
+                    let base_list: Vec<String> = base_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    (name, base_list)
+                } else {
+                    (class_line.to_string(), Vec::new())
+                };
+
+                let parent_indent = Self::indent_level(line);
+                idx += 1;
+
+                let mut class_methods = Vec::new();
+                let mut class_fields = Vec::new();
+
+                while idx < raw_lines.len() {
+                    let next_line = raw_lines[idx];
+                    let next_trimmed = next_line.trim();
+
+                    if next_trimmed.is_empty() || next_trimmed.starts_with('#') || next_trimmed.starts_with("//") {
+                        idx += 1;
+                        continue;
+                    }
+
+                    let cur_indent = Self::indent_level(next_line);
+                    if cur_indent <= parent_indent {
+                        break;
+                    }
+
+                    if let Some(caps) = self.fn_re.captures(next_trimmed) {
+                        let method_name = caps[1].to_string();
+                        let method_indent = cur_indent;
+                        idx += 1;
+
+                        let mut method_lines = Vec::new();
+                        while idx < raw_lines.len() {
+                            let m_line = raw_lines[idx];
+                            let m_trimmed = m_line.trim();
+                            if m_trimmed.is_empty() {
+                                idx += 1;
+                                continue;
+                            }
+                            let m_indent = Self::indent_level(m_line);
+                            if m_indent > method_indent {
+                                method_lines.push((m_indent, m_trimmed.to_string()));
+                                idx += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let body = self.parse_block(&method_lines, &method_name, &mem_norm);
+                        let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                        let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
+
+                        class_methods.push(FunctionDef {
+                            name: method_name,
+                            is_method: true,
+                            params: Vec::new(),
+                            return_type: None,
+                            body,
+                            memory_ops,
+                        });
+                        continue;
+                    }
+
+                    if next_trimmed.contains('=') && !next_trimmed.starts_with("if") {
+                        let parts: Vec<&str> = next_trimmed.splitn(2, '=').collect();
+                        class_fields.push(FieldDef {
+                            name: parts[0].trim().to_string(),
+                            type_hint: None,
+                            default_val: Some(parts[1].trim().to_string()),
+                        });
+                    }
+
+                    idx += 1;
+                }
+
+                classes.push(ClassDef {
                     name: class_name,
                     decorators: current_decorators.clone(),
-                    base_classes: Vec::new(),
-                    fields: Vec::new(),
-                    methods: Vec::new(),
-                };
-                classes.push(class_def);
+                    base_classes: bases,
+                    fields: class_fields,
+                    methods: class_methods,
+                });
                 current_decorators.clear();
-                idx += 1;
                 continue;
             }
 
-            // 4. Function Definition (across Python, C, Go, Rust, JS styles)
+            // Top-level functions: `def foo():`, `fn foo() -> i32:`, `int foo() {`
             if let Some(caps) = self.fn_re.captures(trimmed) {
                 let fn_name = caps[1].to_string();
                 let fn_indent = Self::indent_level(line);
-                
                 idx += 1;
-                let mut block_lines: Vec<(usize, String)> = Vec::new();
+
+                let mut block_lines = Vec::new();
 
                 while idx < raw_lines.len() {
                     let next_line = raw_lines[idx];
@@ -316,7 +413,7 @@ impl OmniParser {
                     }
                 }
 
-                let body = self.parse_block(&block_lines);
+                let body = self.parse_block(&block_lines, &fn_name, &mem_norm);
                 let raw_joined = block_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
                 let memory_ops = mem_norm.normalize_block(&raw_joined, &fn_name);
 
@@ -335,8 +432,18 @@ impl OmniParser {
             // Top-level statement
             top_level.push(Statement::Concrete {
                 code: trimmed.to_string(),
+                idiom: IdiomFamily::Standard,
             });
             idx += 1;
+        }
+
+        // If top-level functions were empty but methods exist, lift methods to top-level functions
+        if functions.is_empty() {
+            for cls in &classes {
+                for method in &cls.methods {
+                    functions.push(method.clone());
+                }
+            }
         }
 
         OmniModule {
@@ -349,7 +456,12 @@ impl OmniParser {
     }
 
     /// Recursively parse indented block lines into statements
-    fn parse_block(&self, lines: &[(usize, String)]) -> Vec<Statement> {
+    fn parse_block(
+        &self,
+        lines: &[(usize, String)],
+        fn_name: &str,
+        mem_norm: &MemoryNormalizer,
+    ) -> Vec<Statement> {
         let mut stmts = Vec::new();
         let mut i = 0;
 
@@ -360,7 +472,7 @@ impl OmniParser {
             if let Some(caps) = self.if_re.captures(text) {
                 let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
 
-                let (then_branch, mut next_i) = self.consume_indented_block(lines, i + 1, indent);
+                let (then_branch, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 let mut else_branch = None;
 
                 // Check for `elif` or `else` at the same indentation level
@@ -368,7 +480,7 @@ impl OmniParser {
                     let next_text = lines[next_i].1.trim();
                     if let Some(elif_caps) = self.elif_re.captures(next_text) {
                         let elif_cond = elif_caps.get(1).or_else(|| elif_caps.get(2)).unwrap().as_str().trim().to_string();
-                        let (elif_then, after_elif) = self.consume_indented_block(lines, next_i + 1, indent);
+                        let (elif_then, after_elif) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
                         else_branch = Some(vec![Statement::If {
                             condition: elif_cond,
                             then_branch: elif_then,
@@ -376,7 +488,7 @@ impl OmniParser {
                         }]);
                         next_i = after_elif;
                     } else if self.else_re.is_match(next_text) {
-                        let (else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent);
+                        let (else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
                         else_branch = Some(else_body);
                         next_i = after_else;
                     }
@@ -394,7 +506,7 @@ impl OmniParser {
             // 2. While loop
             if let Some(caps) = self.while_re.captures(text) {
                 let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
-                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent);
+                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 stmts.push(Statement::WhileLoop { condition, body });
                 i = next_i;
                 continue;
@@ -404,7 +516,7 @@ impl OmniParser {
             if let Some(caps) = self.for_re.captures(text) {
                 let var = caps.get(1).or_else(|| caps.get(3)).unwrap().as_str().to_string();
                 let count = caps.get(2).or_else(|| caps.get(4)).unwrap().as_str().to_string();
-                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent);
+                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 stmts.push(Statement::ForLoop { var, count, body });
                 i = next_i;
                 continue;
@@ -427,17 +539,45 @@ impl OmniParser {
                 continue;
             }
 
-            // 6. Assignment (e.g. `x = 5`, `int count = 10`)
-            if let Some(caps) = self.assign_re.captures(text) {
+            // 6. Explicit Memory Operations (e.g. `temp_buf = alloc(2048)`, `defer free(temp_buf)`)
+            if let Some(op) = mem_norm.normalize_line(text, fn_name) {
+                match op {
+                    UnifiedMemOp::Alloc { .. } | UnifiedMemOp::Free { .. } => {
+                        let is_deferred = text.trim().starts_with("defer ");
+                        stmts.push(Statement::MemOp { op, is_deferred });
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            // 7. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
+            if let Some(caps) = self.walrus_assign_re.captures(text) {
                 stmts.push(Statement::Assign {
                     target: caps[1].trim().to_string(),
                     expr: caps[2].trim().to_string(),
+                    idiom: IdiomFamily::GoScopedDeclaration,
+                    is_scoped_decl: true,
                 });
                 i += 1;
                 continue;
             }
 
-            // 7. Intent
+            // 8. Standard Assignment (e.g. `x = 5`, `int count = 10`, `let count = 0`)
+            if let Some(caps) = self.assign_re.captures(text) {
+                let is_scoped = caps.get(1).is_some();
+                stmts.push(Statement::Assign {
+                    target: caps[2].trim().to_string(),
+                    expr: caps[3].trim().to_string(),
+                    idiom: IdiomFamily::Standard,
+                    is_scoped_decl: is_scoped,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 9. Intent Block
             if text.starts_with("intent") {
                 stmts.push(Statement::Intent {
                     instruction: text.clone(),
@@ -446,9 +586,18 @@ impl OmniParser {
                 continue;
             }
 
-            // 8. Fallback Concrete / Non-standard syntax
+            // 10. Fallback Concrete / Polyglot Statement
+            let idiom = if text.contains("=>") {
+                IdiomFamily::ClosureLambda
+            } else if text.contains("match ") || text.contains("case ") {
+                IdiomFamily::PatternArm
+            } else {
+                IdiomFamily::Unknown("polyglot".to_string())
+            };
+
             stmts.push(Statement::Concrete {
                 code: text.clone(),
+                idiom,
             });
             i += 1;
         }
@@ -462,6 +611,8 @@ impl OmniParser {
         lines: &[(usize, String)],
         start_idx: usize,
         parent_indent: usize,
+        fn_name: &str,
+        mem_norm: &MemoryNormalizer,
     ) -> (Vec<Statement>, usize) {
         let mut nested = Vec::new();
         let mut j = start_idx;
@@ -475,7 +626,7 @@ impl OmniParser {
             }
         }
 
-        let body = self.parse_block(&nested);
+        let body = self.parse_block(&nested, fn_name, mem_norm);
         (body, j)
     }
 }
@@ -551,12 +702,28 @@ def main() {
         assert_eq!(module.functions.len(), 1);
         let f = &module.functions[0];
         assert_eq!(f.name, "main");
-        
-        // count = 0, count = count + 1, if count > 0: return 0
+
+        // count := 0 (GoScopedDeclaration), count = count + 1 (Standard), if count > 0: return 0
         assert_eq!(f.body.len(), 3);
-        assert_eq!(f.body[0], Statement::Assign { target: "count".to_string(), expr: "0".to_string() });
-        assert_eq!(f.body[1], Statement::Assign { target: "count".to_string(), expr: "count + 1".to_string() });
-        
+        assert_eq!(
+            f.body[0],
+            Statement::Assign {
+                target: "count".to_string(),
+                expr: "0".to_string(),
+                idiom: IdiomFamily::GoScopedDeclaration,
+                is_scoped_decl: true,
+            }
+        );
+        assert_eq!(
+            f.body[1],
+            Statement::Assign {
+                target: "count".to_string(),
+                expr: "count + 1".to_string(),
+                idiom: IdiomFamily::Standard,
+                is_scoped_decl: false,
+            }
+        );
+
         if let Statement::If { condition, then_branch, .. } = &f.body[2] {
             assert_eq!(condition, "count > 0");
             assert_eq!(then_branch.len(), 1);

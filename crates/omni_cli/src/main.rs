@@ -147,8 +147,14 @@ fn main() -> anyhow::Result<()> {
     let cache_dir = PathBuf::from(".omnicache");
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_content.as_bytes());
+    hasher.update(b"x86_64-pc-linux-gnu");
     hasher.update(&args.temp.to_le_bytes());
     hasher.update(&[args.opt_level]);
+    for foreign_file in &foreign_c_files {
+        if let Ok(bytes) = fs::read(foreign_file) {
+            hasher.update(&bytes);
+        }
+    }
     let cache_hash = hasher.finalize().to_hex().to_string();
     let cache_file = cache_dir.join(format!("{}.ll", cache_hash));
 
@@ -175,9 +181,12 @@ fn main() -> anyhow::Result<()> {
         verifier.verify_ir(&llvm_ir)?;
         println!("  -> LLVM IR syntax & type verifier passed cleanly.");
 
-        // Commit to .omnicache
+        // Atomic commit to .omnicache (write temp file + rename)
         let _ = fs::create_dir_all(&cache_dir);
-        let _ = fs::write(&cache_file, &llvm_ir);
+        let tmp_cache = cache_dir.join(format!(".tmp_{}.ll", cache_hash));
+        if fs::write(&tmp_cache, &llvm_ir).is_ok() {
+            let _ = fs::rename(&tmp_cache, &cache_file);
+        }
         println!("  -> Bitcode committed to .omnicache/{}.ll", &cache_hash[..12]);
     } else {
         println!("  -> Skipped verification pass (pre-verified bitcode).");

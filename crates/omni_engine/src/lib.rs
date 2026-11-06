@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -13,12 +14,65 @@ pub enum EngineError {
     Timeout(usize),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SsaVariable {
+    pub name: String,
+    pub llvm_name: String,
+    pub type_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SsaContextEnvelope {
+    pub target_abi: String,
+    pub enclosing_fn: String,
+    pub return_type: String,
+    pub next_ssa_idx: usize,
+    pub active_symbols: Vec<SsaVariable>,
+    pub struct_definitions: Vec<String>,
+    pub raw_intent: String,
+    pub idiom_hint: Option<String>,
+}
+
+impl SsaContextEnvelope {
+    /// Formats the context into compact XML micro-tags (<300 tokens) for sub-2B models
+    pub fn to_prompt_micro_tags(&self) -> String {
+        let mut out = String::new();
+        out.push_str("<omni_ir_task>\n");
+        out.push_str(&format!("  <target_abi>{}</target_abi>\n", self.target_abi));
+        out.push_str(&format!(
+            "  <function name=\"{}\" ret=\"{}\"/>\n",
+            self.enclosing_fn, self.return_type
+        ));
+        out.push_str("  <live_registers>\n");
+        for var in &self.active_symbols {
+            out.push_str(&format!(
+                "    <reg var=\"{}\" llvm=\"{}\" type=\"{}\"/>\n",
+                var.name, var.llvm_name, var.type_hint
+            ));
+        }
+        out.push_str("  </live_registers>\n");
+        if !self.struct_definitions.is_empty() {
+            out.push_str("  <structs>\n");
+            for s in &self.struct_definitions {
+                out.push_str(&format!("    <type>{}</type>\n", s));
+            }
+            out.push_str("  </structs>\n");
+        }
+        if let Some(ref hint) = self.idiom_hint {
+            out.push_str(&format!("  <idiom_hint>{}</idiom_hint>\n", hint));
+        }
+        out.push_str(&format!("  <intent>{}</intent>\n", self.raw_intent.trim()));
+        out.push_str(&format!("  <next_reg>%t_{}</next_reg>\n", self.next_ssa_idx));
+        out.push_str("</omni_ir_task>\n");
+        out
+    }
+}
+
 pub trait InferenceEngine: Send + Sync {
     /// Lowers an abstract intent block + contextual environment into LLVM IR instructions
     fn lower_intent(
         &self,
-        context: &str,
-        intent_instruction: &str,
+        envelope: &SsaContextEnvelope,
         temp: f32,
     ) -> Result<String, EngineError>;
 }
@@ -42,11 +96,10 @@ impl MockSynthesisEngine {
 impl InferenceEngine for MockSynthesisEngine {
     fn lower_intent(
         &self,
-        _context: &str,
-        intent_instruction: &str,
+        envelope: &SsaContextEnvelope,
         _temp: f32,
     ) -> Result<String, EngineError> {
-        let lower = intent_instruction.to_lowercase();
+        let lower = envelope.raw_intent.to_lowercase();
 
         // 1. Crypto / Hash block
         if lower.contains("hash") || lower.contains("crypto") {
@@ -59,17 +112,20 @@ impl InferenceEngine for MockSynthesisEngine {
 
         // 2. Filter / Threshold scan
         if lower.contains("filter") || lower.contains("threshold") {
-            return Ok(r#"
+            let next_reg = format!("%t_{}", envelope.next_ssa_idx);
+            return Ok(format!(
+                r#"
   ; [Synthesized from Intent: filter elements]
-  %cond = icmp ugt i32 100, 50
-"#
-            .to_string());
+  {} = icmp ugt i32 100, 50
+"#,
+                next_reg
+            ));
         }
 
         // Default generic no-op / return
         Ok(format!(
             "  ; [Synthesized generic intent block: {}]\n",
-            intent_instruction.trim()
+            envelope.raw_intent.trim()
         ))
     }
 }
@@ -92,14 +148,14 @@ impl LlamaCppEngine {
 impl InferenceEngine for LlamaCppEngine {
     fn lower_intent(
         &self,
-        _context: &str,
-        intent_instruction: &str,
+        envelope: &SsaContextEnvelope,
         _temp: f32,
     ) -> Result<String, EngineError> {
-        // Scaffolding for in-process libllama generation
+        let _prompt = envelope.to_prompt_micro_tags();
+        // Standby scaffolding for local llama.cpp GGUF context evaluation
         Ok(format!(
-            "  ; [LLaMA generated intent block for: {}]\n",
-            intent_instruction
+            "  ; [Standby GGUF synthesis for intent: {}]\n",
+            envelope.raw_intent.trim()
         ))
     }
 }

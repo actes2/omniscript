@@ -22,6 +22,8 @@ declare void @__omni_print_int(i64)
 ; Arena Allocator
 declare i8* @__omni_arena_create(i64)
 declare i8* @__omni_arena_alloc(i8*, i64, i64)
+declare i64 @__omni_arena_mark(i8*)
+declare void @__omni_arena_rewind(i8*, i64)
 declare void @__omni_arena_reset(i8*)
 declare void @__omni_arena_destroy(i8*)
 

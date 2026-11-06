@@ -37,6 +37,16 @@ void* __omni_arena_alloc(OmniArena* arena, size_t size, size_t align) {
     return (void*)aligned_addr;
 }
 
+size_t __omni_arena_mark(OmniArena* arena) {
+    return arena ? arena->offset : 0;
+}
+
+void __omni_arena_rewind(OmniArena* arena, size_t mark) {
+    if (arena && mark <= arena->capacity) {
+        arena->offset = mark;
+    }
+}
+
 void __omni_arena_reset(OmniArena* arena) {
     if (arena) {
         arena->offset = 0; // O(1) bulk free!
