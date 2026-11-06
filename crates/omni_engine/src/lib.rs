@@ -31,6 +31,10 @@ pub struct SsaContextEnvelope {
     pub struct_definitions: Vec<String>,
     pub raw_intent: String,
     pub idiom_hint: Option<String>,
+    pub anchor_id: Option<usize>,
+    pub physical_source: Option<String>,
+    pub concurrency_mode: Option<String>,
+    pub yield_expectation: Option<String>,
 }
 
 impl SsaContextEnvelope {
@@ -38,11 +42,25 @@ impl SsaContextEnvelope {
     pub fn to_prompt_micro_tags(&self) -> String {
         let mut out = String::new();
         out.push_str("<omni_ir_task>\n");
+        if let Some(anchor) = self.anchor_id {
+            out.push_str(&format!("  <interpretive_anchor id=\"{}\"/>\n", anchor));
+        }
+        if let Some(ref ps) = self.physical_source {
+            out.push_str("  <physical_source>\n");
+            out.push_str(&format!("    {}\n", ps.trim()));
+            out.push_str("  </physical_source>\n");
+        }
         out.push_str(&format!("  <target_abi>{}</target_abi>\n", self.target_abi));
         out.push_str(&format!(
             "  <function name=\"{}\" ret=\"{}\"/>\n",
             self.enclosing_fn, self.return_type
         ));
+        if let Some(ref cm) = self.concurrency_mode {
+            out.push_str(&format!("  <concurrency_mode>{}</concurrency_mode>\n", cm));
+        }
+        if let Some(ref ye) = self.yield_expectation {
+            out.push_str(&format!("  <yield_expectation>{}</yield_expectation>\n", ye));
+        }
         out.push_str("  <live_registers>\n");
         for var in &self.active_symbols {
             out.push_str(&format!(
@@ -120,6 +138,22 @@ impl InferenceEngine for MockSynthesisEngine {
 "#,
                 next_reg
             ));
+        }
+
+        // 3. Go Concurrency / Spawn block
+        if lower.starts_with("go ") {
+            let call_expr = envelope.raw_intent.trim_start_matches("go ").trim();
+            let fn_name = call_expr.split('(').next().unwrap_or("").trim();
+            if !fn_name.is_empty() {
+                return Ok(format!(
+                    r#"
+  ; [Synthesized Fiber Spawn for: {}]
+  %fn_ptr_{} = bitcast i32 (i8*, i64)* @__omni_fn_{} to void (i8*)*
+  call void @__omni_go_spawn(void (i8*)* %fn_ptr_{}, i8* null)
+"#,
+                    fn_name, envelope.next_ssa_idx, fn_name, envelope.next_ssa_idx
+                ));
+            }
         }
 
         // Default generic no-op / return

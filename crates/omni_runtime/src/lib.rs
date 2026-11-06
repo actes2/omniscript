@@ -8,6 +8,7 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
         native_dir.join("omni_arena.c"),
         native_dir.join("omni_chan.c"),
         native_dir.join("omni_value.c"),
+        native_dir.join("omni_fiber.c"),
     ]
 }
 
@@ -33,6 +34,13 @@ declare i1 @__omni_chan_send(i8*, i8*)
 declare i1 @__omni_chan_recv(i8*, i8*)
 declare void @__omni_chan_close(i8*)
 declare void @__omni_chan_destroy(i8*)
+
+; Fiber / M:N Goroutine Runtime
+declare void @__omni_fiber_init()
+declare i8* @__omni_fiber_create(void (i8*)*, i8*, i64)
+declare void @__omni_fiber_yield()
+declare void @__omni_fiber_destroy(i8*)
+declare void @__omni_go_spawn(void (i8*)*, i8*)
 "#
 }
 
@@ -43,7 +51,7 @@ mod tests {
     #[test]
     fn test_runtime_sources_exist() {
         let sources = runtime_c_sources();
-        assert_eq!(sources.len(), 3);
+        assert_eq!(sources.len(), 4);
         for s in sources {
             assert!(s.exists(), "Source does not exist: {}", s.display());
         }

@@ -97,6 +97,20 @@ pub enum Statement {
     Intent {
         instruction: String,
     },
+    /// Asynchronous Fiber / Goroutine spawn: `go <call_expr>` or `go func(...)`
+    GoSpawn {
+        call_expr: String,
+        idiom: IdiomFamily,
+    },
+    /// Source-anchored polyglot interpretive block with physical source grounding
+    InterpretiveAnchor {
+        anchor_id: usize,
+        file: String,
+        line_start: usize,
+        line_end: usize,
+        physical_source: String,
+        idiom: IdiomFamily,
+    },
     /// Fallback concrete or polyglot statement
     Concrete {
         code: String,
@@ -577,7 +591,18 @@ impl OmniParser {
                 continue;
             }
 
-            // 9. Intent Block
+            // 9. Go Concurrency Spawn: `go <call_or_closure>`
+            if text.starts_with("go ") {
+                let call_expr = text.trim_start_matches("go ").trim().to_string();
+                stmts.push(Statement::GoSpawn {
+                    call_expr,
+                    idiom: IdiomFamily::GoScopedDeclaration,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 10. Intent Block
             if text.starts_with("intent") {
                 stmts.push(Statement::Intent {
                     instruction: text.clone(),
@@ -586,7 +611,7 @@ impl OmniParser {
                 continue;
             }
 
-            // 10. Fallback Concrete / Polyglot Statement
+            // 11. Fallback Concrete / Polyglot Statement
             let idiom = if text.contains("=>") {
                 IdiomFamily::ClosureLambda
             } else if text.contains("match ") || text.contains("case ") {
@@ -731,5 +756,31 @@ def main() {
         } else {
             panic!("Expected Statement::If for postfix if");
         }
+    }
+
+    #[test]
+    fn test_parse_go_spawn() {
+        let src = r#"
+def main() {
+    ch := make(chan int, 10);
+    go worker(ch);
+    return 0;
+}
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("go_spawn_test", src);
+
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.name, "main");
+        assert_eq!(f.body.len(), 3);
+
+        assert_eq!(
+            f.body[1],
+            Statement::GoSpawn {
+                call_expr: "worker(ch)".to_string(),
+                idiom: IdiomFamily::GoScopedDeclaration,
+            }
+        );
     }
 }

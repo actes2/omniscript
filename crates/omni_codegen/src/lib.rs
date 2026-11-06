@@ -511,7 +511,83 @@ impl<'a> CodeGenerator<'a> {
                     break;
                 }
 
-                // 8. Intent Statement -> packed into SsaContextEnvelope
+                // 8. Go Concurrency Spawn: `go <call_expr>`
+                Statement::GoSpawn { call_expr, idiom } => {
+                    let active_symbols: Vec<SsaVariable> = scope_tree
+                        .active_bindings()
+                        .into_iter()
+                        .map(|b| SsaVariable {
+                            name: b.name,
+                            llvm_name: b.llvm_ptr,
+                            type_hint: b.type_hint,
+                        })
+                        .collect();
+
+                    let envelope = SsaContextEnvelope {
+                        target_abi: "x86_64-pc-linux-gnu".to_string(),
+                        enclosing_fn: fn_name.to_string(),
+                        return_type: "void".to_string(),
+                        next_ssa_idx: *temp_counter,
+                        active_symbols,
+                        struct_definitions: struct_defs.to_vec(),
+                        raw_intent: format!("go {}", call_expr),
+                        idiom_hint: Some(format!("{:?}", idiom)),
+                        anchor_id: Some(*lbl_counter),
+                        physical_source: Some(format!("go {}", call_expr)),
+                        concurrency_mode: Some("fiber_m_to_n".to_string()),
+                        yield_expectation: Some("void".to_string()),
+                    };
+
+                    ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
+                    let synthesized = self.engine.lower_intent(&envelope, temp)?;
+                    ir.push_str(&synthesized);
+                    ir.push_str("  ; <<< [End Go Spawn]\n");
+                }
+
+                // 9. Source-Anchored Interpretive Block
+                Statement::InterpretiveAnchor {
+                    anchor_id,
+                    file,
+                    line_start,
+                    line_end,
+                    physical_source,
+                    idiom,
+                } => {
+                    let active_symbols: Vec<SsaVariable> = scope_tree
+                        .active_bindings()
+                        .into_iter()
+                        .map(|b| SsaVariable {
+                            name: b.name,
+                            llvm_name: b.llvm_ptr,
+                            type_hint: b.type_hint,
+                        })
+                        .collect();
+
+                    let envelope = SsaContextEnvelope {
+                        target_abi: "x86_64-pc-linux-gnu".to_string(),
+                        enclosing_fn: fn_name.to_string(),
+                        return_type: "i32".to_string(),
+                        next_ssa_idx: *temp_counter,
+                        active_symbols,
+                        struct_definitions: struct_defs.to_vec(),
+                        raw_intent: physical_source.clone(),
+                        idiom_hint: Some(format!("{:?}", idiom)),
+                        anchor_id: Some(*anchor_id),
+                        physical_source: Some(physical_source.clone()),
+                        concurrency_mode: None,
+                        yield_expectation: Some("i32".to_string()),
+                    };
+
+                    ir.push_str(&format!(
+                        "  ; >>> [INTERPRETIVE ANCHOR #{} at {}:{}-{}]\n",
+                        anchor_id, file, line_start, line_end
+                    ));
+                    let synthesized = self.engine.lower_intent(&envelope, temp)?;
+                    ir.push_str(&synthesized);
+                    ir.push_str(&format!("  ; <<< [END ANCHOR #{}]\n", anchor_id));
+                }
+
+                // 10. Intent Statement -> packed into SsaContextEnvelope
                 Statement::Intent { instruction } => {
                     let active_symbols: Vec<SsaVariable> = scope_tree
                         .active_bindings()
@@ -532,13 +608,17 @@ impl<'a> CodeGenerator<'a> {
                         struct_definitions: struct_defs.to_vec(),
                         raw_intent: instruction.clone(),
                         idiom_hint: None,
+                        anchor_id: Some(*lbl_counter),
+                        physical_source: Some(instruction.clone()),
+                        concurrency_mode: None,
+                        yield_expectation: Some("i32".to_string()),
                     };
 
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     ir.push_str(&synthesized);
                 }
 
-                // 9. Fallback Concrete / Polyglot Statement -> packed with Idiom hint
+                // 11. Fallback Concrete / Polyglot Statement -> packed with Idiom hint
                 Statement::Concrete { code, idiom } => {
                     let active_symbols: Vec<SsaVariable> = scope_tree
                         .active_bindings()
@@ -559,6 +639,10 @@ impl<'a> CodeGenerator<'a> {
                         struct_definitions: struct_defs.to_vec(),
                         raw_intent: code.clone(),
                         idiom_hint: Some(format!("{:?}", idiom)),
+                        anchor_id: Some(*lbl_counter),
+                        physical_source: Some(code.clone()),
+                        concurrency_mode: None,
+                        yield_expectation: Some("i32".to_string()),
                     };
 
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;

@@ -1,0 +1,9 @@
+def worker():
+    print("Worker fiber executing!")
+    return 0
+
+def main():
+    print("Main fiber starting...")
+    go worker()
+    print("Main fiber completed.")
+    return 0
