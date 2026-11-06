@@ -135,17 +135,18 @@ impl OmniParser {
         }
     }
 
-    /// Canonicalizes source code: unifies bracket blocks (`{ ... }`) into hierarchical indentation
+    /// Canonicalizes source code: unifies bracket blocks (`{ ... }`), `end` blocks, postfix conditionals,
+    /// increments (`i++`), and walrus operators (`:=`) into hierarchical canonical AST lines.
     pub fn canonicalize_source(source: &str) -> String {
         let raw_lines = source.lines();
-        let has_braces = source.contains('{') || source.contains('}');
-
-        if !has_braces {
-            return source.to_string();
-        }
+        let has_explicit_blocks = source.contains('{') || source.contains('}') || source.contains("end");
 
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
+
+        let inc_re = Regex::new(r#"^([a-zA-Z_0-9]+)\+\+$"#).unwrap();
+        let dec_re = Regex::new(r#"^([a-zA-Z_0-9]+)\-\-$"#).unwrap();
+        let postfix_if_re = Regex::new(r#"^(.*?)\s+if\s+(.*)$"#).unwrap();
 
         for line in raw_lines {
             let mut trimmed = line.trim();
@@ -153,7 +154,13 @@ impl OmniParser {
                 continue;
             }
 
-            // Closing brace at start of line
+            // 1. Handle Lua/Ruby/Julia `end` block terminator
+            if trimmed == "end" || trimmed == "end;" {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+
+            // 2. Closing brace at start of line
             if trimmed.starts_with('}') {
                 brace_depth = brace_depth.saturating_sub(1);
                 trimmed = trimmed[1..].trim();
@@ -162,19 +169,56 @@ impl OmniParser {
                 }
             }
 
-            // Strip trailing semicolon
+            // 3. Strip trailing semicolon
             if trimmed.ends_with(';') {
                 trimmed = trimmed[..trimmed.len() - 1].trim();
             }
 
-            // Check if line ends with opening brace
-            let ends_with_open = trimmed.ends_with('{');
-            if ends_with_open {
-                trimmed = trimmed[..trimmed.len() - 1].trim();
+            // 4. Strip Lua `then` and `do`
+            let mut line_str = trimmed.to_string();
+            if line_str.ends_with(" then") {
+                line_str = line_str[..line_str.len() - 5].trim().to_string();
+            } else if line_str.ends_with(" do") {
+                line_str = line_str[..line_str.len() - 3].trim().to_string();
             }
 
-            let indent = "    ".repeat(brace_depth);
-            out_lines.push(format!("{}{}", indent, trimmed));
+            // 5. Replace Go walrus `:=` with `=`
+            line_str = line_str.replace(":=", "=");
+
+            // 6. Handle C-style increment/decrement: `i++` -> `i = i + 1`
+            if let Some(caps) = inc_re.captures(&line_str) {
+                let var = &caps[1];
+                line_str = format!("{} = {} + 1", var, var);
+            } else if let Some(caps) = dec_re.captures(&line_str) {
+                let var = &caps[1];
+                line_str = format!("{} = {} - 1", var, var);
+            }
+
+            // 7. Check if line ends with opening brace
+            let ends_with_open = line_str.ends_with('{');
+            if ends_with_open {
+                line_str = line_str[..line_str.len() - 1].trim().to_string();
+            }
+
+            let current_indent = if has_explicit_blocks {
+                "    ".repeat(brace_depth)
+            } else {
+                let count = Self::indent_level(line);
+                " ".repeat(count)
+            };
+
+            // 8. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
+            if !line_str.starts_with("if ") && !line_str.starts_with("if(") {
+                if let Some(caps) = postfix_if_re.captures(&line_str) {
+                    let stmt = caps[1].trim();
+                    let cond = caps[2].trim();
+                    out_lines.push(format!("{}if {}:", current_indent, cond));
+                    out_lines.push(format!("{}    {}", current_indent, stmt));
+                    continue;
+                }
+            }
+
+            out_lines.push(format!("{}{}", current_indent, line_str));
 
             if ends_with_open {
                 brace_depth += 1;
@@ -489,6 +533,36 @@ fn run() {
             assert_eq!(body.len(), 1);
         } else {
             panic!("Expected Statement::ForLoop");
+        }
+    }
+
+    #[test]
+    fn test_parse_exotic_quirks() {
+        let src = r#"
+def main() {
+    count := 0;
+    count++;
+    return 0 if count > 0;
+}
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("quirk_test", src);
+
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.name, "main");
+        
+        // count = 0, count = count + 1, if count > 0: return 0
+        assert_eq!(f.body.len(), 3);
+        assert_eq!(f.body[0], Statement::Assign { target: "count".to_string(), expr: "0".to_string() });
+        assert_eq!(f.body[1], Statement::Assign { target: "count".to_string(), expr: "count + 1".to_string() });
+        
+        if let Statement::If { condition, then_branch, .. } = &f.body[2] {
+            assert_eq!(condition, "count > 0");
+            assert_eq!(then_branch.len(), 1);
+            assert_eq!(then_branch[0], Statement::Return { expr: Some("0".to_string()) });
+        } else {
+            panic!("Expected Statement::If for postfix if");
         }
     }
 }

@@ -1,0 +1,17 @@
+func main() {
+    print("=== Testing Polyglot Quirks ===");
+    
+    // Go walrus
+    count := 0;
+    
+    // C increment
+    count++;
+    count++;
+    
+    print("Final Count:");
+    print(count);
+
+    // Ruby postfix if guard
+    return 0 if count == 2;
+    return 1;
+}
