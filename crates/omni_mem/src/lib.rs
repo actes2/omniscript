@@ -158,6 +158,47 @@ impl MemoryNormalizer {
     }
 }
 
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum LifetimeViolation {
+    #[error("Escaping pointer: local symbol '{symbol}' escapes scope '{scope}'")]
+    EscapingScope { symbol: String, scope: String },
+
+    #[error("Double free detected: symbol '{symbol}' freed multiple times in scope '{scope}'")]
+    DoubleFree { symbol: String, scope: String },
+}
+
+pub struct LifetimeAuditor;
+
+impl LifetimeAuditor {
+    /// Audits a set of UMO operations for lifetime violations
+    pub fn audit_scope(scope: &str, ops: &[UnifiedMemOp]) -> Result<(), LifetimeViolation> {
+        let mut freed_symbols = std::collections::HashSet::new();
+
+        for op in ops {
+            match op {
+                UnifiedMemOp::EscapeScope { symbol, scope } => {
+                    return Err(LifetimeViolation::EscapingScope {
+                        symbol: symbol.clone(),
+                        scope: scope.clone(),
+                    });
+                }
+                UnifiedMemOp::Free { target } => {
+                    if freed_symbols.contains(target) {
+                        return Err(LifetimeViolation::DoubleFree {
+                            symbol: target.clone(),
+                            scope: scope.to_string(),
+                        });
+                    }
+                    freed_symbols.insert(target.clone());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +235,25 @@ mod tests {
                 symbol: "stack_var".to_string(),
                 scope: "my_func".to_string(),
             }
+        );
+
+        let err = LifetimeAuditor::audit_scope("my_func", &[op]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_detect_double_free() {
+        let ops = vec![
+            UnifiedMemOp::Free { target: "buf".to_string() },
+            UnifiedMemOp::Free { target: "buf".to_string() },
+        ];
+        let res = LifetimeAuditor::audit_scope("my_func", &ops);
+        assert_eq!(
+            res,
+            Err(LifetimeViolation::DoubleFree {
+                symbol: "buf".to_string(),
+                scope: "my_func".to_string(),
+            })
         );
     }
 }

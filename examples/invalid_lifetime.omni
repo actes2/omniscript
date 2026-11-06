@@ -1,0 +1,3 @@
+def bad_func():
+    let local_var = alloc(128)
+    return &local_var

@@ -11,5 +11,6 @@ thiserror.workspace = true
 serde.workspace = true
 omni_mem = { path = "../omni_mem" }
 omni_parser = { path = "../omni_parser" }
+omni_runtime = { path = "../omni_runtime" }
 omni_engine = { path = "../omni_engine" }
 omni_verify = { path = "../omni_verify" }

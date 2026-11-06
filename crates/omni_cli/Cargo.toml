@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+blake3.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 omni_preamble = { path = "../omni_preamble" }
@@ -20,3 +21,4 @@ omni_parser = { path = "../omni_parser" }
 omni_verify = { path = "../omni_verify" }
 omni_codegen = { path = "../omni_codegen" }
 omni_engine = { path = "../omni_engine" }
+omni_runtime = { path = "../omni_runtime" }

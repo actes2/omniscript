@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     // 2. Preamble Assembly & Symbol Carving
     println!("\n[2/5] Executing Preamble Symbol Carving across polyglot targets...");
     let carver = SymbolCarver::new();
-    let mut foreign_c_files = Vec::new();
+    let mut foreign_c_files = omni_runtime::runtime_c_sources();
 
     for import in &module.imports {
         match import {
@@ -135,24 +135,53 @@ fn main() -> anyhow::Result<()> {
             for op in &f.memory_ops {
                 println!("     * {:?}", op);
             }
+
+            if let Err(violation) = omni_mem::LifetimeAuditor::audit_scope(&f.name, &f.memory_ops) {
+                eprintln!("\n[FATAL LIFETIME VIOLATION] {}", violation);
+                std::process::exit(1);
+            }
         }
     }
 
-    // 4. Code Generation & Intent Synthesis
-    println!("\n[4/5] Synthesizing intent blocks and generating unified LLVM IR...");
-    let mock_engine = MockSynthesisEngine::new();
-    let codegen = CodeGenerator::new(&mock_engine);
-    let llvm_ir = codegen.generate_module_ir(&module, args.temp)?;
+    // 4. Code Generation & Intent Synthesis (with .omnicache check)
+    let cache_dir = PathBuf::from(".omnicache");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(source_content.as_bytes());
+    hasher.update(&args.temp.to_le_bytes());
+    hasher.update(&[args.opt_level]);
+    let cache_hash = hasher.finalize().to_hex().to_string();
+    let cache_file = cache_dir.join(format!("{}.ll", cache_hash));
+
+    let (llvm_ir, from_cache) = if !args.no_cache && cache_file.exists() {
+        println!("\n[4/5] [CACHE HIT] Loaded verified LLVM IR from .omnicache/{}.ll (0 ms)", &cache_hash[..12]);
+        (fs::read_to_string(&cache_file)?, true)
+    } else {
+        println!("\n[4/5] Synthesizing intent blocks and generating unified LLVM IR...");
+        let mock_engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&mock_engine);
+        let generated = codegen.generate_module_ir(&module, args.temp)?;
+        (generated, false)
+    };
 
     if args.verbose {
-        println!("\n--- Generated LLVM IR ---\n{}\n-------------------------", llvm_ir);
+        println!("\n--- LLVM IR ---\n{}\n----------------", llvm_ir);
     }
 
     // 5. Verification & Native Compilation
     println!("\n[5/5] Verifying LLVM IR and linking native ELF binary...");
     let verifier = LlvmVerifier::new()?;
-    verifier.verify_ir(&llvm_ir)?;
-    println!("  -> LLVM IR syntax & type verifier passed cleanly.");
+    
+    if !from_cache {
+        verifier.verify_ir(&llvm_ir)?;
+        println!("  -> LLVM IR syntax & type verifier passed cleanly.");
+
+        // Commit to .omnicache
+        let _ = fs::create_dir_all(&cache_dir);
+        let _ = fs::write(&cache_file, &llvm_ir);
+        println!("  -> Bitcode committed to .omnicache/{}.ll", &cache_hash[..12]);
+    } else {
+        println!("  -> Skipped verification pass (pre-verified bitcode).");
+    }
 
     verifier.compile_ir_to_binary(&llvm_ir, &args.output, args.opt_level, &foreign_c_files)?;
     println!("  -> Successfully compiled and linked native binary: {}", args.output.display());

@@ -4,6 +4,7 @@ members = [
     "crates/omni_preamble",
     "crates/omni_mem",
     "crates/omni_parser",
+    "crates/omni_runtime",
     "crates/omni_verify",
     "crates/omni_codegen",
     "crates/omni_engine",
