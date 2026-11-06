@@ -17,6 +17,7 @@ typedef struct {
     OmniMapBucket* buckets;
     size_t capacity;
     size_t count;
+    size_t tombstones;
 } OmniMap;
 
 OmniMap* __omni_map_create(size_t initial_cap);

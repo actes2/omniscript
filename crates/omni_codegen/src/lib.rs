@@ -5,6 +5,14 @@ use regex::Regex;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
+pub enum CleanupOp {
+    Free(String),
+    DestroySlice(String),
+    DestroyMap(String),
+    DestroyChan(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct SymbolBinding {
     pub name: String,
     pub llvm_ptr: String,
@@ -103,6 +111,43 @@ impl<'a> CodeGenerator<'a> {
             .iter()
             .find(|(_, s, _)| s == text)
             .map(|(c, _, len)| (c.as_str(), *len))
+    }
+
+    fn emit_cleanups(
+        ir: &mut String,
+        cleanups: &[CleanupOp],
+        temp_counter: &mut usize,
+        context: &str,
+    ) {
+        for op in cleanups.iter().rev() {
+            match op {
+                CleanupOp::Free(ptr) => {
+                    ir.push_str(&format!("  ; [Deferred Free at {}: %{}]\n", context, ptr));
+                    ir.push_str(&format!("  call void @free(i8* %{})\n", ptr));
+                }
+                CleanupOp::DestroySlice(alloca_ptr) => {
+                    let loaded = format!("%clean_slice_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  ; [RAII Slice Cleanup at {}]\n", context));
+                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  call void @__omni_slice_destroy(i8* {})\n", loaded));
+                }
+                CleanupOp::DestroyMap(alloca_ptr) => {
+                    let loaded = format!("%clean_map_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  ; [RAII Map Cleanup at {}]\n", context));
+                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  call void @__omni_map_destroy(i8* {})\n", loaded));
+                }
+                CleanupOp::DestroyChan(alloca_ptr) => {
+                    let loaded = format!("%clean_chan_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  ; [RAII Chan Cleanup at {}]\n", context));
+                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  call void @__omni_chan_destroy(i8* {})\n", loaded));
+                }
+            }
+        }
     }
 
     fn scan_strings_recursive(
@@ -391,7 +436,7 @@ impl<'a> CodeGenerator<'a> {
         stmts: &[Statement],
         ir: &mut String,
         scope_tree: &mut ScopeTree,
-        deferred_frees: &mut Vec<String>,
+        deferred_frees: &mut Vec<CleanupOp>,
         string_constants: &[(String, String, usize)],
         cur_str_idx: &mut usize,
         lbl_counter: &mut usize,
@@ -411,26 +456,55 @@ impl<'a> CodeGenerator<'a> {
                     idiom: _,
                     is_scoped_decl,
                 } => {
-                    let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
-                        let ptr = format!("%var_{}_{}", target, *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        scope_tree.insert(
-                            target.clone(),
-                            SymbolBinding {
-                                name: target.clone(),
-                                llvm_ptr: ptr.clone(),
-                                type_hint: "i32".to_string(),
-                                is_scoped: *is_scoped_decl,
-                            },
-                        );
-                        ptr
-                    } else {
-                        scope_tree.resolve(target).unwrap().llvm_ptr.clone()
-                    };
+                    let trimmed_expr = expr.trim();
+                    let existing_binding = scope_tree.resolve(trimmed_expr).cloned();
 
-                    let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                    ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
+                    if let Some(src) = existing_binding.filter(|b| b.type_hint.starts_with("i8*")) {
+                        // Preserving collection/channel reference semantics (no truncating to scalar int!)
+                        let ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                            let p = format!("%col_ref_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca i8*\n", p));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: p.clone(),
+                                    type_hint: src.type_hint.clone(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            p
+                        } else {
+                            scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                        };
+
+                        let loaded = format!("%ref_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, src.llvm_ptr));
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", loaded, ptr));
+                    } else {
+                        let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                            let ptr = format!("%var_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: ptr.clone(),
+                                    type_hint: "i32".to_string(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            ptr
+                        } else {
+                            scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                        };
+
+                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
+                    }
                 }
 
                 // 2. If Statement with optional Else
@@ -463,6 +537,7 @@ impl<'a> CodeGenerator<'a> {
                     // Then branch
                     ir.push_str(&format!("{}:\n", then_lbl));
                     scope_tree.enter_scope();
+                    let then_snapshot = deferred_frees.len();
                     let then_ret = self.lower_statements(
                         then_branch,
                         ir,
@@ -476,6 +551,10 @@ impl<'a> CodeGenerator<'a> {
                         struct_defs,
                         temp,
                     )?;
+                    if !then_ret {
+                        Self::emit_cleanups(ir, &deferred_frees[then_snapshot..], temp_counter, "Then Branch Exit");
+                        deferred_frees.truncate(then_snapshot);
+                    }
                     scope_tree.exit_scope();
                     if !then_ret {
                         ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
@@ -485,6 +564,7 @@ impl<'a> CodeGenerator<'a> {
                     if let Some(eb) = else_branch {
                         ir.push_str(&format!("{}:\n", else_lbl));
                         scope_tree.enter_scope();
+                        let else_snapshot = deferred_frees.len();
                         let else_ret = self.lower_statements(
                             eb,
                             ir,
@@ -498,6 +578,10 @@ impl<'a> CodeGenerator<'a> {
                             struct_defs,
                             temp,
                         )?;
+                        if !else_ret {
+                            Self::emit_cleanups(ir, &deferred_frees[else_snapshot..], temp_counter, "Else Branch Exit");
+                            deferred_frees.truncate(else_snapshot);
+                        }
                         scope_tree.exit_scope();
                         if !else_ret {
                             ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
@@ -527,6 +611,7 @@ impl<'a> CodeGenerator<'a> {
 
                     ir.push_str(&format!("{}:\n", body_lbl));
                     scope_tree.enter_scope();
+                    let while_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
                         ir,
@@ -540,6 +625,10 @@ impl<'a> CodeGenerator<'a> {
                         struct_defs,
                         temp,
                     )?;
+                    if !body_ret {
+                        Self::emit_cleanups(ir, &deferred_frees[while_snapshot..], temp_counter, "While Iteration Exit");
+                        deferred_frees.truncate(while_snapshot);
+                    }
                     scope_tree.exit_scope();
                     if !body_ret {
                         ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
@@ -591,6 +680,7 @@ impl<'a> CodeGenerator<'a> {
                     ));
 
                     ir.push_str(&format!("{}:\n", body_lbl));
+                    let for_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
                         ir,
@@ -604,6 +694,10 @@ impl<'a> CodeGenerator<'a> {
                         struct_defs,
                         temp,
                     )?;
+                    if !body_ret {
+                        Self::emit_cleanups(ir, &deferred_frees[for_snapshot..], temp_counter, "For Iteration Exit");
+                        deferred_frees.truncate(for_snapshot);
+                    }
 
                     let load_for_inc = format!("%curr_inc_{}", *temp_counter);
                     *temp_counter += 1;
@@ -672,7 +766,7 @@ impl<'a> CodeGenerator<'a> {
                     UnifiedMemOp::Free { target } => {
                         if *is_deferred {
                             ir.push_str(&format!("  ; [UMO Registered Defer Free: %{}]\n", target));
-                            deferred_frees.push(target.clone());
+                            deferred_frees.push(CleanupOp::Free(target.clone()));
                         } else {
                             ir.push_str(&format!("  ; [UMO Inline Free: %{}]\n", target));
                             ir.push_str(&format!("  call void @free(i8* %{})\n", target));
@@ -689,11 +783,8 @@ impl<'a> CodeGenerator<'a> {
                         "0".to_string()
                     };
 
-                    // Execute any deferred frees before returning
-                    for def_target in deferred_frees.iter().rev() {
-                        ir.push_str(&format!("  ; [Deferred Free at Return: %{}]\n", def_target));
-                        ir.push_str(&format!("  call void @free(i8* %{})\n", def_target));
-                    }
+                    // Execute any active cleanups before returning
+                    Self::emit_cleanups(ir, deferred_frees, temp_counter, "Return");
 
                     ir.push_str(&format!("  ret i32 {}\n", ret_val));
                     custom_return = true;
@@ -718,6 +809,9 @@ impl<'a> CodeGenerator<'a> {
                         make_res, capacity, elem_size
                     ));
                     ir.push_str(&format!("  store i8* {}, i8** {}\n", make_res, ptr));
+
+                    // Register RAII cleanup for channel resource
+                    deferred_frees.push(CleanupOp::DestroyChan(ptr.clone()));
 
                     scope_tree.insert(
                         target.clone(),
@@ -824,6 +918,9 @@ impl<'a> CodeGenerator<'a> {
                             slice_res, val_64
                         ));
                     }
+
+                    // Register RAII cleanup for slice resource
+                    deferred_frees.push(CleanupOp::DestroySlice(ptr.clone()));
 
                     scope_tree.insert(
                         target.clone(),
@@ -950,6 +1047,9 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
 
+                    // Register RAII cleanup for map resource
+                    deferred_frees.push(CleanupOp::DestroyMap(ptr.clone()));
+
                     scope_tree.insert(
                         target.clone(),
                         SymbolBinding {
@@ -961,7 +1061,7 @@ impl<'a> CodeGenerator<'a> {
                     );
                 }
 
-                // 9. Go Concurrency Spawn: `go <call_expr>`
+                // 12. Go Concurrency Spawn: `go <call_expr>`
                 Statement::GoSpawn { call_expr, idiom: _ } => {
                     let parts: Vec<&str> = call_expr.splitn(2, '(').collect();
                     let target_fn = parts[0].trim();
@@ -969,10 +1069,28 @@ impl<'a> CodeGenerator<'a> {
 
                     let arg_reg = if !raw_arg.is_empty() {
                         if let Some(binding) = scope_tree.resolve(raw_arg) {
-                            let loaded = format!("%arg_load_{}", *temp_counter);
+                            if binding.type_hint == "i32" {
+                                let loaded = format!("%arg_i32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i32, i32* {}\n", loaded, binding.llvm_ptr));
+                                let ext = format!("%arg_i64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext, loaded));
+                                let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, ext));
+                                ptr_cast
+                            } else {
+                                let loaded = format!("%arg_load_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                                loaded
+                            }
+                        } else if let Ok(val) = raw_arg.parse::<i32>() {
+                            let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
-                            loaded
+                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, val));
+                            ptr_cast
                         } else {
                             "null".to_string()
                         }
@@ -1167,23 +1285,82 @@ impl<'a> CodeGenerator<'a> {
             ));
 
             let mut scope_tree = ScopeTree::new();
-            let mut deferred_frees = Vec::new();
+            let mut deferred_frees: Vec<CleanupOp> = Vec::new();
 
-            // Bind first function parameter to %data if present
-            if let Some(param) = func.params.first() {
-                let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                temp_counter += 1;
-                ir.push_str(&format!("  {} = alloca i8*\n", ptr));
-                ir.push_str(&format!("  store i8* %data, i8** {}\n", ptr));
-                scope_tree.insert(
-                    param.name.clone(),
-                    SymbolBinding {
-                        name: param.name.clone(),
-                        llvm_ptr: ptr,
-                        type_hint: "i8* (omni_chan)".to_string(),
-                        is_scoped: true,
-                    },
-                );
+            // Bind function parameters with ABI and type awareness
+            for (i, param) in func.params.iter().enumerate() {
+                let p_name_lower = param.name.to_lowercase();
+                let is_chan = param.type_hint.as_deref().map(|th| th.contains("chan")).unwrap_or(false)
+                    || p_name_lower.contains("ch") || p_name_lower.contains("chan");
+                let is_slice = param.type_hint.as_deref().map(|th| th.contains("slice") || th.contains("list")).unwrap_or(false)
+                    || p_name_lower.contains("slice") || p_name_lower.contains("items") || p_name_lower.contains("arr");
+                let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
+                    || p_name_lower.contains("map") || p_name_lower.contains("dict");
+                let is_int = param.type_hint.as_deref().map(|th| th == "int" || th == "i32" || th == "i64").unwrap_or(false)
+                    || (!is_chan && !is_slice && !is_map && (p_name_lower == "val" || p_name_lower == "num" || p_name_lower == "count" || p_name_lower == "idx" || p_name_lower == "n" || p_name_lower == "x" || p_name_lower == "y" || p_name_lower == "z"));
+
+                if i == 0 {
+                    if is_int {
+                        let cast_i64 = format!("%param_int64_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        ir.push_str(&format!("  {} = ptrtoint i8* %data to i64\n", cast_i64));
+                        let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, cast_i64));
+                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                        ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                        scope_tree.insert(
+                            param.name.clone(),
+                            SymbolBinding {
+                                name: param.name.clone(),
+                                llvm_ptr: ptr,
+                                type_hint: "i32".to_string(),
+                                is_scoped: true,
+                            },
+                        );
+                    } else {
+                        let type_hint = if is_map {
+                            "i8* (omni_map)".to_string()
+                        } else if is_slice {
+                            "i8* (omni_slice)".to_string()
+                        } else {
+                            "i8* (omni_chan)".to_string()
+                        };
+                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                        ir.push_str(&format!("  store i8* %data, i8** {}\n", ptr));
+                        scope_tree.insert(
+                            param.name.clone(),
+                            SymbolBinding {
+                                name: param.name.clone(),
+                                llvm_ptr: ptr,
+                                type_hint,
+                                is_scoped: true,
+                            },
+                        );
+                    }
+                } else if i == 1 {
+                    // Second parameter maps to %len (i64)
+                    let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
+                    temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 %len to i32\n", cast_i32));
+                    let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                    temp_counter += 1;
+                    ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                    ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                    scope_tree.insert(
+                        param.name.clone(),
+                        SymbolBinding {
+                            name: param.name.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "i32".to_string(),
+                            is_scoped: true,
+                        },
+                    );
+                }
             }
 
             let custom_ret = self.lower_statements(
@@ -1201,10 +1378,7 @@ impl<'a> CodeGenerator<'a> {
             )?;
 
             if !custom_ret {
-                for def_target in deferred_frees.iter().rev() {
-                    ir.push_str(&format!("  ; [Deferred Free at Function Exit: %{}]\n", def_target));
-                    ir.push_str(&format!("  call void @free(i8* %{})\n", def_target));
-                }
+                Self::emit_cleanups(&mut ir, &deferred_frees, &mut temp_counter, "Function Exit");
                 ir.push_str("  ret i32 0\n");
             }
             ir.push_str("}\n\n");
@@ -1271,8 +1445,39 @@ def main():
         assert!(ir.contains("__omni_map_create"));
         assert!(ir.contains("__omni_map_set"));
         assert!(ir.contains("__omni_map_get"));
+        assert!(ir.contains("__omni_slice_destroy"));
+        assert!(ir.contains("__omni_map_destroy"));
 
         let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
         verifier.verify_ir(&ir).expect("LLVM IR verification failed for collections");
+    }
+
+    #[test]
+    fn test_codegen_channels_and_spawn_verify() {
+        let src = r#"
+def worker(ch):
+    ch <- 42
+    return 0
+
+def main():
+    ch := make(chan int, 4)
+    go worker(ch)
+    val := <-ch
+    return val
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("chan_codegen_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        assert!(ir.contains("__omni_chan_make"));
+        assert!(ir.contains("__omni_chan_send_int"));
+        assert!(ir.contains("__omni_chan_recv_int"));
+        assert!(ir.contains("__omni_go_spawn"));
+        assert!(ir.contains("__omni_chan_destroy"));
+
+        let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        verifier.verify_ir(&ir).expect("LLVM IR verification failed for channels and spawn");
     }
 }

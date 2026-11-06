@@ -306,6 +306,217 @@ impl SyntheticDatasetGenerator {
 "#
                 .to_string(),
             },
+            // 6. Cooperative Fiber Yield
+            ScenarioTemplate {
+                domain: "fiber_yield",
+                envelope: SsaContextEnvelope {
+                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    enclosing_fn: "worker_cooperative_loop".to_string(),
+                    return_type: "i32".to_string(),
+                    next_ssa_idx: 60,
+                    active_symbols: vec![],
+                    struct_definitions: vec![],
+                    raw_intent: "yield()".to_string(),
+                    idiom_hint: Some("FiberYield".to_string()),
+                    anchor_id: Some(106),
+                    physical_source: Some("yield()".to_string()),
+                    concurrency_mode: Some("M:N Fiber".to_string()),
+                    yield_expectation: Some("void".to_string()),
+                    action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                },
+                harness_preamble: String::new(),
+                completion: r#"  ; >>> [Synthesized: yield()]
+  call void @__omni_fiber_yield()
+"#
+                .to_string(),
+            },
+            // 7. Slice Pop Accumulator
+            ScenarioTemplate {
+                domain: "slice_accumulator",
+                envelope: SsaContextEnvelope {
+                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    enclosing_fn: "pop_and_sum".to_string(),
+                    return_type: "i32".to_string(),
+                    next_ssa_idx: 70,
+                    active_symbols: vec![
+                        SsaVariable {
+                            name: "items".to_string(),
+                            llvm_name: "%items_ptr".to_string(),
+                            type_hint: "i8* (omni_slice)".to_string(),
+                        },
+                        SsaVariable {
+                            name: "acc".to_string(),
+                            llvm_name: "%acc_ptr".to_string(),
+                            type_hint: "i32".to_string(),
+                        },
+                    ],
+                    struct_definitions: vec![],
+                    raw_intent: "acc += items.pop()".to_string(),
+                    idiom_hint: Some("SlicePopAccumulator".to_string()),
+                    anchor_id: Some(107),
+                    physical_source: Some("acc += items.pop()".to_string()),
+                    concurrency_mode: None,
+                    yield_expectation: Some("void".to_string()),
+                    action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
+                },
+                harness_preamble: r#"  %items_ptr = alloca i8*
+  %init_s = call i8* @__omni_slice_create(i64 8)
+  store i8* %init_s, i8** %items_ptr
+  call void @__omni_slice_append(i8* %init_s, i64 55)
+  %acc_ptr = alloca i32
+  store i32 10, i32* %acc_ptr
+"#
+                .to_string(),
+                completion: r#"  ; >>> [Synthesized: acc += items.pop()]
+  %t_70 = load i8*, i8** %items_ptr
+  %t_71 = call i64 @__omni_slice_pop(i8* %t_70)
+  %t_72 = trunc i64 %t_71 to i32
+  %t_73 = load i32, i32* %acc_ptr
+  %t_74 = add i32 %t_73, %t_72
+  store i32 %t_74, i32* %acc_ptr
+"#
+                .to_string(),
+            },
+            // 8. Channel Sync Barrier Receive
+            ScenarioTemplate {
+                domain: "channel_recv",
+                envelope: SsaContextEnvelope {
+                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    enclosing_fn: "consumer_gate".to_string(),
+                    return_type: "i32".to_string(),
+                    next_ssa_idx: 80,
+                    active_symbols: vec![
+                        SsaVariable {
+                            name: "ch".to_string(),
+                            llvm_name: "%ch_ptr".to_string(),
+                            type_hint: "i8* (omni_chan)".to_string(),
+                        },
+                        SsaVariable {
+                            name: "res".to_string(),
+                            llvm_name: "%res_ptr".to_string(),
+                            type_hint: "i32".to_string(),
+                        },
+                    ],
+                    struct_definitions: vec![],
+                    raw_intent: "res = <-ch".to_string(),
+                    idiom_hint: Some("GoChannelRecv".to_string()),
+                    anchor_id: Some(108),
+                    physical_source: Some("res = <-ch".to_string()),
+                    concurrency_mode: Some("M:N Fiber".to_string()),
+                    yield_expectation: Some("i32".to_string()),
+                    action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                },
+                harness_preamble: r#"  %ch_ptr = alloca i8*
+  %init_c = call i8* @__omni_chan_make(i64 4, i64 8)
+  store i8* %init_c, i8** %ch_ptr
+  call i1 @__omni_chan_send_int(i8* %init_c, i64 123)
+  %res_ptr = alloca i32
+  store i32 0, i32* %res_ptr
+"#
+                .to_string(),
+                completion: r#"  ; >>> [Synthesized: res = <-ch]
+  %t_80 = load i8*, i8** %ch_ptr
+  %t_81 = call i64 @__omni_chan_recv_int(i8* %t_80)
+  %t_82 = trunc i64 %t_81 to i32
+  store i32 %t_82, i32* %res_ptr
+"#
+                .to_string(),
+            },
+            // 9. Map Update Record
+            ScenarioTemplate {
+                domain: "map_update",
+                envelope: SsaContextEnvelope {
+                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    enclosing_fn: "update_metric_record".to_string(),
+                    return_type: "i32".to_string(),
+                    next_ssa_idx: 90,
+                    active_symbols: vec![
+                        SsaVariable {
+                            name: "metrics".to_string(),
+                            llvm_name: "%map_ptr".to_string(),
+                            type_hint: "i8* (omni_map)".to_string(),
+                        },
+                        SsaVariable {
+                            name: "key".to_string(),
+                            llvm_name: "%key_val".to_string(),
+                            type_hint: "i64".to_string(),
+                        },
+                        SsaVariable {
+                            name: "delta".to_string(),
+                            llvm_name: "%delta_val".to_string(),
+                            type_hint: "i64".to_string(),
+                        },
+                    ],
+                    struct_definitions: vec![],
+                    raw_intent: "metrics[key] = delta".to_string(),
+                    idiom_hint: Some("MapUpdate".to_string()),
+                    anchor_id: Some(109),
+                    physical_source: Some("metrics[key] = delta".to_string()),
+                    concurrency_mode: None,
+                    yield_expectation: Some("void".to_string()),
+                    action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                },
+                harness_preamble: r#"  %map_ptr = alloca i8*
+  %init_m = call i8* @__omni_map_create(i64 16)
+  store i8* %init_m, i8** %map_ptr
+  %key_val = alloca i64
+  store i64 1001, i64* %key_val
+  %delta_val = alloca i64
+  store i64 9999, i64* %delta_val
+"#
+                .to_string(),
+                completion: r#"  ; >>> [Synthesized: metrics[key] = delta]
+  %t_90 = load i8*, i8** %map_ptr
+  %t_91 = load i64, i64* %key_val
+  %t_92 = load i64, i64* %delta_val
+  call void @__omni_map_set_int(i8* %t_90, i64 %t_91, i64 %t_92)
+"#
+                .to_string(),
+            },
+            // 10. Slice Length Query
+            ScenarioTemplate {
+                domain: "slice_length",
+                envelope: SsaContextEnvelope {
+                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    enclosing_fn: "get_collection_size".to_string(),
+                    return_type: "i32".to_string(),
+                    next_ssa_idx: 100,
+                    active_symbols: vec![
+                        SsaVariable {
+                            name: "items".to_string(),
+                            llvm_name: "%items_ptr".to_string(),
+                            type_hint: "i8* (omni_slice)".to_string(),
+                        },
+                        SsaVariable {
+                            name: "len_val".to_string(),
+                            llvm_name: "%len_ptr".to_string(),
+                            type_hint: "i32".to_string(),
+                        },
+                    ],
+                    struct_definitions: vec![],
+                    raw_intent: "len_val = len(items)".to_string(),
+                    idiom_hint: Some("SliceLen".to_string()),
+                    anchor_id: Some(110),
+                    physical_source: Some("len_val = len(items)".to_string()),
+                    concurrency_mode: None,
+                    yield_expectation: Some("i32".to_string()),
+                    action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                },
+                harness_preamble: r#"  %items_ptr = alloca i8*
+  %init_s = call i8* @__omni_slice_create(i64 8)
+  store i8* %init_s, i8** %items_ptr
+  %len_ptr = alloca i32
+  store i32 0, i32* %len_ptr
+"#
+                .to_string(),
+                completion: r#"  ; >>> [Synthesized: len_val = len(items)]
+  %t_100 = load i8*, i8** %items_ptr
+  %t_101 = call i64 @__omni_slice_len(i8* %t_100)
+  %t_102 = trunc i64 %t_101 to i32
+  store i32 %t_102, i32* %len_ptr
+"#
+                .to_string(),
+            },
         ]
     }
 }

@@ -22,6 +22,7 @@ typedef struct OmniFiber {
 } OmniFiber;
 
 void __omni_fiber_init(void);
+int __omni_fiber_is_in_fiber(void);
 OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_size);
 void __omni_fiber_yield(void);
 void __omni_fiber_destroy(OmniFiber* fiber);

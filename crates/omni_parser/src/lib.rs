@@ -234,7 +234,7 @@ impl OmniParser {
             .unwrap(),
             // Matches ch <- 42, out_chan.send(val)
             chan_send_re: Regex::new(
-                r#"^(?:([a-zA-Z_0-9]+)\s*<-\s*(.+)|([a-zA-Z_0-9]+)\.send\s*\(\s*(.+)\s*\))$"#,
+                r#"^(?:([a-zA-Z_0-9]+)\s+<-\s+(.+)|([a-zA-Z_0-9]+)\.send\s*\(\s*(.+)\s*\))$"#,
             )
             .unwrap(),
             // Matches val := <-ch, val = <-ch, val = ch.recv(), <-ch
@@ -265,32 +265,57 @@ impl OmniParser {
         }
     }
 
+    /// Token-aware splitting that respects double and single quotes
+    pub fn split_respecting_quotes(s: &str, delimiter: char) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_double_quote = false;
+        let mut in_single_quote = false;
+        let mut escape = false;
+
+        for c in s.chars() {
+            if escape {
+                current.push(c);
+                escape = false;
+                continue;
+            }
+            if c == '\\' {
+                current.push(c);
+                escape = true;
+                continue;
+            }
+            if c == '"' && !in_single_quote {
+                in_double_quote = !in_double_quote;
+                current.push(c);
+                continue;
+            }
+            if c == '\'' && !in_double_quote {
+                in_single_quote = !in_single_quote;
+                current.push(c);
+                continue;
+            }
+            if c == delimiter && !in_double_quote && !in_single_quote {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+                current.clear();
+                continue;
+            }
+            current.push(c);
+        }
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+        parts
+    }
+
     /// Canonicalizes source code: unifies bracket blocks (`{ ... }`), `end` blocks, postfix conditionals,
     /// and increments (`i++`) into hierarchical canonical AST lines.
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
         let raw_lines = source.lines();
-        let has_explicit_blocks = source.lines().any(|l| {
-            let t = l.trim();
-            t == "{"
-                || t == "}"
-                || t == "end"
-                || t == "end;"
-                || (t.ends_with('{')
-                    && (t.starts_with("def ")
-                        || t.starts_with("fn ")
-                        || t.starts_with("func ")
-                        || t.starts_with("function ")
-                        || t.starts_with("if ")
-                        || t.starts_with("if(")
-                        || t.starts_with("while ")
-                        || t.starts_with("while(")
-                        || t.starts_with("for ")
-                        || t.starts_with("for(")
-                        || t.starts_with("int ")
-                        || t.starts_with("void ")))
-        });
-
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
 
@@ -341,13 +366,15 @@ impl OmniParser {
                 line_str = format!("{} = {} - 1", var, var);
             }
 
-            // 6. Check if line ends with opening brace
+            // 6. Check if line ends with opening brace (explicit block)
             let ends_with_open = line_str.ends_with('{');
             if ends_with_open {
                 line_str = line_str[..line_str.len() - 1].trim().to_string();
             }
 
-            let current_indent = if has_explicit_blocks {
+            // Scoped indentation: if inside an explicit brace block, format via brace_depth.
+            // If at brace_depth == 0 (e.g. standard Python functions), preserve exact original indentation!
+            let current_indent = if brace_depth > 0 {
                 "    ".repeat(brace_depth)
             } else {
                 let count = Self::indent_level(line);
@@ -355,7 +382,12 @@ impl OmniParser {
             };
 
             // 7. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
-            if !line_str.starts_with("if ") && !line_str.starts_with("if(") {
+            // Ensure we do NOT match inside string literals like print("what if now")
+            if !line_str.starts_with("if ")
+                && !line_str.starts_with("if(")
+                && !line_str.contains('"')
+                && !line_str.contains('\'')
+            {
                 if let Some(caps) = postfix_if_re.captures(&line_str) {
                     let stmt = caps[1].trim();
                     let cond = caps[2].trim();
@@ -751,11 +783,7 @@ impl OmniParser {
                 let elements = if inner.is_empty() {
                     Vec::new()
                 } else {
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
+                    Self::split_respecting_quotes(inner, ',')
                 };
                 stmts.push(Statement::ListInit {
                     target,
@@ -774,8 +802,8 @@ impl OmniParser {
                 let entries = if inner.is_empty() {
                     Vec::new()
                 } else {
-                    inner
-                        .split(',')
+                    Self::split_respecting_quotes(inner, ',')
+                        .into_iter()
                         .filter_map(|pair| {
                             let pair = pair.trim();
                             if pair.is_empty() {
@@ -1108,6 +1136,72 @@ def main():
                 target: "scores".to_string(),
                 index_expr: "\"carol\"".to_string(),
                 val_expr: "300".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_mixed_c_and_python_indentation() {
+        let src = r#"
+def py_fn():
+    x = 10
+    return x
+
+int c_fn() {
+    return 20;
+}
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("mixed_test", src);
+
+        assert_eq!(module.functions.len(), 2);
+        let py_f = &module.functions[0];
+        assert_eq!(py_f.name, "py_fn");
+        assert_eq!(py_f.body.len(), 2);
+        assert_eq!(
+            py_f.body[0],
+            Statement::Assign {
+                target: "x".to_string(),
+                expr: "10".to_string(),
+                idiom: IdiomFamily::Standard,
+                is_scoped_decl: false,
+            }
+        );
+
+        let c_f = &module.functions[1];
+        assert_eq!(c_f.name, "c_fn");
+        assert_eq!(c_f.body.len(), 1);
+    }
+
+    #[test]
+    fn test_string_with_commas_and_if_keyword() {
+        let src = r#"
+def main():
+    m = {"greeting": "hello, world", "count": 42}
+    print("what if now")
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("comma_if_test", src);
+
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.body.len(), 3);
+        assert_eq!(
+            f.body[0],
+            Statement::MapInit {
+                target: "m".to_string(),
+                entries: vec![
+                    ("greeting".to_string(), "\"hello, world\"".to_string()),
+                    ("count".to_string(), "42".to_string()),
+                ],
+                is_scoped_decl: false,
+            }
+        );
+        assert_eq!(
+            f.body[1],
+            Statement::Print {
+                expr: "\"what if now\"".to_string(),
             }
         );
     }

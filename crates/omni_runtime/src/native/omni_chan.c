@@ -1,4 +1,5 @@
 #include "omni_chan.h"
+#include "omni_fiber.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,7 +36,13 @@ bool __omni_chan_send(OmniChan* chan, const void* elem_ptr) {
     pthread_mutex_lock(&chan->lock);
 
     while (chan->count == chan->capacity && !chan->closed) {
-        pthread_cond_wait(&chan->not_full, &chan->lock);
+        if (__omni_fiber_is_in_fiber()) {
+            pthread_mutex_unlock(&chan->lock);
+            __omni_fiber_yield();
+            pthread_mutex_lock(&chan->lock);
+        } else {
+            pthread_cond_wait(&chan->not_full, &chan->lock);
+        }
     }
 
     if (chan->closed) {
@@ -61,7 +68,13 @@ bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr) {
     pthread_mutex_lock(&chan->lock);
 
     while (chan->count == 0 && !chan->closed) {
-        pthread_cond_wait(&chan->not_empty, &chan->lock);
+        if (__omni_fiber_is_in_fiber()) {
+            pthread_mutex_unlock(&chan->lock);
+            __omni_fiber_yield();
+            pthread_mutex_lock(&chan->lock);
+        } else {
+            pthread_cond_wait(&chan->not_empty, &chan->lock);
+        }
     }
 
     if (chan->count == 0 && chan->closed) {
@@ -89,8 +102,10 @@ bool __omni_chan_send_int(OmniChan* chan, int64_t val) {
 int64_t __omni_chan_recv_int(OmniChan* chan) {
     if (!chan) return 0;
     int64_t val = 0;
-    __omni_chan_recv(chan, &val);
-    return val;
+    if (__omni_chan_recv(chan, &val)) {
+        return val;
+    }
+    return 0;
 }
 
 size_t __omni_chan_len(OmniChan* chan) {
@@ -112,10 +127,18 @@ void __omni_chan_close(OmniChan* chan) {
 
 void __omni_chan_destroy(OmniChan* chan) {
     if (!chan) return;
-    __omni_chan_close(chan);
+    pthread_mutex_lock(&chan->lock);
+    chan->closed = true;
+    pthread_cond_broadcast(&chan->not_empty);
+    pthread_cond_broadcast(&chan->not_full);
+    pthread_mutex_unlock(&chan->lock);
+
     pthread_mutex_destroy(&chan->lock);
     pthread_cond_destroy(&chan->not_empty);
     pthread_cond_destroy(&chan->not_full);
-    if (chan->buffer) free(chan->buffer);
+    if (chan->buffer) {
+        free(chan->buffer);
+        chan->buffer = NULL;
+    }
     free(chan);
 }

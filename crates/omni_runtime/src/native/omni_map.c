@@ -35,6 +35,7 @@ OmniMap* __omni_map_create(size_t initial_cap) {
 
     map->capacity = cap;
     map->count = 0;
+    map->tombstones = 0;
     return map;
 }
 
@@ -48,10 +49,29 @@ static void map_resize(OmniMap* map, size_t new_cap) {
     map->buckets = new_buckets;
     map->capacity = new_cap;
     map->count = 0;
+    map->tombstones = 0;
+
+    size_t mask = new_cap - 1;
 
     for (size_t i = 0; i < old_cap; i++) {
         if (old_buckets[i].occupied && !old_buckets[i].deleted) {
-            __omni_map_set(map, old_buckets[i].key, old_buckets[i].val);
+            uint64_t h = old_buckets[i].hash;
+            size_t idx = (size_t)(h & mask);
+
+            for (size_t j = 0; j < new_cap; j++) {
+                size_t cur = (idx + j) & mask;
+                if (!new_buckets[cur].occupied) {
+                    // Direct pointer transfer without redundant strdup or memory re-allocation
+                    new_buckets[cur].key = old_buckets[i].key;
+                    new_buckets[cur].val = old_buckets[i].val;
+                    new_buckets[cur].hash = h;
+                    new_buckets[cur].occupied = true;
+                    new_buckets[cur].deleted = false;
+                    map->count++;
+                    break;
+                }
+            }
+        } else if (old_buckets[i].occupied && old_buckets[i].deleted && old_buckets[i].key) {
             free(old_buckets[i].key);
         }
     }
@@ -62,8 +82,10 @@ static void map_resize(OmniMap* map, size_t new_cap) {
 void __omni_map_set(OmniMap* map, const char* key, int64_t val) {
     if (!map || !key) return;
 
-    if ((map->count + 1) * 10 >= map->capacity * 7) {
-        map_resize(map, map->capacity * 2);
+    // Load factor considers both active count and dead tombstones to prevent O(N) probing degradation
+    if ((map->count + map->tombstones + 1) * 10 >= map->capacity * 7) {
+        size_t new_cap = (map->count * 2 >= map->capacity) ? map->capacity * 2 : map->capacity;
+        map_resize(map, new_cap);
     }
 
     uint64_t h = fnv1a_hash(key);
@@ -86,6 +108,9 @@ void __omni_map_set(OmniMap* map, const char* key, int64_t val) {
         } else {
             // Found unoccupied slot
             size_t insert_idx = (first_deleted != (size_t)-1) ? first_deleted : cur;
+            if (insert_idx == first_deleted && map->tombstones > 0) {
+                map->tombstones--;
+            }
             map->buckets[insert_idx].key = strdup(key);
             map->buckets[insert_idx].val = val;
             map->buckets[insert_idx].hash = h;
@@ -97,6 +122,7 @@ void __omni_map_set(OmniMap* map, const char* key, int64_t val) {
     }
 
     if (first_deleted != (size_t)-1) {
+        if (map->tombstones > 0) map->tombstones--;
         map->buckets[first_deleted].key = strdup(key);
         map->buckets[first_deleted].val = val;
         map->buckets[first_deleted].hash = h;
@@ -163,6 +189,7 @@ void __omni_map_delete(OmniMap* map, const char* key) {
                 map->buckets[cur].key = NULL;
             }
             if (map->count > 0) map->count--;
+            map->tombstones++;
             return;
         }
     }

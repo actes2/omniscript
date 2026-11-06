@@ -4,6 +4,7 @@
 
 static OmniFiber* g_current_fiber = NULL;
 static OmniFiber g_main_fiber = {0};
+static OmniFiber* g_dead_fibers = NULL;
 static int g_initialized = 0;
 
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -34,6 +35,14 @@ static void swap_g_context(void** from_rsp, void* to_rsp) {
 }
 #endif
 
+static void cleanup_dead_fibers(void) {
+    while (g_dead_fibers) {
+        OmniFiber* next = g_dead_fibers->next;
+        __omni_fiber_destroy(g_dead_fibers);
+        g_dead_fibers = next;
+    }
+}
+
 void __omni_fiber_init(void) {
     if (!g_initialized) {
         g_main_fiber.rsp = NULL;
@@ -44,6 +53,11 @@ void __omni_fiber_init(void) {
     }
 }
 
+int __omni_fiber_is_in_fiber(void) {
+    __omni_fiber_init();
+    return (g_current_fiber != NULL && g_current_fiber != &g_main_fiber);
+}
+
 static void fiber_entry_stub(void) {
     OmniFiber* f = g_current_fiber;
     if (f && f->entry) {
@@ -51,11 +65,14 @@ static void fiber_entry_stub(void) {
     }
     if (f) {
         f->status = OMNI_FIBER_DEAD;
-        // Reclaim fiber Task Arena in O(1)!
+        // Reclaim fiber Task Arena in O(1)
         if (f->arena) {
             __omni_arena_destroy(f->arena);
             f->arena = NULL;
         }
+        // Enqueue on dead-fiber list for reclamation on main stack
+        f->next = g_dead_fibers;
+        g_dead_fibers = f;
     }
 
     // Switch back to main fiber
@@ -86,20 +103,25 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
     fiber->arg = arg;
     fiber->next = NULL;
 
-    // 16-byte aligned stack top
+    // 16-byte aligned stack top for System V x86_64 ABI
     uintptr_t stack_top = (uintptr_t)fiber->stack_base + stack_size;
     stack_top &= ~((uintptr_t)15);
 
-    // Push initial fiber frame for swap_g_context:
-    // [fiber_entry_stub address], [r15=0], [r14=0], [r13=0], [r12=0], [rbx=0], [rbp=0]
+    // To satisfy System V AMD64 ABI:
+    // At function entry (immediately following a `call` instruction which pushes 8 bytes),
+    // (%rsp + 8) % 16 == 0.
+    // When swap_g_context pops 6 registers (48 bytes) and executes `retq` (8 bytes),
+    // %rsp must equal (stack_top - 8).
+    // Therefore, push an 8-byte dummy alignment word before pushing fiber_entry_stub:
     uint64_t* sp = (uint64_t*)stack_top;
-    *(--sp) = (uint64_t)fiber_entry_stub;
-    *(--sp) = 0; // r15
-    *(--sp) = 0; // r14
-    *(--sp) = 0; // r13
-    *(--sp) = 0; // r12
-    *(--sp) = 0; // rbx
-    *(--sp) = 0; // rbp
+    *(--sp) = 0;                          // 8-byte dummy alignment padding
+    *(--sp) = (uint64_t)fiber_entry_stub; // return address for retq
+    *(--sp) = 0;                          // r15
+    *(--sp) = 0;                          // r14
+    *(--sp) = 0;                          // r13
+    *(--sp) = 0;                          // r12
+    *(--sp) = 0;                          // rbx
+    *(--sp) = 0;                          // rbp
 
     fiber->rsp = (void*)sp;
     return fiber;
@@ -112,6 +134,7 @@ void __omni_fiber_yield(void) {
         OmniFiber* to = &g_main_fiber;
         g_current_fiber = to;
         swap_g_context(&from->rsp, to->rsp);
+        cleanup_dead_fibers();
     }
 }
 
@@ -138,4 +161,7 @@ void __omni_go_spawn(void (*entry)(void*), void* arg) {
     OmniFiber* from = g_current_fiber;
     g_current_fiber = fiber;
     swap_g_context(&from->rsp, fiber->rsp);
+
+    // Upon return to main stack, reclaim any dead fiber stacks
+    cleanup_dead_fibers();
 }
