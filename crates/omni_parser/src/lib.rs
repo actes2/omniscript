@@ -139,8 +139,8 @@ impl OmniParser {
                         continue;
                     }
 
-                    // Check indentation (simple check for leading whitespace)
-                    if next_line.starts_with("    ") || next_line.starts_with('\t') {
+                    // Check indentation (any leading space or tab)
+                    if next_line.starts_with(' ') || next_line.starts_with('\t') {
                         raw_body_lines.push(next_trimmed.to_string());
                         
                         if next_trimmed.starts_with("intent") {

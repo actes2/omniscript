@@ -242,6 +242,7 @@ dependencies = [
  "omni_parser",
  "omni_runtime",
  "omni_verify",
+ "regex",
  "serde",
  "thiserror",
 ]

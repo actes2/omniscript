@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+regex.workspace = true
 serde.workspace = true
 omni_mem = { path = "../omni_mem" }
 omni_parser = { path = "../omni_parser" }
