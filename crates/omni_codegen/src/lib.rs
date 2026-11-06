@@ -511,37 +511,125 @@ impl<'a> CodeGenerator<'a> {
                     break;
                 }
 
-                // 8. Go Concurrency Spawn: `go <call_expr>`
-                Statement::GoSpawn { call_expr, idiom } => {
-                    let active_symbols: Vec<SsaVariable> = scope_tree
-                        .active_bindings()
-                        .into_iter()
-                        .map(|b| SsaVariable {
-                            name: b.name,
-                            llvm_name: b.llvm_ptr,
-                            type_hint: b.type_hint,
-                        })
-                        .collect();
+                // 8. Channel Operations
+                Statement::ChanMake {
+                    target,
+                    capacity,
+                    elem_size,
+                    is_scoped_decl,
+                } => {
+                    let ptr = format!("%chan_{}_{}", target, *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = alloca i8*\n", ptr));
 
-                    let envelope = SsaContextEnvelope {
-                        target_abi: "x86_64-pc-linux-gnu".to_string(),
-                        enclosing_fn: fn_name.to_string(),
-                        return_type: "void".to_string(),
-                        next_ssa_idx: *temp_counter,
-                        active_symbols,
-                        struct_definitions: struct_defs.to_vec(),
-                        raw_intent: format!("go {}", call_expr),
-                        idiom_hint: Some(format!("{:?}", idiom)),
-                        anchor_id: Some(*lbl_counter),
-                        physical_source: Some(format!("go {}", call_expr)),
-                        concurrency_mode: Some("fiber_m_to_n".to_string()),
-                        yield_expectation: Some("void".to_string()),
-                        action_directive: Some("SPAWN_GOROUTINE".to_string()),
+                    let make_res = format!("%make_ch_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i8* @__omni_chan_make(i64 {}, i64 {})\n",
+                        make_res, capacity, elem_size
+                    ));
+                    ir.push_str(&format!("  store i8* {}, i8** {}\n", make_res, ptr));
+
+                    scope_tree.insert(
+                        target.clone(),
+                        SymbolBinding {
+                            name: target.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "i8* (omni_chan)".to_string(),
+                            is_scoped: *is_scoped_decl,
+                        },
+                    );
+                }
+
+                Statement::ChanSend { channel, expr } => {
+                    if let Some(binding) = scope_tree.resolve(channel) {
+                        let ch_loaded = format!("%ch_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
+
+                        let val = self.eval_val(expr, ir, scope_tree, temp_counter);
+                        let val_64 = format!("%val_ext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+
+                        let send_ok = format!("%send_ok_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = call i1 @__omni_chan_send_int(i8* {}, i64 {})\n",
+                            send_ok, ch_loaded, val_64
+                        ));
+                    }
+                }
+
+                Statement::ChanRecv {
+                    target,
+                    channel,
+                    is_scoped_decl,
+                } => {
+                    if let Some(binding) = scope_tree.resolve(channel) {
+                        let ch_loaded = format!("%ch_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
+
+                        let recv_64 = format!("%recv_64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = call i64 @__omni_chan_recv_int(i8* {})\n",
+                            recv_64, ch_loaded
+                        ));
+
+                        let recv_32 = format!("%recv_32_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", recv_32, recv_64));
+
+                        if let Some(ref var_name) = target {
+                            let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(var_name).is_none() {
+                                let ptr = format!("%var_{}_{}", var_name, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                                scope_tree.insert(
+                                    var_name.clone(),
+                                    SymbolBinding {
+                                        name: var_name.clone(),
+                                        llvm_ptr: ptr.clone(),
+                                        type_hint: "i32".to_string(),
+                                        is_scoped: *is_scoped_decl,
+                                    },
+                                );
+                                ptr
+                            } else {
+                                scope_tree.resolve(var_name).unwrap().llvm_ptr.clone()
+                            };
+
+                            ir.push_str(&format!("  store i32 {}, i32* {}\n", recv_32, alloca_ptr));
+                        }
+                    }
+                }
+
+                // 9. Go Concurrency Spawn: `go <call_expr>`
+                Statement::GoSpawn { call_expr, idiom: _ } => {
+                    let parts: Vec<&str> = call_expr.splitn(2, '(').collect();
+                    let target_fn = parts[0].trim();
+                    let raw_arg = parts.get(1).map(|s| s.trim_end_matches(')').trim()).unwrap_or("");
+
+                    let arg_reg = if !raw_arg.is_empty() {
+                        if let Some(binding) = scope_tree.resolve(raw_arg) {
+                            let loaded = format!("%arg_load_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                            loaded
+                        } else {
+                            "null".to_string()
+                        }
+                    } else {
+                        "null".to_string()
                     };
 
                     ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
-                    let synthesized = self.engine.lower_intent(&envelope, temp)?;
-                    ir.push_str(&synthesized);
+                    ir.push_str(&format!(
+                        "  call void @__omni_go_spawn(void (i8*)* @__omni_trampoline_{}, i8* {})\n",
+                        target_fn, arg_reg
+                    ));
                     ir.push_str("  ; <<< [End Go Spawn]\n");
                 }
 
@@ -725,6 +813,23 @@ impl<'a> CodeGenerator<'a> {
 
             let mut scope_tree = ScopeTree::new();
             let mut deferred_frees = Vec::new();
+
+            // Bind first function parameter to %data if present
+            if let Some(param) = func.params.first() {
+                let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                temp_counter += 1;
+                ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                ir.push_str(&format!("  store i8* %data, i8** {}\n", ptr));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: "i8* (omni_chan)".to_string(),
+                        is_scoped: true,
+                    },
+                );
+            }
 
             let custom_ret = self.lower_statements(
                 &func.body,

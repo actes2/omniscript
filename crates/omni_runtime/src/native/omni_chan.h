@@ -22,6 +22,9 @@ typedef struct {
 OmniChan* __omni_chan_make(size_t capacity, size_t elem_size);
 bool __omni_chan_send(OmniChan* chan, const void* elem_ptr);
 bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr);
+bool __omni_chan_send_int(OmniChan* chan, int64_t val);
+int64_t __omni_chan_recv_int(OmniChan* chan);
+size_t __omni_chan_len(OmniChan* chan);
 void __omni_chan_close(OmniChan* chan);
 void __omni_chan_destroy(OmniChan* chan);
 

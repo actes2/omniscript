@@ -81,6 +81,26 @@ bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr) {
     return true;
 }
 
+bool __omni_chan_send_int(OmniChan* chan, int64_t val) {
+    if (!chan) return false;
+    return __omni_chan_send(chan, &val);
+}
+
+int64_t __omni_chan_recv_int(OmniChan* chan) {
+    if (!chan) return 0;
+    int64_t val = 0;
+    __omni_chan_recv(chan, &val);
+    return val;
+}
+
+size_t __omni_chan_len(OmniChan* chan) {
+    if (!chan) return 0;
+    pthread_mutex_lock(&chan->lock);
+    size_t count = chan->count;
+    pthread_mutex_unlock(&chan->lock);
+    return count;
+}
+
 void __omni_chan_close(OmniChan* chan) {
     if (!chan) return;
     pthread_mutex_lock(&chan->lock);

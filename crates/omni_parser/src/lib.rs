@@ -93,6 +93,24 @@ pub enum Statement {
         op: UnifiedMemOp,
         is_deferred: bool,
     },
+    /// Channel creation: `ch := make(chan int, 8)` or `ch = Channel(8)`
+    ChanMake {
+        target: String,
+        capacity: usize,
+        elem_size: usize,
+        is_scoped_decl: bool,
+    },
+    /// Channel send: `ch <- expr` or `ch.send(expr)`
+    ChanSend {
+        channel: String,
+        expr: String,
+    },
+    /// Channel receive: `val := <-ch` or `val = <-ch` or `<-ch`
+    ChanRecv {
+        target: Option<String>,
+        channel: String,
+        is_scoped_decl: bool,
+    },
     /// Abstract intent block awaiting model synthesis
     Intent {
         instruction: String,
@@ -129,6 +147,9 @@ pub struct OmniParser {
     return_re: Regex,
     walrus_assign_re: Regex,
     assign_re: Regex,
+    make_chan_re: Regex,
+    chan_send_re: Regex,
+    chan_recv_re: Regex,
 }
 
 impl Default for OmniParser {
@@ -142,7 +163,7 @@ impl OmniParser {
         Self {
             // Matches def foo():, int foo() {, fn foo() -> i32 {, func foo() {, function foo() {
             fn_re: Regex::new(
-                r#"^(?:def|fn|func|function|(?:[a-zA-Z_0-9*]+\s+)+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
+                r#"^(?:def|fn|func|function|(?:(?:int|int32|int64|float|double|bool|void|char\*|auto)\s+))\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -167,6 +188,21 @@ impl OmniParser {
                 r#"^(?:(let|var|int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#,
             )
             .unwrap(),
+            // Matches ch := make(chan int, 8), ch = Channel(10), let ch = Chan(4)
+            make_chan_re: Regex::new(
+                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*(?:make\s*\(\s*chan\s+[a-zA-Z_0-9*]+\s*(?:,\s*([0-9]+))?\s*\)|(?:Channel|Chan)\s*\(\s*([0-9]+)?\s*\))$"#,
+            )
+            .unwrap(),
+            // Matches ch <- 42, out_chan.send(val)
+            chan_send_re: Regex::new(
+                r#"^(?:([a-zA-Z_0-9]+)\s*<-\s*(.+)|([a-zA-Z_0-9]+)\.send\s*\(\s*(.+)\s*\))$"#,
+            )
+            .unwrap(),
+            // Matches val := <-ch, val = <-ch, val = ch.recv(), <-ch
+            chan_recv_re: Regex::new(
+                r#"^(?:(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))$"#,
+            )
+            .unwrap(),
         }
     }
 
@@ -175,7 +211,12 @@ impl OmniParser {
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
         let raw_lines = source.lines();
-        let has_explicit_blocks = source.contains('{') || source.contains('}') || source.contains("end");
+        let has_explicit_blocks = source.contains('{')
+            || source.contains('}')
+            || source.lines().any(|l| {
+                let t = l.trim();
+                t == "end" || t == "end;"
+            });
 
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
@@ -404,6 +445,20 @@ impl OmniParser {
             // Top-level functions: `def foo():`, `fn foo() -> i32:`, `int foo() {`
             if let Some(caps) = self.fn_re.captures(trimmed) {
                 let fn_name = caps[1].to_string();
+                let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let params: Vec<ParamDef> = raw_params
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|p| {
+                        let name = p.split(':').next().unwrap_or(p).trim().split_whitespace().last().unwrap_or(p);
+                        ParamDef {
+                            name: name.to_string(),
+                            type_hint: None,
+                        }
+                    })
+                    .collect();
+
                 let fn_indent = Self::indent_level(line);
                 idx += 1;
 
@@ -434,7 +489,7 @@ impl OmniParser {
                 functions.push(FunctionDef {
                     name: fn_name,
                     is_method: false,
-                    params: Vec::new(),
+                    params,
                     return_type: None,
                     body,
                     memory_ops,
@@ -566,7 +621,46 @@ impl OmniParser {
                 }
             }
 
-            // 7. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
+            // 7. Channel Creation: `ch := make(chan int, 8)`, `ch = Channel(10)`
+            if let Some(caps) = self.make_chan_re.captures(text) {
+                let is_scoped = caps.get(1).is_some() || text.contains(":=");
+                let target = caps[2].trim().to_string();
+                let cap_str = caps.get(3).or_else(|| caps.get(4)).map(|m| m.as_str()).unwrap_or("1");
+                let capacity = cap_str.parse::<usize>().unwrap_or(1);
+                stmts.push(Statement::ChanMake {
+                    target,
+                    capacity,
+                    elem_size: 8,
+                    is_scoped_decl: is_scoped,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 8. Channel Send: `ch <- 42`, `ch.send(42)`
+            if let Some(caps) = self.chan_send_re.captures(text) {
+                let channel = caps.get(1).or_else(|| caps.get(3)).unwrap().as_str().trim().to_string();
+                let expr = caps.get(2).or_else(|| caps.get(4)).unwrap().as_str().trim().to_string();
+                stmts.push(Statement::ChanSend { channel, expr });
+                i += 1;
+                continue;
+            }
+
+            // 9. Channel Receive: `val := <-ch`, `val = <-ch`, `val = ch.recv()`, `<-ch`
+            if let Some(caps) = self.chan_recv_re.captures(text) {
+                let is_scoped = caps.get(1).is_some() || text.contains(":=");
+                let target = caps.get(2).map(|m| m.as_str().trim().to_string());
+                let channel = caps.get(3).or_else(|| caps.get(4)).unwrap().as_str().trim().to_string();
+                stmts.push(Statement::ChanRecv {
+                    target,
+                    channel,
+                    is_scoped_decl: is_scoped,
+                });
+                i += 1;
+                continue;
+            }
+
+            // 10. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
             if let Some(caps) = self.walrus_assign_re.captures(text) {
                 stmts.push(Statement::Assign {
                     target: caps[1].trim().to_string(),

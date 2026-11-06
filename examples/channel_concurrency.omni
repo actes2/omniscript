@@ -1,0 +1,23 @@
+def worker(ch):
+    print("Worker fiber received channel handle!")
+    print("Worker sending value 42 into channel...")
+    ch <- 42
+    print("Worker sending value 99 into channel...")
+    ch <- 99
+    return 0
+
+def main():
+    print("=== Testing Go-Style Channel Concurrency ===")
+    ch := make(chan int, 8)
+    
+    go worker(ch)
+    
+    first := <-ch
+    print("Main received first value:")
+    print(first)
+    
+    second := <-ch
+    print("Main received second value:")
+    print(second)
+    
+    return 0
