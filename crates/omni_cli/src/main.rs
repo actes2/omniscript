@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_cache: bool,
 
+    /// Cache directory for LLVM IR bitcode
+    #[arg(long, default_value = "tests/outputs/.omnicache")]
+    cache_dir: PathBuf,
+
     /// Verbose diagnostic output
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -144,7 +148,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 4. Code Generation & Intent Synthesis (with .omnicache check)
-    let cache_dir = PathBuf::from(".omnicache");
+    let cache_dir = &args.cache_dir;
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_content.as_bytes());
     hasher.update(b"x86_64-pc-linux-gnu");
@@ -159,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     let cache_file = cache_dir.join(format!("{}.ll", cache_hash));
 
     let (llvm_ir, from_cache) = if !args.no_cache && cache_file.exists() {
-        println!("\n[4/5] [CACHE HIT] Loaded verified LLVM IR from .omnicache/{}.ll (0 ms)", &cache_hash[..12]);
+        println!("\n[4/5] [CACHE HIT] Loaded verified LLVM IR from {}/{}.ll (0 ms)", cache_dir.display(), &cache_hash[..12]);
         (fs::read_to_string(&cache_file)?, true)
     } else {
         println!("\n[4/5] Synthesizing intent blocks and generating unified LLVM IR...");
@@ -182,12 +186,12 @@ fn main() -> anyhow::Result<()> {
         println!("  -> LLVM IR syntax & type verifier passed cleanly.");
 
         // Atomic commit to .omnicache (write temp file + rename)
-        let _ = fs::create_dir_all(&cache_dir);
+        let _ = fs::create_dir_all(cache_dir);
         let tmp_cache = cache_dir.join(format!(".tmp_{}.ll", cache_hash));
         if fs::write(&tmp_cache, &llvm_ir).is_ok() {
             let _ = fs::rename(&tmp_cache, &cache_file);
         }
-        println!("  -> Bitcode committed to .omnicache/{}.ll", &cache_hash[..12]);
+        println!("  -> Bitcode committed to {}/{}.ll", cache_dir.display(), &cache_hash[..12]);
     } else {
         println!("  -> Skipped verification pass (pre-verified bitcode).");
     }

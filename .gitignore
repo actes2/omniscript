@@ -1,5 +1,7 @@
 /target/
 /.omnicache/
+/tests/outputs/*
+!/tests/outputs/.gitkeep
 **/*.rs.bk
 *.swp
 *.orig
@@ -7,6 +9,3 @@
 *_bin
 a.out
 result
-flow_bin
-bracket_bin
-quirks_bin
