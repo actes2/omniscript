@@ -35,6 +35,7 @@ pub struct SsaContextEnvelope {
     pub physical_source: Option<String>,
     pub concurrency_mode: Option<String>,
     pub yield_expectation: Option<String>,
+    pub action_directive: Option<String>,
 }
 
 impl SsaContextEnvelope {
@@ -44,6 +45,9 @@ impl SsaContextEnvelope {
         out.push_str("<omni_ir_task>\n");
         if let Some(anchor) = self.anchor_id {
             out.push_str(&format!("  <interpretive_anchor id=\"{}\"/>\n", anchor));
+        }
+        if let Some(ref ad) = self.action_directive {
+            out.push_str(&format!("  <action_directive>{}</action_directive>\n", ad));
         }
         if let Some(ref ps) = self.physical_source {
             out.push_str("  <physical_source>\n");
@@ -147,11 +151,10 @@ impl InferenceEngine for MockSynthesisEngine {
             if !fn_name.is_empty() {
                 return Ok(format!(
                     r#"
-  ; [Synthesized Fiber Spawn for: {}]
-  %fn_ptr_{} = bitcast i32 (i8*, i64)* @__omni_fn_{} to void (i8*)*
-  call void @__omni_go_spawn(void (i8*)* %fn_ptr_{}, i8* null)
+  ; [Synthesized Fiber Spawn via exact static trampoline]
+  call void @__omni_go_spawn(void (i8*)* @__omni_trampoline_{}, i8* null)
 "#,
-                    fn_name, envelope.next_ssa_idx, fn_name, envelope.next_ssa_idx
+                    fn_name
                 ));
             }
         }

@@ -536,6 +536,7 @@ impl<'a> CodeGenerator<'a> {
                         physical_source: Some(format!("go {}", call_expr)),
                         concurrency_mode: Some("fiber_m_to_n".to_string()),
                         yield_expectation: Some("void".to_string()),
+                        action_directive: Some("SPAWN_GOROUTINE".to_string()),
                     };
 
                     ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
@@ -576,10 +577,11 @@ impl<'a> CodeGenerator<'a> {
                         physical_source: Some(physical_source.clone()),
                         concurrency_mode: None,
                         yield_expectation: Some("i32".to_string()),
+                        action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
                     };
 
                     ir.push_str(&format!(
-                        "  ; >>> [INTERPRETIVE ANCHOR #{} at {}:{}-{}]\n",
+                        "  ; >>> [OMNI INTERPRETIVE ANCHOR #{} at {}:{}-{}]\n",
                         anchor_id, file, line_start, line_end
                     ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
@@ -612,10 +614,16 @@ impl<'a> CodeGenerator<'a> {
                         physical_source: Some(instruction.clone()),
                         concurrency_mode: None,
                         yield_expectation: Some("i32".to_string()),
+                        action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     };
 
+                    ir.push_str(&format!(
+                        "  ; =========================================================================\n  ; >>> [OMNI INTERPRETIVE ANCHOR: ANCHOR_{}]\n  ; Source: {}:{}\n  ; Directive: LOWER_ANONYMOUS_INTENT\n  ; Physical Source: \"{}\"\n  ; =========================================================================\n",
+                        *lbl_counter, fn_name, *lbl_counter, instruction.trim()
+                    ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     ir.push_str(&synthesized);
+                    ir.push_str(&format!("  ; <<< [END ANCHOR: ANCHOR_{}]\n", *lbl_counter));
                 }
 
                 // 11. Fallback Concrete / Polyglot Statement -> packed with Idiom hint
@@ -643,6 +651,7 @@ impl<'a> CodeGenerator<'a> {
                         physical_source: Some(code.clone()),
                         concurrency_mode: None,
                         yield_expectation: Some("i32".to_string()),
+                        action_directive: Some("LOWER_POLYGLOT_SYNTAX".to_string()),
                     };
 
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
@@ -739,6 +748,12 @@ impl<'a> CodeGenerator<'a> {
                 ir.push_str("  ret i32 0\n");
             }
             ir.push_str("}\n\n");
+
+            // Static Trampoline for Fiber Concurrency (100% C-ABI compliant void (*)(void*))
+            ir.push_str(&format!(
+                "define void @__omni_trampoline_{}(i8* %raw_arg) {{\nentry:\n  %res = call i32 @__omni_fn_{}(i8* %raw_arg, i64 0)\n  ret void\n}}\n\n",
+                func.name, func.name
+            ));
         }
 
         // 3. Entrypoint @main
