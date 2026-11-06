@@ -1,0 +1,27 @@
+def main():
+    print("=== Testing Hardened Control Flow ===")
+    
+    # 1. While loop and arithmetic
+    x = 0
+    while x < 3:
+        print("Looping x:")
+        print(x)
+        x = x + 1
+
+    # 2. If-Else conditionals
+    if x == 3:
+        print("Condition Passed: x is 3")
+    else:
+        print("Condition Failed!")
+
+    # 3. For loop with nested If-Else
+    print("=== For Loop with Conditionals ===")
+    for i in 6:
+        if i < 3:
+            print("Low item:")
+            print(i)
+        else:
+            print("High item:")
+            print(i)
+
+    return 0

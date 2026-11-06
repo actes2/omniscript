@@ -7,6 +7,7 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
     vec![
         native_dir.join("omni_arena.c"),
         native_dir.join("omni_chan.c"),
+        native_dir.join("omni_value.c"),
     ]
 }
 
@@ -14,6 +15,10 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
 pub fn runtime_llvm_declarations() -> &'static str {
     r#"
 ; --- OmniScript Framework Runtime Declarations ---
+; Printing helpers
+declare void @__omni_print_str(i8*)
+declare void @__omni_print_int(i64)
+
 ; Arena Allocator
 declare i8* @__omni_arena_create(i64)
 declare i8* @__omni_arena_alloc(i8*, i64, i64)
@@ -36,7 +41,7 @@ mod tests {
     #[test]
     fn test_runtime_sources_exist() {
         let sources = runtime_c_sources();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 3);
         for s in sources {
             assert!(s.exists(), "Source does not exist: {}", s.display());
         }
