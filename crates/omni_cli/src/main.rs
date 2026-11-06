@@ -62,6 +62,15 @@ enum Commands {
     },
     /// Launch the interactive polyglot OmniScript REPL
     Repl,
+    /// Generate a verified synthetic dataset of <omni_ir_task> <-> LLVM IR pairs (Zero external downloads)
+    SynthDataset {
+        /// Number of verified samples to synthesize
+        #[arg(short, long, default_value_t = 100)]
+        count: usize,
+        /// Destination JSONL file
+        #[arg(short, long, default_value = "tests/outputs/synthetic_training_dataset.jsonl")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -69,6 +78,9 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Commands::Repl) => run_repl()?,
+        Some(Commands::SynthDataset { count, output }) => {
+            synth_dataset(count, &output)?;
+        }
         Some(Commands::Run { source, args: prog_args }) => {
             run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose)?;
         }
@@ -85,6 +97,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn synth_dataset(count: usize, output: &Path) -> anyhow::Result<()> {
+    use omni_engine::SyntheticDatasetGenerator;
+
+    println!("============================================================");
+    println!(" OmniScript Synthetic Training Dataset Generator");
+    println!(" Generating {} verified <omni_ir_task> <-> LLVM IR pairs", count);
+    println!(" Destination: {}", output.display());
+    println!(" Hotspot-Safe Mode: ZERO external weight downloads");
+    println!("============================================================");
+
+    let generator = SyntheticDatasetGenerator::new()?;
+    let records = generator.generate_verified_dataset(count);
+    let written = SyntheticDatasetGenerator::write_jsonl(&records, output)?;
+
+    println!("\n[SYNTHESIS COMPLETE]");
+    println!("  -> Successfully synthesized and verified {} samples with Clang", written);
+    println!("  -> Dataset saved to: {}", output.display());
     Ok(())
 }
 

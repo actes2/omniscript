@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub mod dataset_generator;
+pub use dataset_generator::{DatasetRecord, SyntheticDatasetGenerator};
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Model file not found at: {0}")]
