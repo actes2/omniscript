@@ -139,6 +139,61 @@ impl LlvmVerifier {
         Ok(())
     }
 
+    /// Directly execute LLVM IR bitcode in-memory / via ephemeral execution path, streaming stdio
+    pub fn run_jit(
+        &self,
+        ir: &str,
+        opt_level: u8,
+        extra_c_files: &[PathBuf],
+        args: &[String],
+    ) -> Result<std::process::ExitStatus, VerifyError> {
+        let temp_dir = std::env::temp_dir();
+        let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_bin = temp_dir.join(format!("omni_jit_{}_{}", std::process::id(), unique_id));
+
+        self.compile_ir_to_binary(ir, &temp_bin, opt_level, extra_c_files)?;
+
+        let mut child = Command::new(&temp_bin)
+            .args(args)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| VerifyError::Io(e.to_string()))?;
+
+        let status = child.wait().map_err(|e| VerifyError::Io(e.to_string()))?;
+        let _ = fs::remove_file(&temp_bin);
+
+        Ok(status)
+    }
+
+    /// Directly execute LLVM IR and capture stdout/stderr strings
+    pub fn run_jit_captured(
+        &self,
+        ir: &str,
+        opt_level: u8,
+        extra_c_files: &[PathBuf],
+        args: &[String],
+    ) -> Result<(std::process::ExitStatus, String, String), VerifyError> {
+        let temp_dir = std::env::temp_dir();
+        let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_bin = temp_dir.join(format!("omni_jit_cap_{}_{}", std::process::id(), unique_id));
+
+        self.compile_ir_to_binary(ir, &temp_bin, opt_level, extra_c_files)?;
+
+        let output = Command::new(&temp_bin)
+            .args(args)
+            .output()
+            .map_err(|e| VerifyError::Io(e.to_string()))?;
+
+        let _ = fs::remove_file(&temp_bin);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok((output.status, stdout, stderr))
+    }
+
     fn parse_diagnostic(&self, stderr: &str) -> VerifyError {
         for line in stderr.lines() {
             if let Some(caps) = self.diag_re.captures(line) {
@@ -193,5 +248,25 @@ define i32 @bad_fn() {
         } else {
             panic!("Expected SyntaxError diagnostic");
         }
+    }
+
+    #[test]
+    fn test_run_jit_execution() {
+        let verifier = LlvmVerifier::new().unwrap();
+        let ir = r#"
+declare i32 @printf(i8*, ...)
+@.msg = private unnamed_addr constant [15 x i8] c"JIT Works: %d\0A\00", align 1
+
+define i32 @main() {
+  %ptr = getelementptr inbounds [15 x i8], [15 x i8]* @.msg, i64 0, i64 0
+  call i32 (i8*, ...) @printf(i8* %ptr, i32 42)
+  ret i32 0
+}
+"#;
+        let (status, stdout, _stderr) = verifier
+            .run_jit_captured(ir, 0, &[], &[])
+            .expect("JIT execution failed");
+        assert!(status.success());
+        assert_eq!(stdout.trim(), "JIT Works: 42");
     }
 }
