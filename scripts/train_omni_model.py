@@ -80,6 +80,12 @@ def parse_args():
         default=32,
         help="LoRA alpha scaling factor",
     )
+    parser.add_argument(
+        "--load_in_4bit",
+        "--4bit",
+        action="store_true",
+        help="Use QLoRA 4-bit NormalFloat (NF4) quantization to fit inside 8GB-16GB VRAM GPUs",
+    )
     return parser.parse_args()
 
 
@@ -153,12 +159,28 @@ def main():
 
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+    quant_config = None
+    if args.load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+        print("[QLoRA] Enabling 4-bit NormalFloat (NF4) quantization for base model...")
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=compute_dtype,
+        quantization_config=quant_config,
+        torch_dtype=compute_dtype if not args.load_in_4bit else None,
         device_map="auto",
         trust_remote_code=True,
     )
+
+    if args.load_in_4bit:
+        model = prepare_model_for_kbit_training(model)
 
     # 3. Configure LoRA
     print("[PEFT] Initializing LoRA configuration...")
@@ -255,9 +277,30 @@ def main():
 
     merged_path = os.path.join(args.output_dir, "merged")
     print(f"[MERGE] Merging LoRA adapter into base model weights -> {merged_path}...")
-    merged_model = model.merge_and_unload()
-    merged_model.save_pretrained(merged_path, safe_serialization=True)
-    tokenizer.save_pretrained(merged_path)
+    if args.load_in_4bit:
+        # For QLoRA, reload the base model in unquantized 16-bit float on CPU to apply LoRA deltas cleanly
+        from peft import PeftModel
+        import gc
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("[MERGE] Reloading base model on CPU to generate unquantized merged weights...")
+        base_reload = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=compute_dtype,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        peft_reload = PeftModel.from_pretrained(base_reload, adapter_path)
+        merged_model = peft_reload.merge_and_unload()
+        merged_model.save_pretrained(merged_path, safe_serialization=True)
+        tokenizer.save_pretrained(merged_path)
+    else:
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_path, safe_serialization=True)
+        tokenizer.save_pretrained(merged_path)
+
     print("[SUCCESS] Merged standalone Hugging Face model saved successfully!")
 
     # 8. Print Quantization Guide for User
