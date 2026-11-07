@@ -22,24 +22,28 @@ struct Cli {
     output: PathBuf,
 
     /// Model inference temperature for intent lowering
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, global = true, default_value_t = 0.0)]
     temp: f32,
 
     /// LLVM optimization level (0, 1, 2, 3)
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, global = true, default_value_t = 2)]
     opt_level: u8,
 
     /// Bypass .omnicache and force re-synthesis
-    #[arg(long, default_value_t = false)]
+    #[arg(long, global = true, default_value_t = false)]
     no_cache: bool,
 
     /// Cache directory for LLVM IR bitcode
-    #[arg(long, default_value = "tests/outputs/.omnicache")]
+    #[arg(long, global = true, default_value = "tests/outputs/.omnicache")]
     cache_dir: PathBuf,
 
     /// Verbose diagnostic output
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long, global = true, default_value_t = false)]
     verbose: bool,
+
+    /// Target execution device for AI intent lowering: "auto" (default), "cuda", or "cpu"
+    #[arg(long, global = true, default_value = "auto")]
+    device: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -82,14 +86,14 @@ fn main() -> anyhow::Result<()> {
             synth_dataset(count, &output)?;
         }
         Some(Commands::Run { source, args: prog_args }) => {
-            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose)?;
+            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
         }
         Some(Commands::Build { source, output }) => {
-            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose)?;
+            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
         }
         None => {
             if let Some(ref source) = args.source {
-                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose)?;
+                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
             } else {
                 // If no arguments or subcommands provided, launch interactive REPL
                 run_repl()?;
@@ -138,8 +142,9 @@ fn run_file(
     no_cache: bool,
     cache_dir: &Path,
     verbose: bool,
+    device: &str,
 ) -> anyhow::Result<()> {
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device)?;
     let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
     println!(
         "[COMPILE] Ready in {:.2?} (Parse: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?})",
@@ -161,15 +166,16 @@ fn build_file(
     no_cache: bool,
     cache_dir: &Path,
     verbose: bool,
+    device: &str,
 ) -> anyhow::Result<()> {
     let build_start = std::time::Instant::now();
     println!("==================================================");
     println!(" OmniScript Compiler (omnic v0.1.0)");
     println!(" Target Source: {}", source_path.display());
-    println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {}", temp, opt_level, !no_cache);
+    println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {} | Device: {}", temp, opt_level, !no_cache, device);
     println!("==================================================");
 
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device)?;
     let verifier = LlvmVerifier::new()?;
 
     println!("\n[5/5] Linking native ELF binary...");
@@ -195,6 +201,7 @@ fn compile_source(
     no_cache: bool,
     cache_dir: &Path,
     verbose: bool,
+    device: &str,
 ) -> anyhow::Result<(String, Vec<PathBuf>, CompilationStats)> {
     let start_compile = std::time::Instant::now();
     if !source_path.exists() {
@@ -331,9 +338,22 @@ fn compile_source(
         let verifier = LlvmVerifier::new()?;
         let fallback = MockSynthesisEngine::new();
 
-        let generated = if let Some(candle_engine) = CandleGgufEngine::discover_default() {
+        let pref = match device.to_lowercase().as_str() {
+            "cuda" | "gpu" => {
+                if !omni_engine::cuda_is_available() {
+                    eprintln!("[ERROR] Explicit device '--device cuda' requested, but CUDA acceleration is not available or drivers/toolkit are missing.");
+                    std::process::exit(1);
+                }
+                omni_engine::DevicePreference::Cuda(0)
+            }
+            "cpu" => omni_engine::DevicePreference::Cpu,
+            _ => omni_engine::DevicePreference::Auto,
+        };
+
+        let generated = if let Some(candle_engine) = CandleGgufEngine::discover_default_with_device(pref) {
+            let dev_tag = if candle_engine.is_cuda() { "CUDA GPU" } else { "CPU (AVX2/SIMD)" };
             if verbose {
-                println!("  -> [Inference] Using in-process Candle GGUF engine ({})", candle_engine.model_path.display());
+                println!("  -> [Inference] Using in-process Candle GGUF engine on {} ({})", dev_tag, candle_engine.model_path.display());
             }
             let primary_verified = VerifiedSynthesisEngine::new(&candle_engine, &verifier);
             let composite = FallbackEngine::new(primary_verified, fallback);

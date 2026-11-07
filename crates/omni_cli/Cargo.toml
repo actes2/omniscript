@@ -22,3 +22,7 @@ omni_verify = { path = "../omni_verify" }
 omni_codegen = { path = "../omni_codegen" }
 omni_engine = { path = "../omni_engine" }
 omni_runtime = { path = "../omni_runtime" }
+
+[features]
+default = []
+cuda = ["omni_engine/cuda"]

@@ -17,3 +17,7 @@ candle-core = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-cou
 candle-transformers = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-count-unsafe" }
 tokenizers = "0.23.2"
 memmap2 = "0.9.12"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-transformers/cuda"]

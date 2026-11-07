@@ -544,11 +544,19 @@ impl<P: InferenceEngine, F: InferenceEngine> InferenceEngine for FallbackEngine<
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevicePreference {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda(usize),
+}
+
 /// In-process Candle-based GGUF inference engine executing directly without background daemons.
 pub struct CandleGgufEngine {
     model: Mutex<Qwen2Weights>,
     tokenizer: Tokenizer,
-    device: Device,
+    pub device: Device,
     pub model_path: PathBuf,
     pub system_prompt: String,
     pub sample_len: usize,
@@ -556,10 +564,27 @@ pub struct CandleGgufEngine {
 }
 
 impl CandleGgufEngine {
-    pub fn new(model_path: PathBuf) -> Result<Self, EngineError> {
+    pub fn new_with_device(model_path: PathBuf, pref: DevicePreference) -> Result<Self, EngineError> {
         if !model_path.exists() {
             return Err(EngineError::ModelNotFound(model_path));
         }
+
+        let device = match pref {
+            DevicePreference::Cpu => Device::Cpu,
+            DevicePreference::Cuda(ord) => {
+                if !candle_core::utils::cuda_is_available() {
+                    return Err(EngineError::InferenceFailed(
+                        format!("CUDA acceleration requested (device {}), but CUDA is not available or drivers/toolkit are missing", ord)
+                    ));
+                }
+                Device::new_cuda(ord).map_err(|e| {
+                    EngineError::InferenceFailed(format!("Failed to initialize CUDA device {}: {}", ord, e))
+                })?
+            }
+            DevicePreference::Auto => {
+                Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+            }
+        };
 
         let mut file = std::fs::File::open(&model_path)
             .map_err(|e| EngineError::InferenceFailed(format!("Failed to open model file: {}", e)))?;
@@ -579,9 +604,8 @@ impl CandleGgufEngine {
             })
             .unwrap_or(151645);
 
-        let device = Device::Cpu;
         let model = Qwen2Weights::from_gguf(content, &mut file, &device)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed initializing Qwen2 model from GGUF: {}", e)))?;
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed initializing Qwen2 model from GGUF on {:?}: {}", device, e)))?;
 
         Ok(Self {
             model: Mutex::new(model),
@@ -594,12 +618,16 @@ impl CandleGgufEngine {
         })
     }
 
+    pub fn new(model_path: PathBuf) -> Result<Self, EngineError> {
+        Self::new_with_device(model_path, DevicePreference::Auto)
+    }
+
     /// Automatically discover standard model locations on the host system
-    pub fn discover_default() -> Option<Self> {
+    pub fn discover_default_with_device(pref: DevicePreference) -> Option<Self> {
         if let Ok(env_path) = std::env::var("OMNI_MODEL_PATH") {
             let p = PathBuf::from(env_path);
             if p.exists() {
-                if let Ok(engine) = Self::new(p) {
+                if let Ok(engine) = Self::new_with_device(p, pref) {
                     return Some(engine);
                 }
             }
@@ -613,7 +641,7 @@ impl CandleGgufEngine {
 
         for path in &candidate_paths {
             if path.exists() {
-                if let Ok(engine) = Self::new(path.clone()) {
+                if let Ok(engine) = Self::new_with_device(path.clone(), pref) {
                     return Some(engine);
                 }
             }
@@ -622,10 +650,22 @@ impl CandleGgufEngine {
         None
     }
 
+    pub fn discover_default() -> Option<Self> {
+        Self::discover_default_with_device(DevicePreference::Auto)
+    }
+
+    pub fn is_cuda(&self) -> bool {
+        matches!(self.device, Device::Cuda(_))
+    }
+
     pub fn with_sample_len(mut self, len: usize) -> Self {
         self.sample_len = len;
         self
     }
+}
+
+pub fn cuda_is_available() -> bool {
+    candle_core::utils::cuda_is_available()
 }
 
 impl InferenceEngine for CandleGgufEngine {
