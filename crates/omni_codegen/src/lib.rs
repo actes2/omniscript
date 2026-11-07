@@ -1246,7 +1246,6 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("declare i8* @malloc(i64)\n");
         ir.push_str("declare void @free(i8*)\n");
         ir.push_str("declare i32 @printf(i8*, ...)\n");
-        ir.push_str("declare void @fast_hash_block(i8*, i64, i8*)\n");
         ir.push_str(omni_runtime::runtime_llvm_declarations());
         ir.push_str("\n");
 

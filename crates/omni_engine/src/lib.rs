@@ -44,6 +44,11 @@ pub struct SsaContextEnvelope {
 impl SsaContextEnvelope {
     /// Formats the context into compact XML micro-tags (<300 tokens) for sub-2B models
     pub fn to_prompt_micro_tags(&self) -> String {
+        self.to_prompt_with_feedback(None)
+    }
+
+    /// Formats the context with optional feedback from previous Clang compiler diagnostics
+    pub fn to_prompt_with_feedback(&self, feedback: Option<&str>) -> String {
         let mut out = String::new();
         out.push_str("<omni_ir_task>\n");
         if let Some(anchor) = self.anchor_id {
@@ -88,6 +93,15 @@ impl SsaContextEnvelope {
         }
         out.push_str(&format!("  <intent>{}</intent>\n", self.raw_intent.trim()));
         out.push_str(&format!("  <next_reg>%t_{}</next_reg>\n", self.next_ssa_idx));
+
+        if let Some(diag) = feedback {
+            out.push_str("  <compiler_diagnostic>\n");
+            for l in diag.lines() {
+                out.push_str(&format!("    {}\n", l.trim()));
+            }
+            out.push_str("  </compiler_diagnostic>\n");
+        }
+
         out.push_str("</omni_ir_task>\n");
         out
     }
@@ -170,8 +184,265 @@ impl InferenceEngine for MockSynthesisEngine {
     }
 }
 
+/// Strips markdown fences, natural language chat, and trims lines to pure LLVM IR
+pub fn sanitize_llvm_ir(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+
+        // Skip chat / prompt echoes
+        if trimmed.starts_with("<omni_ir_task")
+            || trimmed.starts_with("</omni_ir_task>")
+            || trimmed.starts_with("Here is")
+            || trimmed.starts_with("Sure")
+            || trimmed.starts_with("Note:")
+        {
+            continue;
+        }
+
+        // Keep instruction and comment lines
+        if trimmed.starts_with('%')
+            || trimmed.starts_with(';')
+            || trimmed.starts_with("store ")
+            || trimmed.starts_with("load ")
+            || trimmed.starts_with("call ")
+            || trimmed.starts_with("alloca ")
+            || trimmed.starts_with("br ")
+            || trimmed.starts_with("ret ")
+            || trimmed.starts_with("icmp ")
+            || trimmed.starts_with("add ")
+            || trimmed.starts_with("sub ")
+            || trimmed.starts_with("mul ")
+            || trimmed.starts_with("getelementptr ")
+            || in_fence
+        {
+            if !trimmed.is_empty() {
+                out.push_str("  ");
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+        }
+    }
+
+    if out.trim().is_empty() {
+        raw.trim().to_string()
+    } else {
+        out
+    }
+}
+
+/// Live HTTP inference engine connecting directly to a local Ollama server
+pub struct OllamaInferenceEngine {
+    pub endpoint: String,
+    pub model_name: String,
+    pub system_prompt: String,
+}
+
+impl OllamaInferenceEngine {
+    pub fn new(model_name: impl Into<String>) -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:11434/api/generate".to_string(),
+            model_name: model_name.into(),
+            system_prompt: "You are the OmniScript LLVM IR Compiler Backend. Output ONLY valid, raw LLVM IR basic blocks. Do NOT wrap in markdown fences, do NOT include explanations.".to_string(),
+        }
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+}
+
+impl InferenceEngine for OllamaInferenceEngine {
+    fn lower_intent(
+        &self,
+        envelope: &SsaContextEnvelope,
+        temp: f32,
+    ) -> Result<String, EngineError> {
+        let prompt = envelope.to_prompt_micro_tags();
+        let payload = serde_json::json!({
+            "model": self.model_name,
+            "system": self.system_prompt,
+            "prompt": prompt,
+            "stream": false,
+            "options": {
+                "temperature": temp.max(0.05),
+                "num_predict": 64,
+                "stop": ["</omni_ir_task>", "```", "\n\n"]
+            }
+        });
+
+        let payload_str = serde_json::to_string(&payload)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+        let mut child = std::process::Command::new("curl")
+            .args(["-s", "-X", "POST", &self.endpoint, "-H", "Content-Type: application/json", "-d", "@-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed to execute curl: {}", e)))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, payload_str.as_bytes());
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed reading curl response: {}", e)))?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::InferenceFailed(format!("Ollama HTTP request failed: {}", err)));
+        }
+
+        let resp_json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| EngineError::InferenceFailed(format!("Invalid Ollama JSON response: {}", e)))?;
+
+        let raw_res = resp_json
+            .get("response")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(sanitize_llvm_ir(&raw_res))
+    }
+}
+
+/// Self-Repairing synthesis engine verifying every LLVM IR block with Clang
+pub struct VerifiedSynthesisEngine<'a> {
+    pub backend: &'a dyn InferenceEngine,
+    pub verifier: &'a omni_verify::LlvmVerifier,
+    pub max_retries: usize,
+}
+
+impl<'a> VerifiedSynthesisEngine<'a> {
+    pub fn new(backend: &'a dyn InferenceEngine, verifier: &'a omni_verify::LlvmVerifier) -> Self {
+        Self {
+            backend,
+            verifier,
+            max_retries: 3,
+        }
+    }
+
+    /// Auto-generates dummy params and allocas for live registers to enable isolated Clang verification
+    fn generate_harness_header(envelope: &SsaContextEnvelope) -> (String, String) {
+        let mut params = Vec::new();
+        let mut preamble = String::new();
+
+        for sym in &envelope.active_symbols {
+            if sym.llvm_name.starts_with('%') {
+                let reg_name = &sym.llvm_name;
+                if sym.llvm_name.contains("_ptr") {
+                    preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
+                } else if sym.llvm_name.contains("_val") && sym.type_hint.contains("i64") {
+                    preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
+                } else if sym.llvm_name.contains("_val") {
+                    preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
+                } else {
+                    let ty = if sym.type_hint.contains("i8*") {
+                        "i8*"
+                    } else if sym.type_hint == "i64" {
+                        "i64"
+                    } else if sym.type_hint == "i1" {
+                        "i1"
+                    } else {
+                        "i32"
+                    };
+                    params.push(format!("{} {}", ty, reg_name));
+                }
+            }
+        }
+
+        let header = format!("define i32 @harness({}) {{\nentry:\n", params.join(", "));
+        (header, preamble)
+    }
+}
+
+impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
+    fn lower_intent(
+        &self,
+        envelope: &SsaContextEnvelope,
+        temp: f32,
+    ) -> Result<String, EngineError> {
+        let mut last_error = String::new();
+        let (header, preamble) = Self::generate_harness_header(envelope);
+
+        for attempt in 0..self.max_retries {
+            let feedback = if attempt > 0 { Some(last_error.as_str()) } else { None };
+
+            // Re-package envelope with updated prompt feedback
+            let mut trial_env = envelope.clone();
+            if let Some(err_msg) = feedback {
+                trial_env.raw_intent = format!("{}\n[Compiler Diagnostic Feedback: {}]", envelope.raw_intent, err_msg);
+            }
+
+            let raw_ir = self.backend.lower_intent(&trial_env, temp)?;
+            let sanitized = sanitize_llvm_ir(&raw_ir);
+
+            // Construct verification harness module
+            let mut harness = String::new();
+            harness.push_str("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+            harness.push_str(omni_runtime::runtime_llvm_declarations());
+            harness.push_str("\n");
+            harness.push_str(&header);
+            harness.push_str(&preamble);
+            harness.push_str(&sanitized);
+            harness.push_str("\n  ret i32 0\n}\n");
+
+            // Verify with Clang
+            match self.verifier.verify_ir(&harness) {
+                Ok(_) => {
+                    return Ok(sanitized);
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                }
+            }
+        }
+
+        Err(EngineError::InferenceFailed(format!(
+            "Failed Clang self-repair loop after {} attempts. Last error:\n{}",
+            self.max_retries, last_error
+        )))
+    }
+}
+
+/// Fallback engine that tries the primary engine first, then gracefully degrades to offline mock engine
+pub struct FallbackEngine<P: InferenceEngine, F: InferenceEngine> {
+    pub primary: P,
+    pub fallback: F,
+}
+
+impl<P: InferenceEngine, F: InferenceEngine> FallbackEngine<P, F> {
+    pub fn new(primary: P, fallback: F) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl<P: InferenceEngine, F: InferenceEngine> InferenceEngine for FallbackEngine<P, F> {
+    fn lower_intent(
+        &self,
+        envelope: &SsaContextEnvelope,
+        temp: f32,
+    ) -> Result<String, EngineError> {
+        match self.primary.lower_intent(envelope, temp) {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                tracing::warn!("Primary inference backend failed ({}); falling back to offline engine", err);
+                self.fallback.lower_intent(envelope, temp)
+            }
+        }
+    }
+}
+
 /// Standby wrapper for local GGUF models (Meta LLM-Compiler / Qwen2.5-Coder)
-/// Will be engaged once weights are provided/downloaded.
 pub struct LlamaCppEngine {
     pub model_path: PathBuf,
 }
@@ -192,10 +463,74 @@ impl InferenceEngine for LlamaCppEngine {
         _temp: f32,
     ) -> Result<String, EngineError> {
         let _prompt = envelope.to_prompt_micro_tags();
-        // Standby scaffolding for local llama.cpp GGUF context evaluation
         Ok(format!(
             "  ; [Standby GGUF synthesis for intent: {}]\n",
             envelope.raw_intent.trim()
         ))
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_llvm_ir() {
+        let chatty = r#"
+Sure! Here is the LLVM IR for the requested intent:
+```llvm
+  %t_10 = load i8*, i8** %items_ptr
+  call void @__omni_slice_append(i8* %t_10, i64 42)
+```
+Let me know if you need any adjustments!
+"#;
+        let cleaned = sanitize_llvm_ir(chatty);
+        assert!(cleaned.contains("%t_10 = load i8*, i8** %items_ptr"));
+        assert!(cleaned.contains("call void @__omni_slice_append"));
+        assert!(!cleaned.contains("Sure!"));
+        assert!(!cleaned.contains("Let me know"));
+        assert!(!cleaned.contains("```"));
+    }
+
+    #[test]
+    fn test_verified_synthesis_engine_with_clang() {
+        let verifier = omni_verify::LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        let mock = MockSynthesisEngine::new();
+        let engine = VerifiedSynthesisEngine::new(&mock, &verifier);
+
+        let env = SsaContextEnvelope {
+            target_abi: "x86_64-pc-linux-gnu".to_string(),
+            enclosing_fn: "test_fn".to_string(),
+            return_type: "i32".to_string(),
+            next_ssa_idx: 10,
+            active_symbols: vec![
+                SsaVariable {
+                    name: "data".to_string(),
+                    llvm_name: "%data".to_string(),
+                    type_hint: "i8*".to_string(),
+                },
+                SsaVariable {
+                    name: "len".to_string(),
+                    llvm_name: "%len".to_string(),
+                    type_hint: "i64".to_string(),
+                },
+                SsaVariable {
+                    name: "temp_buf".to_string(),
+                    llvm_name: "%temp_buf".to_string(),
+                    type_hint: "i8*".to_string(),
+                },
+            ],
+            struct_definitions: vec![],
+            raw_intent: "hash data".to_string(),
+            idiom_hint: None,
+            anchor_id: Some(1),
+            physical_source: Some("hash data".to_string()),
+            concurrency_mode: None,
+            yield_expectation: Some("void".to_string()),
+            action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+        };
+
+        let result = engine.lower_intent(&env, 0.0).expect("Verified synthesis failed");
+        assert!(result.contains("call void @fast_hash_block"));
     }
 }

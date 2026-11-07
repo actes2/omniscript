@@ -18,9 +18,10 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
 pub fn runtime_llvm_declarations() -> &'static str {
     r#"
 ; --- OmniScript Framework Runtime Declarations ---
-; Printing helpers
+; Printing & Hashing helpers
 declare void @__omni_print_str(i8*)
 declare void @__omni_print_int(i64)
+declare void @fast_hash_block(i8*, i64, i8*)
 
 ; Arena Allocator
 declare i8* @__omni_arena_create(i64)
