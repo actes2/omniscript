@@ -1,6 +1,6 @@
 use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
-use omni_engine::MockSynthesisEngine;
+use omni_engine::{FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
 use omni_preamble::{ImportDirective, SymbolCarver};
 use omni_verify::LlvmVerifier;
@@ -278,8 +278,12 @@ fn compile_source(
     let (llvm_ir, from_cache) = if !no_cache && cache_file.exists() {
         (fs::read_to_string(&cache_file)?, true)
     } else {
-        let mock_engine = MockSynthesisEngine::new();
-        let codegen = CodeGenerator::new(&mock_engine);
+        let verifier = LlvmVerifier::new()?;
+        let primary = OllamaInferenceEngine::new("omni-coder");
+        let fallback = MockSynthesisEngine::new();
+        let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
+        let composite = FallbackEngine::new(primary_verified, fallback);
+        let codegen = CodeGenerator::new(&composite);
         let generated = codegen.generate_module_ir(&module, temp)?;
         (generated, false)
     };
@@ -312,9 +316,12 @@ fn run_repl() -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut session_stmts: Vec<String> = Vec::new();
     let parser = OmniParser::new();
-    let mock_engine = MockSynthesisEngine::new();
-    let codegen = CodeGenerator::new(&mock_engine);
     let verifier = LlvmVerifier::new()?;
+    let primary = OllamaInferenceEngine::new("omni-coder");
+    let fallback = MockSynthesisEngine::new();
+    let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
+    let composite = FallbackEngine::new(primary_verified, fallback);
+    let codegen = CodeGenerator::new(&composite);
     let runtime_c = omni_runtime::runtime_c_sources();
 
     loop {

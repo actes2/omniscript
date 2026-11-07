@@ -1162,6 +1162,20 @@ impl<'a> CodeGenerator<'a> {
                         })
                         .collect();
 
+                    let clean_instruction = instruction
+                        .trim_start_matches("intent")
+                        .trim_start_matches(':')
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+
+                    let idiom_hint = if clean_instruction.contains(".append(") {
+                        Some("PythonListTransform".to_string())
+                    } else {
+                        None
+                    };
+
                     let envelope = SsaContextEnvelope {
                         target_abi: "x86_64-pc-linux-gnu".to_string(),
                         enclosing_fn: fn_name.to_string(),
@@ -1169,12 +1183,12 @@ impl<'a> CodeGenerator<'a> {
                         next_ssa_idx: *temp_counter,
                         active_symbols,
                         struct_definitions: struct_defs.to_vec(),
-                        raw_intent: instruction.clone(),
-                        idiom_hint: None,
+                        raw_intent: clean_instruction.clone(),
+                        idiom_hint,
                         anchor_id: Some(*lbl_counter),
-                        physical_source: Some(instruction.clone()),
+                        physical_source: Some(clean_instruction.clone()),
                         concurrency_mode: None,
-                        yield_expectation: Some("i32".to_string()),
+                        yield_expectation: Some("void".to_string()),
                         action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     };
 

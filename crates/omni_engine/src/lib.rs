@@ -189,6 +189,13 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
     let mut out = String::new();
     let mut in_fence = false;
 
+    let valid_prefixes = [
+        "%", ";", "store ", "load ", "call ", "alloca ", "br ", "ret ", "icmp ",
+        "add ", "sub ", "mul ", "udiv ", "sdiv ", "urem ", "srem ",
+        "and ", "or ", "xor ", "shl ", "lshr ", "ashr ",
+        "getelementptr ", "sext ", "trunc ", "zext ", "bitcast ", "select ", "phi ",
+    ];
+
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
@@ -196,37 +203,25 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
             continue;
         }
 
+        // Strip non-ascii trailing artifacts or stop residue
+        let ascii_line: String = trimmed.chars().take_while(|c| c.is_ascii()).collect();
+        let trimmed_ascii = ascii_line.trim();
+
         // Skip chat / prompt echoes
-        if trimmed.starts_with("<omni_ir_task")
-            || trimmed.starts_with("</omni_ir_task>")
-            || trimmed.starts_with("Here is")
-            || trimmed.starts_with("Sure")
-            || trimmed.starts_with("Note:")
+        if trimmed_ascii.starts_with("<omni_ir_task")
+            || trimmed_ascii.starts_with("</omni_ir_task>")
+            || trimmed_ascii.starts_with("<|")
+            || trimmed_ascii.starts_with("Here is")
+            || trimmed_ascii.starts_with("Sure")
+            || trimmed_ascii.starts_with("Note:")
         {
             continue;
         }
 
-        // Keep instruction and comment lines
-        if trimmed.starts_with('%')
-            || trimmed.starts_with(';')
-            || trimmed.starts_with("store ")
-            || trimmed.starts_with("load ")
-            || trimmed.starts_with("call ")
-            || trimmed.starts_with("alloca ")
-            || trimmed.starts_with("br ")
-            || trimmed.starts_with("ret ")
-            || trimmed.starts_with("icmp ")
-            || trimmed.starts_with("add ")
-            || trimmed.starts_with("sub ")
-            || trimmed.starts_with("mul ")
-            || trimmed.starts_with("getelementptr ")
-            || in_fence
-        {
-            if !trimmed.is_empty() {
-                out.push_str("  ");
-                out.push_str(trimmed);
-                out.push('\n');
-            }
+        if valid_prefixes.iter().any(|prefix| trimmed_ascii.starts_with(prefix)) || (in_fence && !trimmed_ascii.is_empty()) {
+            out.push_str("  ");
+            out.push_str(trimmed_ascii);
+            out.push('\n');
         }
     }
 
@@ -244,12 +239,18 @@ pub struct OllamaInferenceEngine {
     pub system_prompt: String,
 }
 
+impl Default for OllamaInferenceEngine {
+    fn default() -> Self {
+        Self::new("omni-coder")
+    }
+}
+
 impl OllamaInferenceEngine {
     pub fn new(model_name: impl Into<String>) -> Self {
         Self {
-            endpoint: "http://127.0.0.1:11434/api/generate".to_string(),
+            endpoint: "http://127.0.0.1:11434/api/chat".to_string(),
             model_name: model_name.into(),
-            system_prompt: "You are the OmniScript LLVM IR Compiler Backend. Output ONLY valid, raw LLVM IR basic blocks. Do NOT wrap in markdown fences, do NOT include explanations.".to_string(),
+            system_prompt: "You are OmniScript AI IR Lowering Engine. You synthesize strictly valid LLVM IR basic block instructions for polyglot intent. Output raw LLVM IR instructions only.".to_string(),
         }
     }
 
@@ -268,13 +269,21 @@ impl InferenceEngine for OllamaInferenceEngine {
         let prompt = envelope.to_prompt_micro_tags();
         let payload = serde_json::json!({
             "model": self.model_name,
-            "system": self.system_prompt,
-            "prompt": prompt,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
             "stream": false,
             "options": {
                 "temperature": temp.max(0.05),
-                "num_predict": 64,
-                "stop": ["</omni_ir_task>", "```", "\n\n"]
+                "num_predict": 256,
+                "stop": ["</omni_ir_task>", "```", "<|im_end|>", "<|endoftext|>", "<|im_start|>"]
             }
         });
 
@@ -306,10 +315,16 @@ impl InferenceEngine for OllamaInferenceEngine {
             .map_err(|e| EngineError::InferenceFailed(format!("Invalid Ollama JSON response: {}", e)))?;
 
         let raw_res = resp_json
-            .get("response")
+            .get("message")
+            .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())
+            .or_else(|| resp_json.get("response").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
+
+        if raw_res.trim().is_empty() {
+            return Err(EngineError::InferenceFailed("Ollama returned empty response".to_string()));
+        }
 
         Ok(sanitize_llvm_ir(&raw_res))
     }
@@ -339,12 +354,22 @@ impl<'a> VerifiedSynthesisEngine<'a> {
         for sym in &envelope.active_symbols {
             if sym.llvm_name.starts_with('%') {
                 let reg_name = &sym.llvm_name;
-                if sym.llvm_name.contains("_ptr") {
+                if sym.llvm_name.contains("_ptr") || sym.llvm_name.starts_with("%col_ref_") {
                     preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
-                } else if sym.llvm_name.contains("_val") && sym.type_hint.contains("i64") {
-                    preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
-                } else if sym.llvm_name.contains("_val") {
-                    preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
+                } else if sym.llvm_name.starts_with("%param_") {
+                    if sym.type_hint.contains("i8*") {
+                        preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
+                    } else if sym.type_hint.contains("i64") {
+                        preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
+                    } else {
+                        preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
+                    }
+                } else if sym.llvm_name.contains("_val") || sym.llvm_name.starts_with("%var_") {
+                    if sym.type_hint.contains("i64") {
+                        preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
+                    } else {
+                        preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
+                    }
                 } else {
                     let ty = if sym.type_hint.contains("i8*") {
                         "i8*"
@@ -532,5 +557,55 @@ Let me know if you need any adjustments!
 
         let result = engine.lower_intent(&env, 0.0).expect("Verified synthesis failed");
         assert!(result.contains("call void @fast_hash_block"));
+    }
+
+    #[test]
+    fn test_live_ollama_verified_synthesis() {
+        if std::net::TcpStream::connect("127.0.0.1:11434").is_err() {
+            eprintln!("Skipping live Ollama test: server not reachable on 11434");
+            return;
+        }
+
+        let verifier = omni_verify::LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        let ollama = OllamaInferenceEngine::new("omni-coder");
+        let engine = VerifiedSynthesisEngine::new(&ollama, &verifier);
+
+        let env = SsaContextEnvelope {
+            target_abi: "x86_64-pc-linux-gnu".to_string(),
+            enclosing_fn: "transform_stream".to_string(),
+            return_type: "i32".to_string(),
+            next_ssa_idx: 10,
+            active_symbols: vec![
+                SsaVariable {
+                    name: "items".to_string(),
+                    llvm_name: "%items_ptr".to_string(),
+                    type_hint: "i8* (omni_slice)".to_string(),
+                },
+                SsaVariable {
+                    name: "factor".to_string(),
+                    llvm_name: "%factor_val".to_string(),
+                    type_hint: "i32".to_string(),
+                },
+            ],
+            struct_definitions: vec![],
+            raw_intent: "items.append(items[0] * factor)".to_string(),
+            idiom_hint: Some("PythonListTransform".to_string()),
+            anchor_id: Some(101),
+            physical_source: Some("items.append(items[0] * factor)".to_string()),
+            concurrency_mode: None,
+            yield_expectation: Some("void".to_string()),
+            action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+        };
+
+        let result = engine.lower_intent(&env, 0.05);
+        match result {
+            Ok(ir) => {
+                println!("Live Synthesized and Clang-Verified IR:\n{}", ir);
+                assert!(ir.contains("%items_ptr") || ir.contains("__omni_slice"));
+            }
+            Err(e) => {
+                panic!("Live synthesis failed: {:?}", e);
+            }
+        }
     }
 }

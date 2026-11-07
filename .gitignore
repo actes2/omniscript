@@ -9,3 +9,4 @@
 *_bin
 a.out
 result
+models/*.gguf

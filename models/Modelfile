@@ -1,0 +1,6 @@
+FROM /home/actes/projects/slop/omniscript/models/omni-model-q4_k_m.gguf
+PARAMETER temperature 0.05
+PARAMETER num_predict 64
+PARAMETER stop "</omni_ir_task>"
+PARAMETER stop "```"
+PARAMETER stop "\n\n"

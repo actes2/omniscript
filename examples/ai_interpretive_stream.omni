@@ -1,0 +1,8 @@
+def main():
+    print("=== Testing Live In-Process LLM IR Synthesis ===")
+    items = [21]
+    factor = 2
+    intent "items.append(items[0] * factor)"
+    print("Resulting transformed item:")
+    print(items[1])
+    return 0
