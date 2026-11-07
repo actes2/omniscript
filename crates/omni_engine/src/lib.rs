@@ -1,6 +1,13 @@
+use candle_core::quantized::gguf_file;
+use candle_core::quantized::tokenizer::TokenizerFromGguf;
+use candle_core::{Device, Tensor};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use thiserror::Error;
+use tokenizers::Tokenizer;
 
 pub mod dataset_generator;
 pub use dataset_generator::{DatasetRecord, SyntheticDatasetGenerator};
@@ -537,31 +544,184 @@ impl<P: InferenceEngine, F: InferenceEngine> InferenceEngine for FallbackEngine<
     }
 }
 
-/// Standby wrapper for local GGUF models (Meta LLM-Compiler / Qwen2.5-Coder)
-pub struct LlamaCppEngine {
+/// In-process Candle-based GGUF inference engine executing directly without background daemons.
+pub struct CandleGgufEngine {
+    model: Mutex<Qwen2Weights>,
+    tokenizer: Tokenizer,
+    device: Device,
     pub model_path: PathBuf,
+    pub system_prompt: String,
+    pub sample_len: usize,
+    pub eos_token_id: u32,
 }
 
-impl LlamaCppEngine {
+impl CandleGgufEngine {
     pub fn new(model_path: PathBuf) -> Result<Self, EngineError> {
         if !model_path.exists() {
             return Err(EngineError::ModelNotFound(model_path));
         }
-        Ok(Self { model_path })
+
+        let mut file = std::fs::File::open(&model_path)
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed to open model file: {}", e)))?;
+        let content = gguf_file::Content::read(&mut file)
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed reading GGUF content: {}", e)))?;
+
+        let tokenizer = Tokenizer::from_gguf(&content)
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed extracting tokenizer from GGUF: {}", e)))?;
+
+        let eos_token_id = content
+            .metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| match v {
+                gguf_file::Value::U32(id) => Some(*id),
+                gguf_file::Value::I32(id) => Some(*id as u32),
+                _ => None,
+            })
+            .unwrap_or(151645);
+
+        let device = Device::Cpu;
+        let model = Qwen2Weights::from_gguf(content, &mut file, &device)
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed initializing Qwen2 model from GGUF: {}", e)))?;
+
+        Ok(Self {
+            model: Mutex::new(model),
+            tokenizer,
+            device,
+            model_path,
+            system_prompt: "You are OmniCoder, an autonomous polyglot compiler lowering engine. You translate polyglot statements into valid, SSA-compliant LLVM IR basic blocks. Synthesize ONLY the LLVM IR instructions for the basic block body.".to_string(),
+            sample_len: 512,
+            eos_token_id,
+        })
+    }
+
+    /// Automatically discover standard model locations on the host system
+    pub fn discover_default() -> Option<Self> {
+        if let Ok(env_path) = std::env::var("OMNI_MODEL_PATH") {
+            let p = PathBuf::from(env_path);
+            if p.exists() {
+                if let Ok(engine) = Self::new(p) {
+                    return Some(engine);
+                }
+            }
+        }
+
+        let candidate_paths = [
+            PathBuf::from("/var/lib/ollama/.ollama/models/blobs/sha256-a621e8119dfe20fe4bfc788fff29de9f6d5f3ec1b2091735a14a6101e930f7a9"),
+            PathBuf::from("models/omni-coder.gguf"),
+            PathBuf::from("tests/models/omni-coder.gguf"),
+        ];
+
+        for path in &candidate_paths {
+            if path.exists() {
+                if let Ok(engine) = Self::new(path.clone()) {
+                    return Some(engine);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn with_sample_len(mut self, len: usize) -> Self {
+        self.sample_len = len;
+        self
     }
 }
 
-impl InferenceEngine for LlamaCppEngine {
+impl InferenceEngine for CandleGgufEngine {
     fn lower_intent(
         &self,
         envelope: &SsaContextEnvelope,
-        _temp: f32,
+        temp: f32,
     ) -> Result<String, EngineError> {
-        let _prompt = envelope.to_prompt_micro_tags();
-        Ok(format!(
-            "  ; [Standby GGUF synthesis for intent: {}]\n",
-            envelope.raw_intent.trim()
-        ))
+        let prompt_body = envelope.to_prompt_micro_tags();
+        let formatted_prompt = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            self.system_prompt, prompt_body
+        );
+
+        let encoding = self
+            .tokenizer
+            .encode(formatted_prompt, true)
+            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer encode error: {}", e)))?;
+        let tokens = encoding.get_ids();
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::InferenceFailed(format!("Mutex poison: {}", e)))?;
+
+        model.clear_kv_cache();
+
+        let sampling = if temp <= 0.05 {
+            Sampling::ArgMax
+        } else {
+            Sampling::All {
+                temperature: temp as f64,
+            }
+        };
+
+        let mut logits_processor = LogitsProcessor::from_sampling(299792458, sampling);
+
+        let input = Tensor::new(tokens, &self.device)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
+            .unsqueeze(0)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+        let logits = model
+            .forward(&input, 0)
+            .map_err(|e| EngineError::InferenceFailed(format!("Model forward prefill failed: {}", e)))?;
+        let logits = logits
+            .squeeze(0)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+        let mut next_token = logits_processor
+            .sample(&logits)
+            .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
+
+        let mut generated_tokens = Vec::new();
+
+        let is_stop_token = |t: u32| -> bool {
+            t == self.eos_token_id || t == 151645 || t == 151643
+        };
+
+        if !is_stop_token(next_token) {
+            generated_tokens.push(next_token);
+        }
+
+        for step in 0..self.sample_len {
+            if is_stop_token(next_token) {
+                break;
+            }
+
+            let input = Tensor::new(&[next_token], &self.device)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
+                .unsqueeze(0)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+            let logits = model
+                .forward(&input, tokens.len() + step)
+                .map_err(|e| EngineError::InferenceFailed(format!("Model forward step failed: {}", e)))?;
+            let logits = logits
+                .squeeze(0)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+            next_token = logits_processor
+                .sample(&logits)
+                .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
+
+            if is_stop_token(next_token) {
+                break;
+            }
+            generated_tokens.push(next_token);
+        }
+
+        let raw_output = self
+            .tokenizer
+            .decode(&generated_tokens, true)
+            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
+
+        Ok(sanitize_llvm_ir(&raw_output))
     }
 }
 
@@ -679,6 +839,43 @@ Let me know if you need any adjustments!
             }
             Err(e) => {
                 panic!("Live synthesis failed: {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_candle_gguf_engine_live() {
+        let Some(candle_engine) = CandleGgufEngine::discover_default() else {
+            eprintln!("Skipping test_candle_gguf_engine_live: no GGUF model discovered on host");
+            return;
+        };
+
+        let env = SsaContextEnvelope {
+            target_abi: "x86_64-pc-linux-gnu".to_string(),
+            enclosing_fn: "test_candle".to_string(),
+            return_type: "i32".to_string(),
+            next_ssa_idx: 1,
+            active_symbols: vec![],
+            struct_definitions: vec![],
+            raw_intent: "time.sleep(1)".to_string(),
+            idiom_hint: None,
+            anchor_id: Some(1),
+            physical_source: Some("time.sleep(1)".to_string()),
+            concurrency_mode: None,
+            yield_expectation: Some("void".to_string()),
+            action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+            ecosystem_context: Some("python (module: time)".to_string()),
+            import_chain: vec![],
+        };
+
+        let result = candle_engine.with_sample_len(16).lower_intent(&env, 0.0);
+        match result {
+            Ok(ir) => {
+                println!("Candle In-Process GGUF Synthesized IR:\n{}", ir);
+                assert!(!ir.trim().is_empty());
+            }
+            Err(e) => {
+                panic!("Candle inference failed: {:?}", e);
             }
         }
     }

@@ -1,6 +1,6 @@
 use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
-use omni_engine::{FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
+use omni_engine::{CandleGgufEngine, FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
 use omni_preamble::{DependencyDriller, ImportDirective, SymbolCarver};
 use omni_verify::LlvmVerifier;
@@ -120,6 +120,16 @@ fn synth_dataset(count: usize, output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct CompilationStats {
+    pub from_cache: bool,
+    pub parse_time: std::time::Duration,
+    pub drill_time: std::time::Duration,
+    pub codegen_time: std::time::Duration,
+    pub verify_time: std::time::Duration,
+    pub total_compile_time: std::time::Duration,
+}
+
 fn run_file(
     source_path: &Path,
     prog_args: &[String],
@@ -129,7 +139,12 @@ fn run_file(
     cache_dir: &Path,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    let (llvm_ir, foreign_c_files) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
+    let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
+    println!(
+        "[COMPILE] Ready in {:.2?} (Parse: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?})",
+        stats.total_compile_time, stats.parse_time, stats.codegen_time, cache_str, stats.verify_time
+    );
     let verifier = LlvmVerifier::new()?;
     let status = verifier.run_jit(&llvm_ir, opt_level, &foreign_c_files, prog_args)?;
     if !status.success() {
@@ -147,19 +162,29 @@ fn build_file(
     cache_dir: &Path,
     verbose: bool,
 ) -> anyhow::Result<()> {
+    let build_start = std::time::Instant::now();
     println!("==================================================");
     println!(" OmniScript Compiler (omnic v0.1.0)");
     println!(" Target Source: {}", source_path.display());
     println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {}", temp, opt_level, !no_cache);
     println!("==================================================");
 
-    let (llvm_ir, foreign_c_files) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose)?;
     let verifier = LlvmVerifier::new()?;
 
     println!("\n[5/5] Linking native ELF binary...");
+    let link_start = std::time::Instant::now();
     verifier.compile_ir_to_binary(&llvm_ir, output, opt_level, &foreign_c_files)?;
+    let link_time = link_start.elapsed();
+    let total_build_time = build_start.elapsed();
+
     println!("  -> Successfully compiled and linked native binary: {}", output.display());
-    println!("\n[BUILD COMPLETE] Run binary with: ./{}", output.display());
+    let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
+    println!(
+        "\n[BUILD COMPLETE] Total: {:.2?} (Parse: {:.2?} | Drill: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?} | Link: {:.2?})",
+        total_build_time, stats.parse_time, stats.drill_time, stats.codegen_time, cache_str, stats.verify_time, link_time
+    );
+    println!("Run binary with: ./{}", output.display());
     Ok(())
 }
 
@@ -170,7 +195,8 @@ fn compile_source(
     no_cache: bool,
     cache_dir: &Path,
     verbose: bool,
-) -> anyhow::Result<(String, Vec<PathBuf>)> {
+) -> anyhow::Result<(String, Vec<PathBuf>, CompilationStats)> {
+    let start_compile = std::time::Instant::now();
     if !source_path.exists() {
         eprintln!("[ERROR] Source file '{}' does not exist.", source_path.display());
         std::process::exit(1);
@@ -185,10 +211,13 @@ fn compile_source(
     let base_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
 
     // 1. Parse AST & Memory Instructions
+    let t_parse_start = std::time::Instant::now();
     let parser = OmniParser::new();
     let module = parser.parse_module(module_name, &source_content);
+    let parse_time = t_parse_start.elapsed();
 
     // 2. Preamble Assembly & Symbol Carving
+    let t_drill_start = std::time::Instant::now();
     let carver = SymbolCarver::new();
     let mut foreign_c_files = omni_runtime::runtime_c_sources();
 
@@ -269,6 +298,7 @@ fn compile_source(
             }
         }
     }
+    let drill_time = t_drill_start.elapsed();
 
     // 3. Memory & Lifetime Normalization Summary
     for f in &module.functions {
@@ -281,6 +311,7 @@ fn compile_source(
     }
 
     // 4. Code Generation & Intent Synthesis (with .omnicache check)
+    let t_codegen_start = std::time::Instant::now();
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_content.as_bytes());
     hasher.update(b"x86_64-pc-linux-gnu");
@@ -298,20 +329,36 @@ fn compile_source(
         (fs::read_to_string(&cache_file)?, true)
     } else {
         let verifier = LlvmVerifier::new()?;
-        let primary = OllamaInferenceEngine::new("omni-coder");
         let fallback = MockSynthesisEngine::new();
-        let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
-        let composite = FallbackEngine::new(primary_verified, fallback);
-        let codegen = CodeGenerator::new(&composite);
-        let generated = codegen.generate_module_ir(&module, temp)?;
+
+        let generated = if let Some(candle_engine) = CandleGgufEngine::discover_default() {
+            if verbose {
+                println!("  -> [Inference] Using in-process Candle GGUF engine ({})", candle_engine.model_path.display());
+            }
+            let primary_verified = VerifiedSynthesisEngine::new(&candle_engine, &verifier);
+            let composite = FallbackEngine::new(primary_verified, fallback);
+            let codegen = CodeGenerator::new(&composite);
+            codegen.generate_module_ir(&module, temp)?
+        } else {
+            if verbose {
+                println!("  -> [Inference] Fallback to Ollama service (omni-coder)");
+            }
+            let primary = OllamaInferenceEngine::new("omni-coder");
+            let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
+            let composite = FallbackEngine::new(primary_verified, fallback);
+            let codegen = CodeGenerator::new(&composite);
+            codegen.generate_module_ir(&module, temp)?
+        };
         (generated, false)
     };
+    let codegen_time = t_codegen_start.elapsed();
 
     if verbose {
         println!("\n--- LLVM IR ---\n{}\n----------------", llvm_ir);
     }
 
     // 5. Verification
+    let t_verify_start = std::time::Instant::now();
     let verifier = LlvmVerifier::new()?;
     if !from_cache {
         verifier.verify_ir(&llvm_ir)?;
@@ -321,8 +368,19 @@ fn compile_source(
             let _ = fs::rename(&tmp_cache, &cache_file);
         }
     }
+    let verify_time = t_verify_start.elapsed();
+    let total_compile_time = start_compile.elapsed();
 
-    Ok((llvm_ir, foreign_c_files))
+    let stats = CompilationStats {
+        from_cache,
+        parse_time,
+        drill_time,
+        codegen_time,
+        verify_time,
+        total_compile_time,
+    };
+
+    Ok((llvm_ir, foreign_c_files, stats))
 }
 
 fn run_repl() -> anyhow::Result<()> {

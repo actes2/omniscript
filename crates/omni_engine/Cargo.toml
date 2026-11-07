@@ -13,3 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 omni_verify = { path = "../omni_verify" }
 omni_runtime = { path = "../omni_runtime" }
+candle-core = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-count-unsafe" }
+candle-transformers = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-count-unsafe" }
+tokenizers = "0.23.2"
+memmap2 = "0.9.12"
