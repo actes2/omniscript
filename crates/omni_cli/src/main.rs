@@ -2,7 +2,7 @@ use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
 use omni_engine::{FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
-use omni_preamble::{ImportDirective, SymbolCarver};
+use omni_preamble::{DependencyDriller, ImportDirective, SymbolCarver};
 use omni_verify::LlvmVerifier;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -206,12 +206,31 @@ fn compile_source(
                 }
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "c" || ext == "cpp" {
-                    foreign_c_files.push(full_path.clone());
+                    let mut driller = DependencyDriller::new();
+                    let slice = driller.drill(&full_path);
+                    for src in slice.local_sources {
+                        if !foreign_c_files.contains(&src) {
+                            foreign_c_files.push(src);
+                        }
+                    }
+                    if verbose && !slice.external_frontier.is_empty() {
+                        println!("  -> External frontier dependencies detected: {:?}", slice.external_frontier);
+                    }
                 }
                 if verbose {
                     println!(
                         "  -> Bound foreign file '{}' as alias '{:?}'",
                         path.display(),
+                        alias.as_deref().unwrap_or("self")
+                    );
+                }
+            }
+            ImportDirective::Ecosystem { ecosystem, module, alias } => {
+                if verbose {
+                    println!(
+                        "  -> Ingested foreign ecosystem '{}' module '{}' as alias '{:?}'",
+                        ecosystem,
+                        module,
                         alias.as_deref().unwrap_or("self")
                     );
                 }

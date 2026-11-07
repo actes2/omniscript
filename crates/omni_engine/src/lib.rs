@@ -39,6 +39,8 @@ pub struct SsaContextEnvelope {
     pub concurrency_mode: Option<String>,
     pub yield_expectation: Option<String>,
     pub action_directive: Option<String>,
+    pub ecosystem_context: Option<String>,
+    pub import_chain: Vec<String>,
 }
 
 impl SsaContextEnvelope {
@@ -91,6 +93,19 @@ impl SsaContextEnvelope {
         if let Some(ref hint) = self.idiom_hint {
             out.push_str(&format!("  <idiom_hint>{}</idiom_hint>\n", hint));
         }
+        if let Some(ref eco) = self.ecosystem_context {
+            out.push_str(&format!("  <ecosystem_context>{}</ecosystem_context>\n", eco));
+        }
+        if !self.import_chain.is_empty() {
+            out.push_str("  <import_chain>\n");
+            for imp in &self.import_chain {
+                out.push_str(&format!("    <import>{}</import>\n", imp));
+            }
+            out.push_str("  </import_chain>\n");
+        }
+        out.push_str("  <platform_abi>\n");
+        out.push_str("    Full LLVM IR instruction set is active. You may emit standard 'declare' prototypes for external platform C ABI calls if not present in runtime declarations.\n");
+        out.push_str("  </platform_abi>\n");
         out.push_str(&format!("  <intent>{}</intent>\n", self.raw_intent.trim()));
         out.push_str(&format!("  <next_reg>%t_{}</next_reg>\n", self.next_ssa_idx));
 
@@ -176,6 +191,17 @@ impl InferenceEngine for MockSynthesisEngine {
             }
         }
 
+        // 4. Standard sleep/delay invocation (POSIX fallback)
+        if lower.contains("sleep") {
+            let num = envelope.raw_intent
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<i32>()
+                .unwrap_or(1);
+            return Ok(format!("  call i32 @sleep(i32 {})\n", num));
+        }
+
         // Default generic no-op / return
         Ok(format!(
             "  ; [Synthesized generic intent block: {}]\n",
@@ -194,6 +220,7 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
         "add ", "sub ", "mul ", "udiv ", "sdiv ", "urem ", "srem ",
         "and ", "or ", "xor ", "shl ", "lshr ", "ashr ",
         "getelementptr ", "sext ", "trunc ", "zext ", "bitcast ", "select ", "phi ",
+        "declare ",
     ];
 
     for line in raw.lines() {
@@ -230,6 +257,43 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
     } else {
         out
     }
+}
+
+/// Separates top-level `declare ...` statements from inner basic block instructions,
+/// deduplicating against internal runtime declarations.
+pub fn extract_declarations_and_body(raw_ir: &str) -> (Vec<String>, String) {
+    let mut declarations = Vec::new();
+    let mut body_lines = Vec::new();
+    let runtime_decls = omni_runtime::runtime_llvm_declarations();
+
+    for line in raw_ir.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("declare ") {
+            // Deduplicate against internal omni_runtime declarations
+            let fn_name = if let Some(open) = trimmed.find('@') {
+                if let Some(paren) = trimmed[open..].find('(') {
+                    &trimmed[open..open + paren]
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            };
+
+            if !fn_name.is_empty() && runtime_decls.contains(fn_name) {
+                // Already provided by omni_runtime, skip
+                continue;
+            }
+
+            if !declarations.iter().any(|d: &String| d.trim() == trimmed) {
+                declarations.push(trimmed.to_string());
+            }
+        } else {
+            body_lines.push(line);
+        }
+    }
+
+    (declarations, body_lines.join("\n"))
 }
 
 /// Live HTTP inference engine connecting directly to a local Ollama server
@@ -410,15 +474,21 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
 
             let raw_ir = self.backend.lower_intent(&trial_env, temp)?;
             let sanitized = sanitize_llvm_ir(&raw_ir);
+            let (dyn_decls, body) = extract_declarations_and_body(&sanitized);
 
-            // Construct verification harness module
+            // Construct verification harness module with dynamic declares at module scope!
             let mut harness = String::new();
             harness.push_str("target triple = \"x86_64-pc-linux-gnu\"\n\n");
             harness.push_str(omni_runtime::runtime_llvm_declarations());
             harness.push_str("\n");
+            for decl in &dyn_decls {
+                harness.push_str(decl);
+                harness.push('\n');
+            }
+            harness.push_str("\n");
             harness.push_str(&header);
             harness.push_str(&preamble);
-            harness.push_str(&sanitized);
+            harness.push_str(&body);
             harness.push_str("\n  ret i32 0\n}\n");
 
             // Verify with Clang
@@ -553,6 +623,8 @@ Let me know if you need any adjustments!
             concurrency_mode: None,
             yield_expectation: Some("void".to_string()),
             action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+            ecosystem_context: None,
+            import_chain: vec![],
         };
 
         let result = engine.lower_intent(&env, 0.0).expect("Verified synthesis failed");
@@ -595,6 +667,8 @@ Let me know if you need any adjustments!
             concurrency_mode: None,
             yield_expectation: Some("void".to_string()),
             action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+            ecosystem_context: None,
+            import_chain: vec![],
         };
 
         let result = engine.lower_intent(&env, 0.05);

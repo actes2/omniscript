@@ -44,6 +44,12 @@ pub enum ImportDirective {
         dir_path: PathBuf,
         symbols: Vec<String>,
     },
+    /// Ecosystem dialect import: `import 'python' time as pytime`, `import 'c' "sys/socket"`
+    Ecosystem {
+        ecosystem: String,
+        module: String,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +119,22 @@ impl SymbolCarver {
     pub fn parse_directive(line: &str) -> Option<ImportDirective> {
         let trimmed = line.trim();
 
-        // `from "stuff" import Symbol1, Symbol2`
+        // 1. Ecosystem dialect import: `import 'python' time [as alias]`, `import 'c' "sys/socket"`, `import 'python'time`
+        let eco_re = Regex::new(
+            r#"^import\s+['"]([a-zA-Z0-9_\-]+)['"]\s*["']?([a-zA-Z0-9_\-./:]+)["']?(?:\s+as\s+([a-zA-Z_0-9]+))?$"#,
+        ).unwrap();
+        if let Some(caps) = eco_re.captures(trimmed) {
+            let ecosystem = caps[1].to_string();
+            let module = caps[2].to_string();
+            let alias = caps.get(3).map(|m| m.as_str().to_string());
+            return Some(ImportDirective::Ecosystem {
+                ecosystem,
+                module,
+                alias,
+            });
+        }
+
+        // 2. `from "stuff" import Symbol1, Symbol2`
         let from_re = Regex::new(r#"^from\s+"([^"]+)"\s+import\s+(.+)$"#).unwrap();
         if let Some(caps) = from_re.captures(trimmed) {
             let dir_path = PathBuf::from(&caps[1]);
@@ -125,7 +146,7 @@ impl SymbolCarver {
             return Some(ImportDirective::FromDirectory { dir_path, symbols });
         }
 
-        // `import "path" (as Alias)?`
+        // 3. `import "path" (as Alias)?`
         let import_re = Regex::new(r#"^import\s+"([^"]+)"(?:\s+as\s+([a-zA-Z_0-9]+))?$"#).unwrap();
         if let Some(caps) = import_re.captures(trimmed) {
             let path = PathBuf::from(&caps[1]);
@@ -372,6 +393,85 @@ impl SymbolCarver {
     }
 }
 
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Default)]
+pub struct DependencySlice {
+    pub local_sources: Vec<PathBuf>,
+    pub include_dirs: Vec<PathBuf>,
+    pub external_frontier: Vec<String>,
+}
+
+pub struct DependencyDriller {
+    visited: HashSet<PathBuf>,
+    include_c_re: Regex,
+}
+
+impl Default for DependencyDriller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DependencyDriller {
+    pub fn new() -> Self {
+        Self {
+            visited: HashSet::new(),
+            include_c_re: Regex::new(r#"^\s*#include\s*[<"]([^>"]+)[>"]"#).unwrap(),
+        }
+    }
+
+    /// Recursively drill down imported files, extracting concrete source dependencies,
+    /// include paths, and isolating the terminal external frontier (missing/system headers).
+    pub fn drill(&mut self, start_path: &Path) -> DependencySlice {
+        let mut slice = DependencySlice::default();
+        self.walk_recursive(start_path, &mut slice);
+        slice.local_sources.sort();
+        slice.local_sources.dedup();
+        slice.include_dirs.sort();
+        slice.include_dirs.dedup();
+        slice.external_frontier.sort();
+        slice.external_frontier.dedup();
+        slice
+    }
+
+    fn walk_recursive(&mut self, path: &Path, slice: &mut DependencySlice) {
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        };
+
+        if self.visited.contains(&abs_path) || !abs_path.exists() {
+            return;
+        }
+
+        self.visited.insert(abs_path.clone());
+        if abs_path.is_file() {
+            slice.local_sources.push(abs_path.clone());
+            if let Some(parent) = abs_path.parent() {
+                slice.include_dirs.push(parent.to_path_buf());
+            }
+
+            if let Ok(content) = fs::read_to_string(&abs_path) {
+                let parent = abs_path.parent().unwrap_or_else(|| Path::new("."));
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if let Some(caps) = self.include_c_re.captures(trimmed) {
+                        let target = &caps[1];
+                        let candidate = parent.join(target);
+                        if candidate.exists() {
+                            self.walk_recursive(&candidate, slice);
+                        } else {
+                            slice.external_frontier.push(target.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +480,36 @@ mod tests {
 
     #[test]
     fn test_parse_import_directives() {
+        let d0 = SymbolCarver::parse_directive("import 'python' time").unwrap();
+        assert_eq!(
+            d0,
+            ImportDirective::Ecosystem {
+                ecosystem: "python".to_string(),
+                module: "time".to_string(),
+                alias: None,
+            }
+        );
+
+        let d0_bare = SymbolCarver::parse_directive("import 'python'time").unwrap();
+        assert_eq!(
+            d0_bare,
+            ImportDirective::Ecosystem {
+                ecosystem: "python".to_string(),
+                module: "time".to_string(),
+                alias: None,
+            }
+        );
+
+        let d0_alias = SymbolCarver::parse_directive("import 'rust' std::time as rtime").unwrap();
+        assert_eq!(
+            d0_alias,
+            ImportDirective::Ecosystem {
+                ecosystem: "rust".to_string(),
+                module: "std::time".to_string(),
+                alias: Some("rtime".to_string()),
+            }
+        );
+
         let d1 = SymbolCarver::parse_directive(r#"import "foo.js" as Foo"#).unwrap();
         assert_eq!(
             d1,
@@ -429,6 +559,29 @@ func (r *RateLimiter) allow() bool {{
         assert_eq!(sym.name, "allow");
         assert_eq!(sym.language, "go");
         assert!(sym.is_uncaged); // verifies unexported lowercase Go func is successfully un-caged!
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_dependency_driller_recursive() {
+        let temp_dir = std::env::temp_dir().join("omni_test_driller");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let header_file = temp_dir.join("local_types.h");
+        fs::write(&header_file, "#include <time.h>\ntypedef int my_int;\n").unwrap();
+
+        let source_file = temp_dir.join("worker.c");
+        fs::write(&source_file, "#include \"local_types.h\"\n#include <unistd.h>\n").unwrap();
+
+        let mut driller = DependencyDriller::new();
+        let slice = driller.drill(&source_file);
+
+        assert!(slice.local_sources.contains(&source_file));
+        assert!(slice.local_sources.contains(&header_file));
+        assert!(slice.external_frontier.contains(&"time.h".to_string()));
+        assert!(slice.external_frontier.contains(&"unistd.h".to_string()));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

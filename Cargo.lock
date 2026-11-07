@@ -246,6 +246,7 @@ dependencies = [
  "omni_engine",
  "omni_mem",
  "omni_parser",
+ "omni_preamble",
  "omni_runtime",
  "omni_verify",
  "regex",

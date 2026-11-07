@@ -11,6 +11,7 @@ thiserror.workspace = true
 regex.workspace = true
 serde.workspace = true
 omni_mem = { path = "../omni_mem" }
+omni_preamble = { path = "../omni_preamble" }
 omni_parser = { path = "../omni_parser" }
 omni_runtime = { path = "../omni_runtime" }
 omni_engine = { path = "../omni_engine" }

@@ -1,4 +1,16 @@
+import 'python'time
+
+func Foo() { 
+    print("hi mom")    
+    time.sleep(5)
+    print("job done")
+}
+
 def main():
    for i in 10:
-    print("Hello world!")
+       print("Hello world!")
+   
+   go Foo()
+   time.sleep(10)
+   print("All jobs finished closing the application")
    return 0

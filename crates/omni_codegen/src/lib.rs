@@ -1,8 +1,8 @@
-use omni_engine::{InferenceEngine, SsaContextEnvelope, SsaVariable};
+use omni_engine::{extract_declarations_and_body, InferenceEngine, SsaContextEnvelope, SsaVariable};
 use omni_mem::UnifiedMemOp;
 use omni_parser::{OmniModule, Statement};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub enum CleanupOp {
@@ -444,6 +444,9 @@ impl<'a> CodeGenerator<'a> {
         fn_name: &str,
         struct_defs: &[String],
         temp: f32,
+        ecosystem_context: Option<&str>,
+        import_chain: &[String],
+        dynamic_declarations: &mut HashSet<String>,
     ) -> anyhow::Result<bool> {
         let mut custom_return = false;
 
@@ -550,6 +553,9 @@ impl<'a> CodeGenerator<'a> {
                         fn_name,
                         struct_defs,
                         temp,
+                        ecosystem_context,
+                        import_chain,
+                        dynamic_declarations,
                     )?;
                     if !then_ret {
                         Self::emit_cleanups(ir, &deferred_frees[then_snapshot..], temp_counter, "Then Branch Exit");
@@ -577,6 +583,9 @@ impl<'a> CodeGenerator<'a> {
                             fn_name,
                             struct_defs,
                             temp,
+                            ecosystem_context,
+                            import_chain,
+                            dynamic_declarations,
                         )?;
                         if !else_ret {
                             Self::emit_cleanups(ir, &deferred_frees[else_snapshot..], temp_counter, "Else Branch Exit");
@@ -624,6 +633,9 @@ impl<'a> CodeGenerator<'a> {
                         fn_name,
                         struct_defs,
                         temp,
+                        ecosystem_context,
+                        import_chain,
+                        dynamic_declarations,
                     )?;
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[while_snapshot..], temp_counter, "While Iteration Exit");
@@ -693,6 +705,9 @@ impl<'a> CodeGenerator<'a> {
                         fn_name,
                         struct_defs,
                         temp,
+                        ecosystem_context,
+                        import_chain,
+                        dynamic_declarations,
                     )?;
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[for_snapshot..], temp_counter, "For Iteration Exit");
@@ -1139,6 +1154,8 @@ impl<'a> CodeGenerator<'a> {
                         concurrency_mode: None,
                         yield_expectation: Some("i32".to_string()),
                         action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
+                        ecosystem_context: ecosystem_context.map(|s| s.to_string()),
+                        import_chain: import_chain.to_vec(),
                     };
 
                     ir.push_str(&format!(
@@ -1146,7 +1163,14 @@ impl<'a> CodeGenerator<'a> {
                         anchor_id, file, line_start, line_end
                     ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
-                    ir.push_str(&synthesized);
+                    let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    for d in dyn_decls {
+                        dynamic_declarations.insert(d);
+                    }
+                    ir.push_str(&body);
+                    if !body.ends_with('\n') {
+                        ir.push('\n');
+                    }
                     ir.push_str(&format!("  ; <<< [END ANCHOR #{}]\n", anchor_id));
                 }
 
@@ -1190,6 +1214,8 @@ impl<'a> CodeGenerator<'a> {
                         concurrency_mode: None,
                         yield_expectation: Some("void".to_string()),
                         action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                        ecosystem_context: ecosystem_context.map(|s| s.to_string()),
+                        import_chain: import_chain.to_vec(),
                     };
 
                     ir.push_str(&format!(
@@ -1197,7 +1223,14 @@ impl<'a> CodeGenerator<'a> {
                         *lbl_counter, fn_name, *lbl_counter, instruction.trim()
                     ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
-                    ir.push_str(&synthesized);
+                    let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    for d in dyn_decls {
+                        dynamic_declarations.insert(d);
+                    }
+                    ir.push_str(&body);
+                    if !body.ends_with('\n') {
+                        ir.push('\n');
+                    }
                     ir.push_str(&format!("  ; <<< [END ANCHOR: ANCHOR_{}]\n", *lbl_counter));
                 }
 
@@ -1227,10 +1260,19 @@ impl<'a> CodeGenerator<'a> {
                         concurrency_mode: None,
                         yield_expectation: Some("i32".to_string()),
                         action_directive: Some("LOWER_POLYGLOT_SYNTAX".to_string()),
+                        ecosystem_context: ecosystem_context.map(|s| s.to_string()),
+                        import_chain: import_chain.to_vec(),
                     };
 
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
-                    ir.push_str(&synthesized);
+                    let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    for d in dyn_decls {
+                        dynamic_declarations.insert(d);
+                    }
+                    ir.push_str(&body);
+                    if !body.ends_with('\n') {
+                        ir.push('\n');
+                    }
                 }
             }
         }
@@ -1240,7 +1282,6 @@ impl<'a> CodeGenerator<'a> {
 
     /// Generate unified LLVM IR text from OmniModule
     pub fn generate_module_ir(&self, module: &OmniModule, temp: f32) -> anyhow::Result<String> {
-        let mut ir = String::new();
         let mut string_constants: Vec<(String, String, usize)> = Vec::new();
         let mut str_counter = 0;
 
@@ -1249,39 +1290,59 @@ impl<'a> CodeGenerator<'a> {
             self.scan_strings_recursive(&func.body, &mut string_constants, &mut str_counter);
         }
 
-        ir.push_str("; ModuleID = '");
-        ir.push_str(&module.name);
-        ir.push_str("'\nsource_filename = \"");
-        ir.push_str(&module.name);
-        ir.push_str(".omni\"\ntarget triple = \"x86_64-pc-linux-gnu\"\n\n");
+        // Extract ecosystem and import context
+        let mut ecosystem_hints = Vec::new();
+        let mut import_chain = Vec::new();
 
-        // Runtime headers & extern declarations
-        ir.push_str("; Standard Runtime & libc Declarations\n");
-        ir.push_str("declare i8* @malloc(i64)\n");
-        ir.push_str("declare void @free(i8*)\n");
-        ir.push_str("declare i32 @printf(i8*, ...)\n");
-        ir.push_str(omni_runtime::runtime_llvm_declarations());
-        ir.push_str("\n");
-
-        // Global string constants
-        for (const_name, text, len) in &string_constants {
-            ir.push_str(&format!(
-                "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1\n",
-                const_name, len, text
-            ));
+        for imp in &module.imports {
+            match imp {
+                omni_preamble::ImportDirective::Ecosystem { ecosystem, module, alias } => {
+                    let desc = match alias {
+                        Some(a) => format!("{} (module: {}, alias: {})", ecosystem, module, a),
+                        None => format!("{} (module: {})", ecosystem, module),
+                    };
+                    ecosystem_hints.push(desc.clone());
+                    import_chain.push(desc);
+                }
+                omni_preamble::ImportDirective::FileAlias { path, alias } => {
+                    let desc = match alias {
+                        Some(a) => format!("file: {} as {}", path.display(), a),
+                        None => format!("file: {}", path.display()),
+                    };
+                    import_chain.push(desc);
+                }
+                omni_preamble::ImportDirective::DirectoryAlias { path, alias } => {
+                    let desc = match alias {
+                        Some(a) => format!("dir: {} as {}", path.display(), a),
+                        None => format!("dir: {}", path.display()),
+                    };
+                    import_chain.push(desc);
+                }
+                omni_preamble::ImportDirective::FromDirectory { dir_path, symbols } => {
+                    import_chain.push(format!("from {}: {:?}", dir_path.display(), symbols));
+                }
+            }
         }
-        ir.push_str("\n");
+
+        let ecosystem_context = if ecosystem_hints.is_empty() {
+            None
+        } else {
+            Some(ecosystem_hints.join(", "))
+        };
 
         // 1. Classes -> Struct Types
         let mut struct_defs = Vec::new();
+        let mut struct_defs_ir = String::new();
         for cls in &module.structs_and_classes {
-            ir.push_str(&format!("; Class: {}\n", cls.name));
+            struct_defs_ir.push_str(&format!("; Class: {}\n", cls.name));
             let s_def = format!("%struct.{} = type {{ i8* }}", cls.name);
-            ir.push_str(&format!("{}\n\n", s_def));
+            struct_defs_ir.push_str(&format!("{}\n\n", s_def));
             struct_defs.push(s_def);
         }
 
         // 2. Functions (namespaced as @__omni_fn_<name>)
+        let mut functions_ir = String::new();
+        let mut dynamic_declarations = HashSet::new();
         let mut has_user_main = false;
         let mut cur_str_idx = 0;
         let mut lbl_counter = 0;
@@ -1292,7 +1353,7 @@ impl<'a> CodeGenerator<'a> {
                 has_user_main = true;
             }
 
-            ir.push_str(&format!(
+            functions_ir.push_str(&format!(
                 "define i32 @__omni_fn_{}(i8* %data, i64 %len) {{\nentry:\n",
                 func.name
             ));
@@ -1316,14 +1377,14 @@ impl<'a> CodeGenerator<'a> {
                     if is_int {
                         let cast_i64 = format!("%param_int64_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        ir.push_str(&format!("  {} = ptrtoint i8* %data to i64\n", cast_i64));
+                        functions_ir.push_str(&format!("  {} = ptrtoint i8* %data to i64\n", cast_i64));
                         let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, cast_i64));
+                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, cast_i64));
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                        functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                        functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
                         scope_tree.insert(
                             param.name.clone(),
                             SymbolBinding {
@@ -1343,8 +1404,8 @@ impl<'a> CodeGenerator<'a> {
                         };
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca i8*\n", ptr));
-                        ir.push_str(&format!("  store i8* %data, i8** {}\n", ptr));
+                        functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                        functions_ir.push_str(&format!("  store i8* %data, i8** {}\n", ptr));
                         scope_tree.insert(
                             param.name.clone(),
                             SymbolBinding {
@@ -1359,11 +1420,11 @@ impl<'a> CodeGenerator<'a> {
                     // Second parameter maps to %len (i64)
                     let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
                     temp_counter += 1;
-                    ir.push_str(&format!("  {} = trunc i64 %len to i32\n", cast_i32));
+                    functions_ir.push_str(&format!("  {} = trunc i64 %len to i32\n", cast_i32));
                     let ptr = format!("%param_{}_{}", param.name, temp_counter);
                     temp_counter += 1;
-                    ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                    ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                    functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                    functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
                     scope_tree.insert(
                         param.name.clone(),
                         SymbolBinding {
@@ -1378,7 +1439,7 @@ impl<'a> CodeGenerator<'a> {
 
             let custom_ret = self.lower_statements(
                 &func.body,
-                &mut ir,
+                &mut functions_ir,
                 &mut scope_tree,
                 &mut deferred_frees,
                 &string_constants,
@@ -1388,20 +1449,65 @@ impl<'a> CodeGenerator<'a> {
                 &func.name,
                 &struct_defs,
                 temp,
+                ecosystem_context.as_deref(),
+                &import_chain,
+                &mut dynamic_declarations,
             )?;
 
             if !custom_ret {
-                Self::emit_cleanups(&mut ir, &deferred_frees, &mut temp_counter, "Function Exit");
-                ir.push_str("  ret i32 0\n");
+                Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Function Exit");
+                functions_ir.push_str("  ret i32 0\n");
             }
-            ir.push_str("}\n\n");
+            functions_ir.push_str("}\n\n");
 
             // Static Trampoline for Fiber Concurrency (100% C-ABI compliant void (*)(void*))
-            ir.push_str(&format!(
+            functions_ir.push_str(&format!(
                 "define void @__omni_trampoline_{}(i8* %raw_arg) {{\nentry:\n  %res = call i32 @__omni_fn_{}(i8* %raw_arg, i64 0)\n  ret void\n}}\n\n",
                 func.name, func.name
             ));
         }
+
+        // Assemble full Module IR
+        let mut ir = String::new();
+        ir.push_str("; ModuleID = '");
+        ir.push_str(&module.name);
+        ir.push_str("'\nsource_filename = \"");
+        ir.push_str(&module.name);
+        ir.push_str(".omni\"\ntarget triple = \"x86_64-pc-linux-gnu\"\n\n");
+
+        // Runtime headers & extern declarations
+        ir.push_str("; Standard Runtime & libc Declarations\n");
+        ir.push_str("declare i8* @malloc(i64)\n");
+        ir.push_str("declare void @free(i8*)\n");
+        ir.push_str("declare i32 @printf(i8*, ...)\n");
+        ir.push_str(omni_runtime::runtime_llvm_declarations());
+        ir.push_str("\n");
+
+        if !dynamic_declarations.is_empty() {
+            ir.push_str("; Dynamically Harvested External Declarations\n");
+            let mut sorted_decls: Vec<_> = dynamic_declarations.into_iter().collect();
+            sorted_decls.sort();
+            for decl in sorted_decls {
+                ir.push_str(&decl);
+                ir.push('\n');
+            }
+            ir.push('\n');
+        }
+
+        // Global string constants
+        for (const_name, text, len) in &string_constants {
+            ir.push_str(&format!(
+                "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1\n",
+                const_name, len, text
+            ));
+        }
+        ir.push_str("\n");
+
+        // Struct definitions
+        ir.push_str(&struct_defs_ir);
+
+        // Function definitions
+        ir.push_str(&functions_ir);
 
         // 3. Entrypoint @main
         ir.push_str("define i32 @main(i32 %argc, i8** %argv) {\nentry:\n");

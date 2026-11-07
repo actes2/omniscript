@@ -18,6 +18,10 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
 pub fn runtime_llvm_declarations() -> &'static str {
     r#"
 ; --- OmniScript Framework Runtime Declarations ---
+; Standard POSIX libc & System Declarations
+declare i32 @sleep(i32)
+declare i32 @usleep(i32)
+
 ; Printing & Hashing helpers
 declare void @__omni_print_str(i8*)
 declare void @__omni_print_int(i64)

@@ -131,6 +131,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*
   %init_s = call i8* @__omni_slice_create(i64 4)
@@ -179,6 +181,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: Some("M:N Fiber".to_string()),
                     yield_expectation: Some("i1".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %ch_ptr = alloca i8*
   %init_c = call i8* @__omni_chan_make(i64 8, i64 8)
@@ -217,6 +221,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %mask_val = alloca i32
   store i32 255, i32* %mask_val
@@ -251,6 +257,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("i8*".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %arena_ptr = alloca i8*
   %init_a = call i8* @__omni_arena_create(i64 65536)
@@ -291,6 +299,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("i64".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %map_ptr = alloca i8*
   %init_m = call i8* @__omni_map_create(i64 16)
@@ -323,6 +333,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: Some("M:N Fiber".to_string()),
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: String::new(),
                 completion: r#"  ; >>> [Synthesized: yield()]
@@ -358,6 +370,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*
   %init_s = call i8* @__omni_slice_create(i64 8)
@@ -405,6 +419,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: Some("M:N Fiber".to_string()),
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %ch_ptr = alloca i8*
   %init_c = call i8* @__omni_chan_make(i64 4, i64 8)
@@ -455,6 +471,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %map_ptr = alloca i8*
   %init_m = call i8* @__omni_map_create(i64 16)
@@ -501,6 +519,8 @@ impl SyntheticDatasetGenerator {
                     concurrency_mode: None,
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                    ecosystem_context: None,
+                    import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*
   %init_s = call i8* @__omni_slice_create(i64 8)

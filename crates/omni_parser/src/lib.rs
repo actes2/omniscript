@@ -1,5 +1,5 @@
 use omni_mem::{MemoryNormalizer, UnifiedMemOp};
-use omni_preamble::ImportDirective;
+pub use omni_preamble::ImportDirective;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
