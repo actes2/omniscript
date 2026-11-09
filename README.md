@@ -2,34 +2,41 @@
 
 > **Autonomous Polyglot Systems Compiler & Zero-GC Runtime with In-Process AI Lowering**
 
-OmniScript (`omnic`) is an experimental systems programming compiler and runtime written in Rust and low-level C. It unifies syntax and idioms from **Python**, **Go**, **C/C++**, and **Rust** within single translation units, lowering directly to verified **LLVM IR**, native ELF binaries, and in-memory JIT execution without a tracing garbage collector.
+OmniScript (`omnic`) is a high-performance polyglot systems programming compiler and runtime written in Rust and low-level C. It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **Go**, **JavaScript**, **C/C++**, **Java**, **C#**, and **Lua** within single translation units. OmniScript lowers directly to verified **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution—**completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
 
 ---
 
-## Architectural Philosophy
+## Key Capabilities
 
-1. **Unrestricted Polyglot Ingestion**: Codebases shouldn't force artificial semantic trade-offs. Python indentation, C/Rust bracket blocks, Go-style concurrency channels, and walrus declarations (`:=`) coexist seamlessly.
-2. **Deterministic Zero-GC Systems Lifecycle**: Tracing garbage collection is eliminated. Memory management uses **Unified Memory Operations (UMO)**, Zig-style **Scope Arenas**, and deterministic **RAII scope destruction** for slices, maps, and channels.
-3. **Physical Source Interpretive Anchoring**: Syntactic structures with ambiguous semantic intent are not destructively mangled. Instead, they are tagged with immutable source anchors and packed into **SSA Context Envelopes** (`<omni_ir_task>`) for local small-model (~1.5B) LLVM IR lowering with bounded Clang verification loops.
-4. **Offline Airgapped Reproducibility**: Zero external model weight downloads; deterministic BLAKE3 bitcode caching (`.omnicache`); test fodder isolation under `tests/outputs/`.
+1. **Pure-Rust 1-to-1 Language Parity**: Full native instruction comprehension for Rust structs, inherent `impl` blocks, constructor literals, tagged enums (`type { i32, [N x i8] }`), pattern matching (`switch i32 %tag` jump tables), and fat-pointer slices without invoking `rustc`.
+2. **Universal Polyglot Package Shimmer (`omnic install`)**: A unified multi-registry package resolution engine driven by `omni-requirements.txt`. Autonomously resolves, downloads, and unpacks packages from **crates.io** (Rust), **PyPI** (Python), **npm** (Node.js), **Maven Central** (Java `.class` bytecode), **NuGet** (C# `.dll` assemblies), and **Direct Git Repositories** (`[git]'<lang>' <url>`) into a Go-mod style cache hierarchy under `~/.omnicache/`.
+3. **Pure-Rust In-Process Archive Engine**: All tarball (`.crate`, `.tar.gz`, `.tgz`) and ZIP (`.whl`, `.jar`, `.nupkg`) extraction is executed directly in compiler memory via `flate2`, `tar`, and `zip`. Zero reliance on host CLI utilities (`tar`, `unzip`, `curl`, `powershell`).
+4. **Deterministic Zero-GC Systems Runtime**: Zero tracing garbage collection overhead. Memory is managed via **Unified Memory Operations (UMO)**, per-request monotonic **Scope Arenas** (`omni_arena.c`) with $O(1)$ bulk resets, and deterministic **RAII scope destruction** for slices, Robin Hood hash maps, and channels.
+5. **Cross-Platform Systems Portability**: Native execution across **Linux** (`x86_64`, `aarch64`), **macOS** (Apple Silicon `arm64-apple-darwin` and Intel `x86_64-apple-darwin`), and **Windows** (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`). Hand-rolled naked assembly context switches for System V (x86_64) and AAPCS64 (ARM64), dual-path POSIX/Windows virtual memory guard pages (`mprotect` / `VirtualProtect`), and Winsock2 socket boundaries.
+6. **Physical Source Interpretive Anchoring & Local AI Lowering**: Ambiguous polyglot idioms (`:=`, `=>`, dynamic duck-typing) are preserved in non-destructive Dual-Representation AST nodes, packed into **SSA Context Envelopes** (`<omni_ir_task>`), and lowered via an in-process 1.5B Candle GGUF model backed by an in-memory Clang self-repair loop.
 
 ---
 
-## Compiler Pipeline
+## Architectural Pipeline
 
 ```mermaid
 flowchart TD
-    SRC["Source File (.omni)"] --> PRE["omni_preamble<br/>(Import Directives & Symbol Uncaging)"]
-    PRE --> PARSER["omni_parser<br/>(Dynamic Bracket/Indent Canonicalizer & Anchoring)"]
-    PARSER --> MEM["omni_mem<br/>(UMO Normalization & Autonomous Borrow Audit)"]
-    MEM --> CODEGEN["omni_codegen<br/>(Lexical ScopeTree & RAII Cleanup Emission)"]
+    MANIFEST["omni-requirements.txt"] --> SHIMMER["omni_preamble::shimmer<br/>(crates.io, PyPI, npm, Maven, NuGet, Git)"]
+    SHIMMER --> CACHE[("Hermetic Cache<br/>~/.omnicache/")]
     
-    PARSER -. "Ambiguous Idioms / Anchors" .-> ENG["omni_engine<br/>(SSA Context Envelopes & Micro-Tags)"]
+    SRC["Source File (.omni, .rs, .py, .go, .js)"] --> PRE["omni_preamble<br/>(Dependency Driller & Symbol Carver)"]
+    CACHE --> PRE
+    
+    PRE --> PARSER["omni_parser<br/>(Polyglot AST: Rust Structs/Enums, Go Walrus, Python Indent)"]
+    PARSER --> MEM["omni_mem<br/>(UMO Normalization & Autonomous Borrow Audit)"]
+    MEM --> CODEGEN["omni_codegen<br/>(Monomorphized Structs, Jump Tables, ScopeTree RAII)"]
+    
+    PARSER -. "Ambiguous Idioms / Anchors" .-> ENG["omni_engine<br/>(SSA Context Envelopes & Candle GGUF Lowering)"]
     ENG -. "Synthesized LLVM IR Blocks" .-> CODEGEN
     
     CODEGEN --> VERIFY["omni_verify<br/>(Clang Diagnostic & LLVM Type Verifier)"]
     VERIFY --> JIT["In-Memory JIT Execution<br/>(omnic run / omnic repl)"]
-    VERIFY --> AOT["Native ELF Linked Binary<br/>(omnic build)"]
+    VERIFY --> AOT["Native ELF / Mach-O / PE Binary<br/>(omnic build)"]
     
     RUNTIME[("omni_runtime<br/>(Fibers, MPMC Channels, Slices, Maps, Arenas)")] --> VERIFY
 ```
@@ -38,49 +45,58 @@ flowchart TD
 
 ## Workspace Architecture (`crates/`)
 
-The workspace is organized into modular Rust crates and an embedded native C runtime:
+The OmniScript compiler workspace is structured into modular Rust crates and an embedded native C systems runtime:
 
 | Crate | Path | Responsibility |
 |---|---|---|
-| **`omni_preamble`** | [`crates/omni_preamble`](file:///home/actes/projects/slop/omniscript/crates/omni_preamble) | Parses polyglot import directives (`import`, `from ... import`, `#include`, `package`), uncaging symbols into the global namespace. |
-| **`omni_mem`** | [`crates/omni_mem`](file:///home/actes/projects/slop/omniscript/crates/omni_mem) | Autonomous lifetime auditor and memory normalizer. Enforces static borrow rules and detects double-free or escape violations via `UnifiedMemOp`. |
-| **`omni_parser`** | [`crates/omni_parser`](file:///home/actes/projects/slop/omniscript/crates/omni_parser) | Polyglot parser with dynamic block canonicalization (rewrites `{}` only when `brace_depth > 0`, preserving Python indentation), quote-aware token splitting, Go walrus (`:=`), and channel operators (`<-`). |
-| **`omni_runtime`** | [`crates/omni_runtime`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime) | Statically-linked C systems runtime: cooperative fibers, MPMC channels, zero-GC slices, Robin Hood hash maps, and arenas. |
-| **`omni_verify`** | [`crates/omni_verify`](file:///home/actes/projects/slop/omniscript/crates/omni_verify) | Clang/LLVM validation subsystem. Provides compiler diagnostics, JIT execution harnesses (`run_jit`, `run_jit_captured`), and native ELF linker drivers. |
-| **`omni_engine`** | [`crates/omni_engine`](file:///home/actes/projects/slop/omniscript/crates/omni_engine) | SSA Context Envelope generator and verified synthetic dataset pipeline generating `<omni_ir_task>` micro-tags paired with verified LLVM IR. |
-| **`omni_codegen`** | [`crates/omni_codegen`](file:///home/actes/projects/slop/omniscript/crates/omni_codegen) | LLVM IR emitter with lexical `ScopeTree`, string interning, static C-ABI trampolines (`void (*)(void*)`), and RAII `CleanupOp` lifecycle management. |
-| **`omni_cli`** | [`crates/omni_cli`](file:///home/actes/projects/slop/omniscript/crates/omni_cli) | CLI compiler driver (`omnic`) providing `build`, `run`, and interactive `repl` commands. |
+| **`omni_preamble`** | [`crates/omni_preamble`](./crates/omni_preamble) | Universal package shimmer (`shimmer.rs`) and multi-ecosystem dependency driller. Fetches from crates.io, PyPI, npm, Maven Central, NuGet, and Git; handles in-process gzip/tar/zip decompression; disassembles JVM bytecode; carves C ABI symbols and AST function spines across Linux, macOS, and Windows. |
+| **`omni_mem`** | [`crates/omni_mem`](./crates/omni_mem) | Autonomous lifetime auditor and memory normalizer. Enforces static borrow disciplines and validates ownership lifecycles via `UnifiedMemOp`. |
+| **`omni_parser`** | [`crates/omni_parser`](./crates/omni_parser) | Polyglot parser supporting Rust `struct`, `impl`, `enum`, and `match`; Go walrus declarations (`:=`) and channel primitives (`<-`); Python indentation, classes, and decorators (`@app.route`). |
+| **`omni_runtime`** | [`crates/omni_runtime`](./crates/omni_runtime) | Statically-linked C systems runtime: cooperative fibers (AAPCS64 & System V AMD64), MPMC channels, zero-GC slices, Robin Hood hash maps, raw OS socket syscalls, and arena-backed allocators (`omni_arena.c`). Dynamically resolves host target triples. |
+| **`omni_verify`** | [`crates/omni_verify`](./crates/omni_verify) | Clang/LLVM validation subsystem. Cross-platform toolchain discovery (Linux, Homebrew macOS, Windows LLVM), in-memory JIT runners (`run_jit`, `run_jit_captured`), and native linker drivers. |
+| **`omni_engine`** | [`crates/omni_engine`](./crates/omni_engine) | SSA Context Envelope generator, in-process Candle GGUF inference engine, Clang self-repair loop with Attempt 1 failover, and synthetic training dataset generator. |
+| **`omni_codegen`** | [`crates/omni_codegen`](./crates/omni_codegen) | LLVM IR emitter with lexical `ScopeTree`, string interning, tagged union switch jump tables, static devirtualized method calls, and RAII `CleanupOp` lifecycle management. |
+| **`omni_cli`** | [`crates/omni_cli`](./crates/omni_cli) | CLI compiler driver (`omnic`) implementing `build`, `run`, `install`, `repl`, and `export-dataset`. Incorporates BLAKE3 bitcode caching keyed on host target triple. |
 
 ---
 
-## Native Runtime Subsystems
+## Native Zero-GC Systems Runtime
 
-The runtime in [`crates/omni_runtime/src/native`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native) provides foundational zero-GC systems primitives:
+Foundational zero-GC primitives are located in [`crates/omni_runtime/src/native`](./crates/omni_runtime/src/native):
 
-### 1. Cooperative M:N Fibers ([`omni_fiber.c`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native/omni_fiber.c))
-- **System V x86_64 ABI Alignment**: Context creation pushes an 8-byte dummy padding word before the entry point address so that `(%rsp + 8) % 16 == 0` upon entry, preventing vector `#GP` faults.
-- **Dead Stack Reclamation**: Completed fibers are enqueued into `g_dead_fibers` and freed immediately upon scheduler context switch back to the main stack, eliminating fiber stack leaks.
+### 1. Cooperative M:N Fibers ([`omni_fiber.c`](./crates/omni_runtime/src/native/omni_fiber.c))
+- **Multi-Architecture Assembly**: Hand-crafted naked assembly context switching supporting both **x86_64** (System V AMD64 callee-saved registers `%rbx`, `%rbp`, `%r12`–`%r15`) and **ARM64** (AAPCS64 callee-saved registers `x19`–`x30`).
+- **16-Byte Stack Alignment**: On context creation, an 8-byte dummy word is pushed prior to the entry address so that `(%rsp + 8) % 16 == 0` upon entry, preventing vector `#GP` faults.
+- **Dead Stack Reclamation**: Completed fibers are enqueued into `g_dead_fibers` and freed immediately upon scheduler context switch back to the main stack, completely eliminating fiber stack leaks.
+- **Hardware Guard Pages**: Stack overflow detection via POSIX `mprotect(PAGE_NONE)` or Windows `VirtualProtect(PAGE_NOACCESS)`.
 
-### 2. Fiber-Aware MPMC Channels ([`omni_chan.c`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native/omni_chan.c))
+### 2. Fiber-Aware MPMC Channels ([`omni_chan.c`](./crates/omni_runtime/src/native/omni_chan.c))
 - **Deadlock-Free Synchronization**: Channel operations inspect `__omni_fiber_is_in_fiber()`. When full or empty, channels unlock their internal mutex, invoke `__omni_fiber_yield()`, and re-lock, enabling cooperative M:N fiber handoffs without blocking the OS thread.
 
-### 3. Zero-GC Polyglot Collections
-- **Dynamic Slices ([`omni_slice.c`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native/omni_slice.c))**: Contiguous exponential-growth buffers (`__omni_slice_append`, `__omni_slice_get`, `__omni_slice_set`, `__omni_slice_pop`).
-- **Tombstone-Protected Hash Maps ([`omni_map.c`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native/omni_map.c))**: FNV-1a hash map with open addressing and linear probing. Incorporates tombstone tracking in load factor evaluations to eliminate $O(N)$ probing degradation, and performs direct pointer migrations on table resize.
-- **Scope Arenas ([`omni_arena.c`](file:///home/actes/projects/slop/omniscript/crates/omni_runtime/src/native/omni_arena.c))**: High-performance contiguous monotonic arenas with rewind/mark support.
+### 3. Zero-GC Polyglot Collections & Per-Request Arenas
+- **Dynamic Slices ([`omni_slice.c`](./crates/omni_runtime/src/native/omni_slice.c))**: Contiguous exponential-growth buffers (`__omni_slice_append`, `__omni_slice_get`, `__omni_slice_set`, `__omni_slice_pop`).
+- **Tombstone-Protected Hash Maps ([`omni_map.c`](./crates/omni_runtime/src/native/omni_map.c))**: FNV-1a hash map with open addressing and linear probing. Incorporates tombstone tracking in load factor evaluations to eliminate $O(N)$ probing degradation, and performs direct pointer migrations on table resize.
+- **Scope Arenas ([`omni_arena.c`](./crates/omni_runtime/src/native/omni_arena.c))**: Monotonic contiguous memory arenas (`__omni_arena_create`, `__omni_arena_alloc`, `__omni_arena_reset`, `__omni_arena_destroy`). Sockets, route tokenizers (`__omni_str_token_arena`), and HTTP payloads use per-request arenas with $O(1)$ bulk resets to completely eliminate heap fragmentation.
+- **Thin OS Syscall Boundaries ([`omni_value.c`](./crates/omni_runtime/src/native/omni_value.c))**: Direct OS socket file-descriptor boundaries (`__omni_os_socket_listen`, `__omni_os_socket_accept`, `__omni_os_socket_read_arena`, `__omni_os_socket_write_http`, `__omni_os_socket_close`) with POSIX Berkeley Sockets and Windows Winsock2 compatibility.
 
 ---
 
 ## CLI Usage
 
-### Build Native ELF Binary
-Compiles source into a standalone, statically linked executable:
+### Install Dependencies from Unified Manifest
+Downloads and unpacks dependencies from crates.io, PyPI, npm, Maven, NuGet, and Git into `~/.omnicache/`:
 ```bash
-cargo run -q -p omni_cli -- build examples/collections.omni -o tests/outputs/collections
-./tests/outputs/collections
+cargo run -q -p omni_cli -- install [omni-requirements.txt]
 ```
 
-### JIT Execution Mode
+### Build Native Standalone Binary
+Compiles source into a standalone executable linked against the host target triple:
+```bash
+cargo run -q -p omni_cli -- build examples/rust_structs_and_enums.omni -o rust_structs_bin
+./rust_structs_bin
+```
+
+### Direct JIT Execution
 Directly compiles to LLVM IR, verifies the module via Clang, and executes in-memory:
 ```bash
 cargo run -q -p omni_cli -- run examples/channel_concurrency.omni
@@ -92,11 +108,103 @@ Launches an interactive REPL maintaining active lexical bindings and evaluating 
 cargo run -q -p omni_cli -- repl
 ```
 
+### Synthetic Training Dataset Exporter
+Generates verified paired datasets (`<omni_ir_task>` XML micro-tags paired with verified LLVM IR basic blocks) for fine-tuning the 1.5B student model:
+```bash
+cargo run -q -p omni_cli -- export-dataset --count 500 --output datasets/training_pairs.jsonl
+```
+
 ---
 
-## Example Polyglot Programs
+## Code Examples
 
-### Go-Style Concurrency & Channels ([`examples/channel_concurrency.omni`](file:///home/actes/projects/slop/omniscript/examples/channel_concurrency.omni))
+### 1. Pure Rust Parity: Structs, Inherent `impl`, Tagged Enums & Pattern Matching ([`examples/rust_structs_and_enums.omni`](./examples/rust_structs_and_enums.omni))
+Natively lowers to packed LLVM structs (`%struct.Point = type { i64, i64 }`), tagged unions (`%enum.Status = type { i32, [8 x i8] }`), and `switch i32 %tag` jump tables:
+```rust
+struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+
+impl Point {
+    pub fn norm_squared(&self) -> i64 {
+        return self.x * self.x + self.y * self.y;
+    }
+}
+
+enum Status {
+    Pending,
+    Active,
+    Completed(i64),
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    let norm = p.norm_squared();
+    print("Point norm squared:");
+    print(norm);
+
+    let s = Status::Completed(42);
+    match s {
+        Status::Pending => {
+            print("Status is Pending");
+        }
+        Status::Active => {
+            print("Status is Active");
+        }
+        Status::Completed(val) => {
+            print("Status is Completed with payload:");
+            print(val);
+        }
+    }
+
+    print("Rust structs and tagged enums parity verified successfully!");
+}
+```
+
+### 2. Universal Polyglot Manifest ([`omni-requirements.txt`](./omni-requirements.txt))
+Define dependencies across 6 ecosystems and direct Git checkouts using a uniform syntax:
+```text
+# Standard Registry Packages: '<ecosystem>' <package_name> [op] <version>
+'rust'   strsim = "0.11.1"
+'rust'   crc32fast = "1.4.0"
+'python' fastapi == 0.115.0
+'node'   express == 4.19.2
+'c'      sqlite3 == 3.45.1
+'maven'  org.json:json == 20240303
+'nuget'  Newtonsoft.Json == 13.0.3
+
+# Direct Git Importers: [git]'<language>' <url>[#<tag_or_branch>]
+[git]'rust' https://github.com/dtolnay/anyhow.git#1.0.86
+[git]'go'   github.com/gin-gonic/gin#v1.9.1
+```
+
+### 3. Native Rust App with Crate Resolution ([`examples/rust_app.omni`](./examples/rust_app.omni))
+```rust
+use 'rust' fast_math
+
+fn rotate_hash(seed: i64, rounds: i64) -> i64 {
+    let mut acc: i64 = seed
+    for i in range(rounds) {
+        acc = acc * 31 + 17
+    }
+    return acc
+}
+
+fn main() {
+    println!("=== OmniScript Native Rust Polyglot Runner ===")
+    let seed: i64 = 42
+    let checksum: i64 = rotate_hash(seed, 4)
+    println!("Computed seed hash: {}", checksum)
+
+    // Third-party dependency invocation carved directly from Rust crate
+    let card_num: i64 = 7992739871
+    let luhn_digit: i64 = fast_math.compute_luhn(card_num)
+    println!("Luhn checksum from fast_math crate: {}", luhn_digit)
+}
+```
+
+### 4. Go-Style Concurrency & Channels ([`examples/channel_concurrency.omni`](./examples/channel_concurrency.omni))
 ```python
 def worker(ch):
     print("Worker fiber received channel handle!")
@@ -119,7 +227,41 @@ def main():
     return 0
 ```
 
-### Zero-GC Collections & Iteration ([`examples/collections.omni`](file:///home/actes/projects/slop/omniscript/examples/collections.omni))
+### 5. Pythonic Classes & RAII Context Managers ([`examples/python_classes.omni`](./examples/python_classes.omni))
+```python
+class Counter:
+    def __init__(self, start):
+        self.val = start
+        self.step = 2
+
+    def increment(self, amount):
+        self.val = self.val + (amount * self.step)
+        return self.val
+
+class ScopedResource:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __enter__(self):
+        print("Entering ScopedResource context")
+        return self.tag
+
+    def __exit__(self):
+        print("Exiting ScopedResource context (RAII cleanup executed)")
+        return 0
+
+def main():
+    c = Counter(10)
+    v1 = c.increment(5)
+    print(f"Counter after increment: {}", v1)
+
+    with ScopedResource(100) as res:
+        print(f"Inside context tag: {}", res)
+
+    return 0
+```
+
+### 6. Zero-GC Collections & Hash Maps ([`examples/collections.omni`](./examples/collections.omni))
 ```python
 def main():
     items = [10, 20, 30]
@@ -136,54 +278,83 @@ def main():
     return 0
 ```
 
-### C-Style Brackets & Control Flow ([`examples/bracket_syntax.omni`](file:///home/actes/projects/slop/omniscript/examples/bracket_syntax.omni))
-```c
-def check_brackets() {
-    int x = 0;
-    while (x < 3) {
-        print(x);
-        x = x + 1;
-    }
-    return x;
-}
+### 7. Native Flask Microservice Ingestion ([`hello_flask.py`](./hello_flask.py))
+Standard Python Flask applications compile directly to native standalone ELF binaries without a CPython runtime:
+```python
+from flask import Flask
 
-def main() {
-    val := check_brackets();
-    print(val);
-    return 0;
-}
+app = Flask(__name__)
+
+@app.route("/")
+def hello_world():
+    return "Hello, World!"
+
+@app.route("/foo")
+def foo():
+    result = {}
+    result["status"] = "bar"
+    return result
+
+if __name__ == "__main__":
+    app.run(port=6969)
 ```
 
 ---
 
 ## Verification & Testing
 
-Execute the entire test suite across all 8 crates:
+### 1. In-The-Wild Package & Ecosystem Matrix (`tests/in_the_wild_matrix/`)
+Integration suites verifying real-world package dependencies across native shared libraries, bytecode, package managers, and virtual environments:
+- **`01_c_system_so`**: System dynamic shared library linkage (`/usr/lib/libz.so`), verifying `zlib.compressBound` via direct C ABI symbol dispatch.
+- **`02_jvm_bytecode_so`**: Pure-Rust JVM `.class` bytecode transcription (`JvmBytecodeDecoder`) without hosting a JVM runtime, verifying multi-argument arithmetic execution (`BytecodeService.add`, `BytecodeService.compute_ratio`).
+- **`03_python_site_packages`**: Cross-platform Python `./venv` / `site-packages` traversal, hop-chain tracing through `__init__.py`, and self-contained function carving (`compute_checksum`, `transform_metric`).
+- **`04_node_package_json`**: Node `node_modules` package manifest resolution (`package.json` `"main": "lib/core.js"`), recursive AST dependency carving, and LLVM IR lowering (`hash_block`, `verify_token`).
+
+Run the in-the-wild matrix suite:
 ```bash
-cargo test --all
+cargo test --test test_in_the_wild_matrix
 ```
 
-Run end-to-end example verifications:
+### 2. Multi-Language Polyglot Matrix (`tests/polyglot_matrix/`)
+Runs all 8 language modules (Python, JavaScript, Rust, Go, C, Java, C#, Lua) and the simultaneous 8-language mesh (`09_polyglot_mesh`):
 ```bash
-cargo run -q -p omni_cli -- run examples/channel_concurrency.omni
-cargo run -q -p omni_cli -- run examples/collections.omni
-cargo run -q -p omni_cli -- run examples/bracket_syntax.omni
-cargo run -q -p omni_cli -- run examples/hardened_control_flow.omni
-cargo run -q -p omni_cli -- run examples/polyglot_quirks.omni
+cargo test --test test_polyglot_matrix -- --test-threads=1
 ```
 
-Generate verified synthetic training pairs (`<omni_ir_task>` XML micro-tags paired with verified LLVM IR):
+### 3. Full Workspace Test Suite
+Execute the entire test suite across all crates:
 ```bash
-cargo test -p omni_engine -- --nocapture
+cargo test --all -- --test-threads=1
 ```
 
 ---
 
-## Specification Documents
+## Architecture Specifications & Documentation
 
-Detailed technical whitepapers and specifications are cataloged in [`docs/`](file:///home/actes/projects/slop/omniscript/docs):
-- [`docs/GAMEPLAN.md`](file:///home/actes/projects/slop/omniscript/docs/GAMEPLAN.md): Technical roadmap and project objectives.
-- [`docs/MEMORY_AND_RUNTIME_SYSTEM.md`](file:///home/actes/projects/slop/omniscript/docs/MEMORY_AND_RUNTIME_SYSTEM.md): UMO and memory lifecycle mechanics.
-- [`docs/MN_CONCURRENCY_AND_FIBER_RUNTIME.md`](file:///home/actes/projects/slop/omniscript/docs/MN_CONCURRENCY_AND_FIBER_RUNTIME.md): Fiber context switching and M:N concurrency runtime.
-- [`docs/PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md`](file:///home/actes/projects/slop/omniscript/docs/PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md): Dual-representation AST and LLM prompt packing.
-- [`docs/MODEL_PIPELINE_AND_DISTILLATION.md`](file:///home/actes/projects/slop/omniscript/docs/MODEL_PIPELINE_AND_DISTILLATION.md): 1.5B distilled compiler model strategy.
+Comprehensive technical whitepapers and specifications are cataloged in [`docs/`](./docs):
+
+| Document | Focus |
+|---|---|
+| [`docs/DEPENDENCY_AND_IMPORT_SYSTEM.md`](./docs/DEPENDENCY_AND_IMPORT_SYSTEM.md) | Universal package shimmer (`omnic install`), manifest syntax, in-process decompression, and foreign symbol carving. |
+| [`docs/CROSS_PLATFORM_PORTABILITY_GUIDE.md`](./docs/CROSS_PLATFORM_PORTABILITY_GUIDE.md) | Target triple resolution, ARM64/x86_64 fiber assembly, Winsock2/POSIX socket boundaries, and memory guard pages. |
+| [`docs/MASTER_ROADMAP_POLYGLOT_SHIMMER_AND_RUST_PARITY.md`](./docs/MASTER_ROADMAP_POLYGLOT_SHIMMER_AND_RUST_PARITY.md) | Detailed technical roadmap for Rust parity, multi-registry shimmers, and completed milestones. |
+| [`docs/GAMEPLAN.md`](./docs/GAMEPLAN.md) | Initial architectural design, systems requirements, and execution phases. |
+| [`docs/MEMORY_AND_RUNTIME_SYSTEM.md`](./docs/MEMORY_AND_RUNTIME_SYSTEM.md) | Unified Memory Operations (UMO), Scope Arenas, and zero-GC lifecycle management. |
+| [`docs/MN_CONCURRENCY_AND_FIBER_RUNTIME.md`](./docs/MN_CONCURRENCY_AND_FIBER_RUNTIME.md) | Cooperative M:N fiber context switching, deadlock-free MPMC channels, and scheduler internals. |
+| [`docs/PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md`](./docs/PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md) | Non-destructive dual-representation AST nodes, SSA context envelopes, and prompt packing. |
+| [`docs/MODEL_PIPELINE_AND_DISTILLATION.md`](./docs/MODEL_PIPELINE_AND_DISTILLATION.md) | 1.5B distilled local compiler model architecture, inference bindings, and Clang self-repair loops. |
+| [`docs/GARBAGE_COLLECTORLESS_STRATEGY.md`](./docs/GARBAGE_COLLECTORLESS_STRATEGY.md) | Static lifetime analysis, autonomous borrow checking, and zero-tracing GC design. |
+| [`docs/STOLEN_COMPILER_CONCEPTS.md`](./docs/STOLEN_COMPILER_CONCEPTS.md) | Borrowed compiler paradigms synthesized from Zig, Rust, Go, Mojo, and Swift. |
+| [`docs/SYNTAX_SPEC_AND_EXAMPLES.md`](./docs/SYNTAX_SPEC_AND_EXAMPLES.md) | Grammar specification, operator disambiguation, and multi-syntax examples. |
+| [`docs/POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md`](./docs/POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md) | Edge-case handling across language semantics and syntax normalization. |
+| [`docs/GPU_TRAINING_WORKFLOW.md`](./docs/GPU_TRAINING_WORKFLOW.md) | Fine-tuning and distillation pipeline for the local compiler model. |
+
+---
+
+## License
+
+Licensed under either of:
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](./LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.

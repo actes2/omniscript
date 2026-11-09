@@ -28,7 +28,39 @@ import "drivers/sensors" as Sensors
 from "stuff" import Parser
 from "engine/crypto" import SHA256Signer, KeyPair
 from "./network" import fetch_async as fetch
+
+# 4. First-class ecosystem & native package manager drilling
+import 'python' flask
+import 'python' requests
+import 'javascript' risk_engine
+import 'rust' crypto
+import 'go' math
+import 'c' unistd
 ```
+
+---
+
+## 2.1 Multi-Ecosystem Package Manager Driller & Shimmer
+
+OmniScript autonomously discovers, installs, and traverses native package managers within the project root and host platform without requiring wrappers:
+
+- **Universal Package Shimmer (`omnic install`)**: Parses `omni-requirements.txt` (or inline package annotations) and pulls dependencies directly from official registries:
+  - **Python (PyPI)**: Fetches JSON metadata and downloads wheels (`.whl`), unzipping them via pure-Rust `zip::ZipArchive` directly into `~/.omnicache/packages/python/<pkg>-<ver>/`.
+  - **Rust (crates.io)**: Queries the crates.io sparse index, downloads `.crate` tarballs, and extracts pure Rust source via `flate2` + `tar::Archive` directly into `~/.omnicache/packages/rust/<pkg>-<ver>/`.
+  - **Node.js (npm)**: Fetches package metadata from `registry.npmjs.org`, downloads `.tgz`, and extracts via `flate2` + `tar::Archive` directly into `~/.omnicache/packages/node/<pkg>-<ver>/`.
+  - **C / C++**: Downloads raw source archives/amalgamations or links directly to system shared libraries (`.so`, `.dylib`, `.dll`) discovered via `pkg-config`.
+  - **Java (Maven Central)**: Downloads `.jar` archives and extracts class files, lowered directly to LLVM IR via the built-in `JvmBytecodeDecoder`.
+  - **C# (NuGet)**: Downloads `.nupkg` ZIPs from NuGet flat containers and extracts `.dll` assemblies.
+  - **Direct Git Repositories (`[git]'<lang>' <url>`)**: Clones or checks out git repositories directly into Go-mod style hierarchical cache paths under `~/.omnicache/git/<lang>/`.
+- **Local Ecosystem Discovery**:
+  - **Python**: Searches `./venv`, virtualenvs, conda environments, host `site-packages`, and dynamic `importlib.util.find_spec` probes down to `_socket`/`posix` C-frontiers.
+  - **JavaScript / TypeScript**: Traverses workspace `.js`/`.ts`/`.mjs`/`.cjs`, `./node_modules`, `NODE_PATH`, Homebrew `/opt/homebrew/lib/node_modules`, and Windows `%APPDATA%\npm\node_modules`.
+  - **Rust / Cargo**: Scans `src/`, local vendored crates (`./vendor/<crate>/src/lib.rs`), and global Cargo registries (`~/.cargo/registry/src`).
+  - **Go**: Resolves `go.mod`, local packages, vendored libraries (`./vendor/`), and `$GOPATH/pkg/mod`.
+  - **C / C++**: Discovers project headers (`include/`), vcpkg (`./vcpkg_installed`), Conan, Homebrew `/opt/homebrew/include`, and `/usr/include`.
+  - **Java / JVM**: Scans Maven/Gradle source roots (`src/main/java`) and `~/.m2/repository`.
+  - **C# / .NET**: Scans `.csproj` structures and global NuGet caches (`~/.nuget/packages`, `%LOCALAPPDATA%\NuGet\v3-cache`).
+  - **Lua**: Resolves workspace `.lua`, `<mod>/init.lua`, and Luarocks (`~/.luarocks/share/lua/5.1`).
 
 ---
 

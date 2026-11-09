@@ -42,7 +42,7 @@ impl SyntheticDatasetGenerator {
 
             // Construct verification harness module
             let mut harness = String::new();
-            harness.push_str("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+            harness.push_str(&format!("target triple = \"{}\"\n\n", omni_runtime::host_target_triple()));
             harness.push_str(omni_runtime::runtime_llvm_declarations());
             harness.push_str("\n");
 
@@ -107,7 +107,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "collections_transform",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "transform_stream".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 10,
@@ -132,6 +132,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*
@@ -157,7 +158,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "channel_pipeline",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "producer_loop".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 20,
@@ -182,6 +183,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i1".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %ch_ptr = alloca i8*
@@ -204,7 +206,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "bitwise_kernel",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "compute_hamming_weight".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 30,
@@ -222,6 +224,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %mask_val = alloca i32
@@ -240,7 +243,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "memory_arena",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "process_packet".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 40,
@@ -258,6 +261,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i8*".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %arena_ptr = alloca i8*
@@ -275,7 +279,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "map_lookup",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "query_metric".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 50,
@@ -300,6 +304,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i64".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %map_ptr = alloca i8*
@@ -320,7 +325,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "fiber_yield",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "worker_cooperative_loop".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 60,
@@ -334,6 +339,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: String::new(),
@@ -346,7 +352,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "slice_accumulator",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "pop_and_sum".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 70,
@@ -371,6 +377,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*
@@ -395,7 +402,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "channel_recv",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "consumer_gate".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 80,
@@ -420,6 +427,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %ch_ptr = alloca i8*
@@ -442,7 +450,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "map_update",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "update_metric_record".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 90,
@@ -472,6 +480,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("void".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %map_ptr = alloca i8*
@@ -495,7 +504,7 @@ impl SyntheticDatasetGenerator {
             ScenarioTemplate {
                 domain: "slice_length",
                 envelope: SsaContextEnvelope {
-                    target_abi: "x86_64-pc-linux-gnu".to_string(),
+                    target_abi: omni_runtime::host_target_triple().to_string(),
                     enclosing_fn: "get_collection_size".to_string(),
                     return_type: "i32".to_string(),
                     next_ssa_idx: 100,
@@ -520,6 +529,7 @@ impl SyntheticDatasetGenerator {
                     yield_expectation: Some("i32".to_string()),
                     action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
                     ecosystem_context: None,
+                    lifetime_context: None,
                     import_chain: vec![],
                 },
                 harness_preamble: r#"  %items_ptr = alloca i8*

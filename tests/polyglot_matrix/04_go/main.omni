@@ -1,0 +1,6 @@
+import 'go' worker
+import 'go' telemetry
+
+task_res := worker.ComputeTask(12, 5)
+event_id := telemetry.RecordEvent(task_res, 3)
+print(f"Go event id: {}", event_id)

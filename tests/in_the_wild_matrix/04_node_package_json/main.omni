@@ -1,0 +1,8 @@
+import 'javascript' fast_crypto
+
+h = fast_crypto.hash_block(100, 42)
+v = fast_crypto.verify_token(h, 255)
+
+print("In-the-wild Node package.json manifest resolution test passed!")
+print(f"Hashed block: {}", h)
+print(f"Verified token: {}", v)

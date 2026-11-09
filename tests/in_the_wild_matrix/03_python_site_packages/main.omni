@@ -1,0 +1,8 @@
+import 'python' in_the_wild_pkg
+
+cs = in_the_wild_pkg.compute_checksum(10, 5)
+transformed = in_the_wild_pkg.transform_metric(cs)
+
+print("In-the-wild Python site-packages dependency test passed!")
+print(f"Checksum: {}", cs)
+print(f"Transformed metric: {}", transformed)

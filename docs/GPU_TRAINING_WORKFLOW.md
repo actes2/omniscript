@@ -7,8 +7,8 @@ This guide details the procedure for transferring OmniScript's Clang-verified sy
 ## 1. Files to Transfer to Your GPU Workstation
 
 From this repository on your Surface, copy two files to your GPU PC:
-1. **Training Script**: [`scripts/train_omni_model.py`](file:///home/actes/projects/slop/omniscript/scripts/train_omni_model.py)
-2. **Dataset File**: [`tests/outputs/synthetic_training_dataset.jsonl`](file:///home/actes/projects/slop/omniscript/tests/outputs/synthetic_training_dataset.jsonl)
+1. **Training Script**: [`scripts/train_omni_model.py`](../scripts/train_omni_model.py)
+2. **Dataset File**: [`tests/outputs/synthetic_training_dataset.jsonl`](../tests/outputs/synthetic_training_dataset.jsonl)
 
 Example transfer via `scp`:
 ```bash

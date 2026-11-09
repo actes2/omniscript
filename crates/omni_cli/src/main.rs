@@ -2,7 +2,7 @@ use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
 use omni_engine::{CandleGgufEngine, FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
-use omni_preamble::{DependencyDriller, ImportDirective, SymbolCarver};
+use omni_preamble::{DependencyDriller, ImportDirective, PackageShimmer, SymbolCarver};
 use omni_verify::LlvmVerifier;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -66,7 +66,14 @@ enum Commands {
     },
     /// Launch the interactive polyglot OmniScript REPL
     Repl,
+    /// Install dependencies declared in omni-requirements.txt or custom manifest
+    Install {
+        /// Manifest path (defaults to omni-requirements.txt)
+        #[arg(default_value = "omni-requirements.txt")]
+        manifest: PathBuf,
+    },
     /// Generate a verified synthetic dataset of <omni_ir_task> <-> LLVM IR pairs (Zero external downloads)
+    #[command(alias = "export-dataset")]
     SynthDataset {
         /// Number of verified samples to synthesize
         #[arg(short, long, default_value_t = 100)]
@@ -82,6 +89,9 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Commands::Repl) => run_repl()?,
+        Some(Commands::Install { manifest }) => {
+            install_dependencies(&manifest, args.verbose)?;
+        }
         Some(Commands::SynthDataset { count, output }) => {
             synth_dataset(count, &output)?;
         }
@@ -121,6 +131,42 @@ fn synth_dataset(count: usize, output: &Path) -> anyhow::Result<()> {
     println!("\n[SYNTHESIS COMPLETE]");
     println!("  -> Successfully synthesized and verified {} samples with Clang", written);
     println!("  -> Dataset saved to: {}", output.display());
+    Ok(())
+}
+
+fn install_dependencies(manifest_path: &Path, verbose: bool) -> anyhow::Result<()> {
+    if !manifest_path.exists() {
+        anyhow::bail!("Requirements manifest '{}' not found.", manifest_path.display());
+    }
+    let shimmer = PackageShimmer::new();
+    let specs = shimmer
+        .parse_requirements_file(manifest_path)
+        .map_err(|e| anyhow::anyhow!("Failed parsing requirements: {}", e))?;
+
+    println!("OmniScript Package Shimmer: installing {} packages from {}...", specs.len(), manifest_path.display());
+    let mut installed = 0;
+    for spec in &specs {
+        let desc = if spec.is_git {
+            format!("[git]'{}' {}", spec.ecosystem.as_str(), spec.git_url.as_deref().unwrap_or(""))
+        } else {
+            format!("'{}' {} (version: {})", spec.ecosystem.as_str(), spec.name, spec.version.as_deref().unwrap_or("latest"))
+        };
+        print!("  -> Resolving {} ... ", desc);
+        let _ = io::stdout().flush();
+        match shimmer.shim_package(spec) {
+            Ok(cached_path) => {
+                println!("OK");
+                if verbose {
+                    println!("     Cache: {}", cached_path.display());
+                }
+                installed += 1;
+            }
+            Err(e) => {
+                println!("FAILED: {}", e);
+            }
+        }
+    }
+    println!("Successfully synchronized {}/{} packages into ~/.omnicache/", installed, specs.len());
     Ok(())
 }
 
@@ -220,13 +266,14 @@ fn compile_source(
     // 1. Parse AST & Memory Instructions
     let t_parse_start = std::time::Instant::now();
     let parser = OmniParser::new();
-    let module = parser.parse_module(module_name, &source_content);
+    let mut module = parser.parse_module_with_dir(module_name, &source_content, Some(base_dir));
     let parse_time = t_parse_start.elapsed();
 
     // 2. Preamble Assembly & Symbol Carving
     let t_drill_start = std::time::Instant::now();
     let carver = SymbolCarver::new();
     let mut foreign_c_files = omni_runtime::runtime_c_sources();
+    let mut all_dependency_files = Vec::new();
 
     for import in &module.imports {
         match import {
@@ -240,6 +287,7 @@ fn compile_source(
                     );
                     std::process::exit(1);
                 }
+                all_dependency_files.push(full_path.clone());
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "c" || ext == "cpp" {
                     let mut driller = DependencyDriller::new();
@@ -261,14 +309,140 @@ fn compile_source(
                     );
                 }
             }
-            ImportDirective::Ecosystem { ecosystem, module, alias } => {
+            ImportDirective::Ecosystem { ecosystem, module: mod_name, alias } => {
+                let mut target_symbols =
+                    omni_preamble::DependencyDriller::extract_dotted_symbols(&source_content);
+                if let Some(ref sym) = alias {
+                    if !target_symbols.contains(sym) {
+                        target_symbols.push(sym.clone());
+                    }
+                }
+                let mut driller = DependencyDriller::new();
+                let walk = driller.crawl_ecosystem_import(
+                    base_dir,
+                    ecosystem,
+                    mod_name,
+                    &target_symbols,
+                );
+                for f in &walk.visited_files {
+                    if !all_dependency_files.contains(f) {
+                        all_dependency_files.push(f.clone());
+                    }
+                    let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a") && !foreign_c_files.contains(f) {
+                        foreign_c_files.push(f.clone());
+                    }
+                }
+                if let Some(ref orig) = walk.resolved_origin {
+                    if !all_dependency_files.contains(orig) {
+                        all_dependency_files.push(orig.clone());
+                    }
+                    let ext = orig.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a") && !foreign_c_files.contains(orig) {
+                        foreign_c_files.push(orig.clone());
+                    }
+                }
+
+                // Ingest pure-source crawled module items directly into AST
+                let mut all_sources_to_merge = walk.visited_files.clone();
+                if let Some(ref orig) = walk.resolved_origin {
+                    if !all_sources_to_merge.contains(orig) {
+                        all_sources_to_merge.push(orig.clone());
+                    }
+                }
+                for vf in &all_sources_to_merge {
+                    let ext = vf.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext == "class" {
+                        if let Ok(methods) = omni_preamble::DependencyDriller::decode_jvm_class(vf) {
+                            for (m_name, params, decompiled_expr) in methods {
+                                let body = if decompiled_expr.trim().starts_with("return") {
+                                    decompiled_expr.trim().to_string()
+                                } else {
+                                    format!("return {}", decompiled_expr.trim())
+                                };
+                                let func_src = format!("fn {}({}) {{\n  {}\n}}\n", m_name, params.join(", "), body);
+                                let sub_mod = parser.parse_module(mod_name, &func_src);
+                                for f in sub_mod.functions {
+                                    if !module.functions.iter().any(|existing| existing.name == f.name) {
+                                        module.functions.push(f);
+                                    }
+                                }
+                            }
+                        }
+                    } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
+                        if let Ok(src) = fs::read_to_string(vf) {
+                            let sub_mod = parser.parse_module(mod_name, &src);
+                            for f in sub_mod.functions {
+                                if !module.functions.iter().any(|existing| existing.name == f.name) {
+                                    module.functions.push(f);
+                                }
+                            }
+                            for s in sub_mod.structs_and_classes {
+                                if !module.structs_and_classes.iter().any(|existing| existing.name == s.name) {
+                                    module.structs_and_classes.push(s);
+                                }
+                            }
+                            for e in sub_mod.enums {
+                                if !module.enums.iter().any(|existing| existing.name == e.name) {
+                                    module.enums.push(e);
+                                }
+                            }
+                        }
+                    }
+                }
                 if verbose {
                     println!(
                         "  -> Ingested foreign ecosystem '{}' module '{}' as alias '{:?}'",
                         ecosystem,
-                        module,
+                        mod_name,
                         alias.as_deref().unwrap_or("self")
                     );
+                    if let Some(ref origin) = walk.resolved_origin {
+                        println!(
+                            "     [Dependency Walk] Resolved '{}' via {} -> {}",
+                            mod_name,
+                            walk.resolution_source,
+                            origin.display()
+                        );
+                        println!(
+                            "     [Dependency Walk] Crawled {} package files; tracing call sites {:?}:",
+                            walk.visited_files.len(),
+                            target_symbols
+                        );
+                        for trace in &walk.call_traces {
+                            if !trace.hop_chain.is_empty() {
+                                println!(
+                                    "       * .{} -> {}",
+                                    trace.symbol,
+                                    trace.hop_chain.join(" => ")
+                                );
+                                if let (Some(sc_sym), Some(sc_proto)) =
+                                    (&trace.short_circuit_c_symbol, &trace.short_circuit_prototype)
+                                {
+                                    println!(
+                                        "           |-> [C-Frontier Short-Circuit] @{} ({})",
+                                        sc_sym, sc_proto
+                                    );
+                                }
+                            } else {
+                                println!("       * .{} -> [dynamic runtime attribute]", trace.symbol);
+                            }
+                        }
+                        if !walk.native_frontier.is_empty() {
+                            println!(
+                                "     [Dependency Walk] Terminal Native / External Frontier ({} boundaries):",
+                                walk.native_frontier.len()
+                            );
+                            for front in &walk.native_frontier {
+                                println!("       ! {}", front);
+                            }
+                        }
+                    } else {
+                        println!(
+                            "     [Dependency Walk] Module '{}' unresolved on host ({})",
+                            mod_name, walk.resolution_source
+                        );
+                    }
                 }
             }
             ImportDirective::FromDirectory { dir_path, symbols } => {
@@ -321,11 +495,16 @@ fn compile_source(
     let t_codegen_start = std::time::Instant::now();
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_content.as_bytes());
-    hasher.update(b"x86_64-pc-linux-gnu");
+    hasher.update(omni_codegen::host_target_triple().as_bytes());
     hasher.update(&temp.to_le_bytes());
     hasher.update(&[opt_level]);
     for foreign_file in &foreign_c_files {
         if let Ok(bytes) = fs::read(foreign_file) {
+            hasher.update(&bytes);
+        }
+    }
+    for dep_file in &all_dependency_files {
+        if let Ok(bytes) = fs::read(dep_file) {
             hasher.update(&bytes);
         }
     }
@@ -356,8 +535,7 @@ fn compile_source(
                 println!("  -> [Inference] Using in-process Candle GGUF engine on {} ({})", dev_tag, candle_engine.model_path.display());
             }
             let primary_verified = VerifiedSynthesisEngine::new(&candle_engine, &verifier);
-            let composite = FallbackEngine::new(primary_verified, fallback);
-            let codegen = CodeGenerator::new(&composite);
+            let codegen = CodeGenerator::new(&primary_verified);
             codegen.generate_module_ir(&module, temp)?
         } else {
             if verbose {
@@ -412,6 +590,7 @@ fn run_repl() -> anyhow::Result<()> {
 
     let stdin = io::stdin();
     let mut session_stmts: Vec<String> = Vec::new();
+    let mut disambig_enabled = false;
     let parser = OmniParser::new();
     let verifier = LlvmVerifier::new()?;
     let primary = OllamaInferenceEngine::new("omni-coder");
@@ -442,10 +621,23 @@ fn run_repl() -> anyhow::Result<()> {
             }
             ":help" => {
                 println!("Available commands:");
-                println!("  :ir     - Print synthesized LLVM IR for current session");
-                println!("  :list   - List all statements in current session");
-                println!("  :reset  - Clear current session memory and variables");
-                println!("  :quit   - Exit REPL");
+                println!("  :ir       - Print synthesized LLVM IR for current session");
+                println!("  :list     - List all statements in current session");
+                println!("  :reset    - Clear current session memory and variables");
+                println!("  :disambig - Toggle conversational disambiguation on ambiguous idioms");
+                println!("  :quit     - Exit REPL");
+                continue;
+            }
+            ":disambig" => {
+                disambig_enabled = !disambig_enabled;
+                println!(
+                    "Conversational Disambiguation Mode: {}",
+                    if disambig_enabled {
+                        "ENABLED (Prompt on ambiguous operators)"
+                    } else {
+                        "DISABLED (Automatic Canonical Lowering)"
+                    }
+                );
                 continue;
             }
             ":reset" => {
@@ -473,21 +665,52 @@ fn run_repl() -> anyhow::Result<()> {
             _ => {}
         }
 
+        let mut processed_line = trimmed.to_string();
+        if (disambig_enabled || trimmed.ends_with('?')) && trimmed.contains(":=") {
+            let clean = trimmed.trim_end_matches('?').trim();
+            println!("\n[CONVERSATIONAL DISAMBIGUATION] Operator ':=' detected in: `{}`", clean);
+            println!("  [1] Go-style Scoped Variable Declaration (alloca & initialize local register)");
+            println!("  [2] Python-style Walrus Expression (assign & evaluate scalar in expression)");
+            println!("  [3] Canonical Assignment (=)");
+            print!("Select semantic interpretation [1-3] (default 1): ");
+            io::stdout().flush()?;
+            let mut choice = String::new();
+            if stdin.lock().read_line(&mut choice).is_ok() {
+                match choice.trim() {
+                    "2" => {
+                        println!("  -> Tagged as Python Walrus expression.");
+                        processed_line = clean.to_string();
+                    }
+                    "3" => {
+                        println!("  -> Rewritten as Canonical Assignment.");
+                        processed_line = clean.replace(":=", "=");
+                    }
+                    _ => {
+                        println!("  -> Tagged as Go Scoped Declaration.");
+                        processed_line = clean.to_string();
+                    }
+                }
+            }
+        } else if trimmed.ends_with('?') {
+            processed_line = trimmed.trim_end_matches('?').trim().to_string();
+        }
+
         // If the statement is an expression without print or assignment, wrap it in print
-        let stmt_to_add = if !trimmed.starts_with("print(")
-            && !trimmed.contains('=')
-            && !trimmed.contains("<-")
-            && !trimmed.contains(".append(")
-            && !trimmed.contains(".push(")
-            && !trimmed.contains(".send(")
-            && !trimmed.starts_with("go ")
-            && !trimmed.starts_with("for ")
-            && !trimmed.starts_with("while ")
-            && !trimmed.starts_with("if ")
+        let stmt_to_add = if !processed_line.starts_with("print(")
+            && !processed_line.contains('=')
+            && !processed_line.contains("<-")
+            && !processed_line.contains(".append(")
+            && !processed_line.contains(".push(")
+            && !processed_line.contains(".send(")
+            && !processed_line.starts_with("go ")
+            && !processed_line.starts_with("for ")
+            && !processed_line.starts_with("while ")
+            && !processed_line.starts_with("if ")
+            && !processed_line.starts_with("with ")
         {
-            format!("print({})", trimmed)
+            format!("print({})", processed_line)
         } else {
-            trimmed.to_string()
+            processed_line
         };
 
         let mut trial_stmts = session_stmts.clone();

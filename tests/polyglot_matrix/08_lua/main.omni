@@ -1,0 +1,10 @@
+import 'lua' physics_core
+import 'lua' orbital
+
+p = physics_core.compute_momentum(10, 20)
+ke = physics_core.compute_kinetic_energy(10, 20)
+margin = orbital.escape_margin(ke, 1500)
+
+print(f"Lua Momentum: {}", p)
+print(f"Lua Kinetic Energy: {}", ke)
+print(f"Lua Escape Margin: {}", margin)

@@ -43,10 +43,20 @@ impl Default for LlvmVerifier {
 impl LlvmVerifier {
     pub fn new() -> Result<Self, VerifyError> {
         let candidates = [
+            // Linux candidates
             PathBuf::from("/usr/lib/llvm20/bin/clang"),
             PathBuf::from("/usr/lib/llvm21/bin/clang"),
+            PathBuf::from("/usr/lib/llvm19/bin/clang"),
             PathBuf::from("/usr/bin/clang"),
+            // macOS Homebrew & Xcode candidates
+            PathBuf::from("/opt/homebrew/opt/llvm/bin/clang"),
+            PathBuf::from("/opt/homebrew/bin/clang"),
+            PathBuf::from("/usr/local/opt/llvm/bin/clang"),
+            // Windows LLVM installation candidates
+            PathBuf::from(r"C:\Program Files\LLVM\bin\clang.exe"),
+            PathBuf::from(r"C:\LLVM\bin\clang.exe"),
             PathBuf::from("clang"),
+            PathBuf::from("clang.exe"),
         ];
 
         let mut found_path = None;
@@ -54,11 +64,10 @@ impl LlvmVerifier {
             if c.exists() {
                 found_path = Some(c.clone());
                 break;
-            } else if c.to_str() == Some("clang") {
-                if let Ok(output) = Command::new("which").arg("clang").output() {
+            } else if c.to_str() == Some("clang") || c.to_str() == Some("clang.exe") {
+                if let Ok(output) = Command::new(c).arg("--version").output() {
                     if output.status.success() {
-                        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        found_path = Some(PathBuf::from(path_str));
+                        found_path = Some(c.clone());
                         break;
                     }
                 }
@@ -84,8 +93,9 @@ impl LlvmVerifier {
         f.write_all(ir.as_bytes())
             .map_err(|e| VerifyError::Io(e.to_string()))?;
 
+        let dev_null = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let output = Command::new(&self.clang_path)
-            .args(["-x", "ir", "-c", "-o", "/dev/null"])
+            .args(["-x", "ir", "-c", "-o", dev_null])
             .arg(&temp_ll)
             .output()
             .map_err(|e| VerifyError::Io(e.to_string()))?;
@@ -121,9 +131,14 @@ impl LlvmVerifier {
         cmd.arg(format!("-O{}", opt_level));
         cmd.arg(&temp_ll);
 
-        // Include any foreign C sources
+        // Include any foreign C sources or shared objects (.so, .a, .dylib, .dll, .lib)
         for extra in extra_c_files {
-            cmd.arg("-x").arg("c").arg(extra);
+            let ext = extra.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext == "so" || ext == "a" || ext == "dylib" || ext == "lib" || ext == "dll" {
+                cmd.arg("-x").arg("none").arg(extra);
+            } else {
+                cmd.arg("-x").arg("c").arg(extra);
+            }
         }
 
         cmd.arg("-o").arg(out_path);
@@ -149,7 +164,11 @@ impl LlvmVerifier {
     ) -> Result<std::process::ExitStatus, VerifyError> {
         let temp_dir = std::env::temp_dir();
         let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_bin = temp_dir.join(format!("omni_jit_{}_{}", std::process::id(), unique_id));
+        let temp_bin = if cfg!(windows) {
+            temp_dir.join(format!("omni_jit_{}_{}.exe", std::process::id(), unique_id))
+        } else {
+            temp_dir.join(format!("omni_jit_{}_{}", std::process::id(), unique_id))
+        };
 
         self.compile_ir_to_binary(ir, &temp_bin, opt_level, extra_c_files)?;
 
@@ -177,7 +196,11 @@ impl LlvmVerifier {
     ) -> Result<(std::process::ExitStatus, String, String), VerifyError> {
         let temp_dir = std::env::temp_dir();
         let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_bin = temp_dir.join(format!("omni_jit_cap_{}_{}", std::process::id(), unique_id));
+        let temp_bin = if cfg!(windows) {
+            temp_dir.join(format!("omni_jit_cap_{}_{}.exe", std::process::id(), unique_id))
+        } else {
+            temp_dir.join(format!("omni_jit_cap_{}_{}", std::process::id(), unique_id))
+        };
 
         self.compile_ir_to_binary(ir, &temp_bin, opt_level, extra_c_files)?;
 

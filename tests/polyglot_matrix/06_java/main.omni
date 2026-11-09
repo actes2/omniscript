@@ -1,0 +1,10 @@
+import 'java' MathService
+import 'java' StatsHelper
+
+sum = MathService.add(20, 22)
+prod = MathService.multiply(6, 7)
+avg = StatsHelper.mean_scaled(sum, prod)
+
+print(f"Java sum: {}", sum)
+print(f"Java prod: {}", prod)
+print(f"Java mean: {}", avg)

@@ -49,9 +49,29 @@ bool __omni_val_lt(OmniValue a, OmniValue b);
 bool __omni_val_gt(OmniValue a, OmniValue b);
 bool __omni_val_truthy(OmniValue v);
 
-// Standard Output
+// Standard Output & Sleep
 void __omni_val_print(OmniValue v);
 void __omni_print_str(const char* s);
 void __omni_print_int(int64_t v);
+void __omni_sleep_s(int64_t seconds);
+void __omni_sleep_ms(int64_t milliseconds);
+
+// Interpretive C-Frontier Short-Circuit Intrinsics & OS Socket Syscall Primitives
+char* __omni_c_http_get(const char* url, int32_t* status_out);
+char* __omni_c_json_parse(const char* raw_json);
+char* __omni_c_json_get(const char* json_str, const char* key);
+char* __omni_obj_get(const char* obj, const char* key);
+int32_t __omni_c_to_float(const char* s);
+int32_t __omni_c_to_int(const char* s);
+void __omni_c_return_str(const char* s);
+const char* __omni_c_get_returned_str(void);
+char* __omni_str_token(const char* s, int32_t index);
+char* __omni_str_token_arena(void* arena, const char* s, int32_t index);
+char* __omni_os_socket_read_arena(void* arena, int32_t client_fd);
+int32_t __omni_os_socket_listen(int32_t port);
+int32_t __omni_os_socket_accept(int32_t server_fd);
+char* __omni_os_socket_read(int32_t client_fd);
+void __omni_os_socket_write_http(int32_t client_fd, int32_t status_code, const char* body);
+void __omni_os_socket_close(int32_t fd);
 
 #endif // OMNI_VALUE_H

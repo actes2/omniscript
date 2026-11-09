@@ -228,13 +228,13 @@ The compiler driver is built entirely in **Rust** from Day 1 for maximum speed, 
 ---
 
 ## 7. Documentation Suite
-- [`GAMEPLAN.md`](file:///home/actes/projects/slop/omniscript/docs/GAMEPLAN.md) - Master architecture & phase roadmap.
-- [`MN_CONCURRENCY_AND_FIBER_RUNTIME.md`](file:///home/actes/projects/slop/omniscript/docs/MN_CONCURRENCY_AND_FIBER_RUNTIME.md) - Go-style M:N fiber scheduler, cross-platform register swapping (`swap_g_context`), and zero-GC fiber task arenas.
-- [`PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md`](file:///home/actes/projects/slop/omniscript/docs/PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md) - Bi-directional Interpretive Anchors, 3 static contract passes, and sub-2B dual grounding.
-- [`STOLEN_COMPILER_CONCEPTS.md`](file:///home/actes/projects/slop/omniscript/docs/STOLEN_COMPILER_CONCEPTS.md) - Best-in-class concepts borrowed from Go, Zig, Erlang, LuaJIT, and Rust.
-- [`MEMORY_AND_RUNTIME_SYSTEM.md`](file:///home/actes/projects/slop/omniscript/docs/MEMORY_AND_RUNTIME_SYSTEM.md) - UMO normalizer, autonomous borrow checking & runtime shims.
-- [`GARBAGE_COLLECTORLESS_STRATEGY.md`](file:///home/actes/projects/slop/omniscript/docs/GARBAGE_COLLECTORLESS_STRATEGY.md) - Four pillars eliminating tracing GC.
-- [`DEPENDENCY_AND_IMPORT_SYSTEM.md`](file:///home/actes/projects/slop/omniscript/docs/DEPENDENCY_AND_IMPORT_SYSTEM.md) - Polyglot imports, preamble symbol carving, and Go un-caging.
-- [`SYNTAX_SPEC_AND_EXAMPLES.md`](file:///home/actes/projects/slop/omniscript/docs/SYNTAX_SPEC_AND_EXAMPLES.md) - Pythonic class baseline, omnivorous syntax, and EBNF grammar.
-- [`MODEL_PIPELINE_AND_DISTILLATION.md`](file:///home/actes/projects/slop/omniscript/docs/MODEL_PIPELINE_AND_DISTILLATION.md) - Teacher-student distillation, directional abliteration, and embedded execution.
-- [`POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md`](file:///home/actes/projects/slop/omniscript/docs/POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md) - Cross-language quirks analysis and lexical canonicalization.
+- [`GAMEPLAN.md`](./GAMEPLAN.md) - Master architecture & phase roadmap.
+- [`MN_CONCURRENCY_AND_FIBER_RUNTIME.md`](./MN_CONCURRENCY_AND_FIBER_RUNTIME.md) - Go-style M:N fiber scheduler, cross-platform register swapping (`swap_g_context`), and zero-GC fiber task arenas.
+- [`PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md`](./PHYSICAL_SOURCE_ANCHORING_AND_INTERPRETIVE_IR.md) - Bi-directional Interpretive Anchors, 3 static contract passes, and sub-2B dual grounding.
+- [`STOLEN_COMPILER_CONCEPTS.md`](./STOLEN_COMPILER_CONCEPTS.md) - Best-in-class concepts borrowed from Go, Zig, Erlang, LuaJIT, and Rust.
+- [`MEMORY_AND_RUNTIME_SYSTEM.md`](./MEMORY_AND_RUNTIME_SYSTEM.md) - UMO normalizer, autonomous borrow checking & runtime shims.
+- [`GARBAGE_COLLECTORLESS_STRATEGY.md`](./GARBAGE_COLLECTORLESS_STRATEGY.md) - Four pillars eliminating tracing GC.
+- [`DEPENDENCY_AND_IMPORT_SYSTEM.md`](./DEPENDENCY_AND_IMPORT_SYSTEM.md) - Polyglot imports, preamble symbol carving, and Go un-caging.
+- [`SYNTAX_SPEC_AND_EXAMPLES.md`](./SYNTAX_SPEC_AND_EXAMPLES.md) - Pythonic class baseline, omnivorous syntax, and EBNF grammar.
+- [`MODEL_PIPELINE_AND_DISTILLATION.md`](./MODEL_PIPELINE_AND_DISTILLATION.md) - Teacher-student distillation, directional abliteration, and embedded execution.
+- [`POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md`](./POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md) - Cross-language quirks analysis and lexical canonicalization.

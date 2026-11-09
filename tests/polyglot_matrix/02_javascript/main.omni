@@ -1,0 +1,4 @@
+import 'javascript' risk_service
+
+res = risk_service.evaluate_risk(10, 20, 3)
+print(f"Evaluated JS risk: {}", res)

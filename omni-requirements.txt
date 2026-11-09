@@ -1,0 +1,5 @@
+# OmniScript Unified Polyglot Manifest
+'rust' strsim = "0.11.1"
+'maven' org.json:json == 20240303
+'nuget' Newtonsoft.Json == 13.0.3
+[git]'rust' https://github.com/dtolnay/anyhow.git#1.0.86

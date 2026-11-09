@@ -1,0 +1,8 @@
+import 'jvm' BytecodeService
+
+sum = BytecodeService.add(40, 2)
+ratio = BytecodeService.compute_ratio(50, 5)
+
+print("In-the-wild JVM bytecode (.class) transcription test passed!")
+print(f"BytecodeService.add(40, 2): {}", sum)
+print(f"BytecodeService.compute_ratio(50, 5): {}", ratio)

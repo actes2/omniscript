@@ -1,0 +1,5 @@
+import 'python' metrics
+import 'python' time
+
+val = metrics.calculate_metric(3, 2)
+print(f"Calculated Python metric: {}", val)

@@ -1,0 +1,37 @@
+class Counter:
+    def __init__(self, start):
+        self.val = start
+        self.step = 2
+
+    def increment(self, amount):
+        self.val = self.val + (amount * self.step)
+        return self.val
+
+class ScopedResource:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __enter__(self):
+        print("Entering ScopedResource context")
+        return self.tag
+
+    def __exit__(self):
+        print("Exiting ScopedResource context (RAII cleanup executed)")
+        return 0
+
+    def compute(self, bonus):
+        return self.tag + bonus
+
+def main():
+    c = Counter(10)
+    v1 = c.increment(5)
+    print(f"Counter after increment: {}", v1)
+    step_val = c.step
+    print(f"Direct field read c.step: {}", step_val)
+
+    with ScopedResource(100) as res:
+        out = res.compute(42)
+        print(f"Computed inside context: {}", out)
+
+    print("Post context manager execution completed!")
+    return 0

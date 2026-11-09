@@ -1,0 +1,26 @@
+// OmniScript Native Rust Application with Third-Party Dependencies
+use 'rust' fast_math
+
+fn rotate_hash(seed: i64, rounds: i64) -> i64 {
+    let mut acc: i64 = seed
+    for i in range(rounds) {
+        acc = acc * 31 + 17
+    }
+    return acc
+}
+
+fn main() {
+    println!("=== OmniScript Native Rust Polyglot Runner ===")
+
+    // 1. Rust-style typed variables and function invocation
+    let seed: i64 = 42
+    let checksum: i64 = rotate_hash(seed, 4)
+    println!("Computed seed hash: {}", checksum)
+
+    // 2. Third-party dependency invocation carved directly from Rust crate
+    let card_num: i64 = 7992739871
+    let luhn_digit: i64 = fast_math.compute_luhn(card_num)
+    println!("Luhn checksum from fast_math crate: {}", luhn_digit)
+
+    println!("Rust application successfully compiled and executed!")
+}

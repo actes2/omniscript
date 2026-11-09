@@ -7,6 +7,13 @@
 *.orig
 .venv/
 *_bin
+*.exe
 a.out
 result
 models/*.gguf
+models/*.tmp
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+

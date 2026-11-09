@@ -1,0 +1,10 @@
+import 'csharp' OrderEngine
+import 'csharp' RiskCalculator
+
+subtotal = OrderEngine.ComputeSubtotal(10, 50)
+discounted = OrderEngine.ApplyDiscount(subtotal, 75)
+margin = RiskCalculator.EvaluateMargin(discounted, 300)
+
+print(f"C# Subtotal: {}", subtotal)
+print(f"C# Discounted: {}", discounted)
+print(f"C# Margin: {}", margin)

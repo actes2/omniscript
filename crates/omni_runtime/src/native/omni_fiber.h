@@ -12,8 +12,10 @@
 
 typedef struct OmniFiber {
     void* rsp;                  // Current stack pointer (offset 0 for assembly)
-    void* stack_base;
-    size_t stack_size;
+    void* stack_base;           // Usable stack base (above guard page)
+    size_t stack_size;          // Usable stack size
+    size_t total_mmap_size;     // Total mapped size including guard page
+    size_t guard_page_size;     // Guard page size
     OmniArena* arena;           // Fiber-local Task Arena
     int status;
     void (*entry)(void*);
@@ -27,5 +29,6 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
 void __omni_fiber_yield(void);
 void __omni_fiber_destroy(OmniFiber* fiber);
 void __omni_go_spawn(void (*entry)(void*), void* arg);
+void* __omni_fiber_run_on_main_stack(void* (*fn)(void*), void* arg);
 
 #endif // OMNI_FIBER_H

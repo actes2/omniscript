@@ -1,0 +1,5 @@
+import 'c' zlib
+
+bound = zlib.compressBound(1000)
+print("In-the-wild C zlib shared library test passed!")
+print(f"Calculated zlib compressBound for 1000 bytes: {}", bound)

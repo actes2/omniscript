@@ -1,0 +1,40 @@
+// OmniScript Pure Rust Parity: Structs, Inherent Impl, Tagged Enums, and Pattern Matching
+struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+
+impl Point {
+    pub fn norm_squared(&self) -> i64 {
+        return self.x * self.x + self.y * self.y;
+    }
+}
+
+enum Status {
+    Pending,
+    Active,
+    Completed(i64),
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    let norm = p.norm_squared();
+    print("Point norm squared:");
+    print(norm);
+
+    let s = Status::Completed(42);
+    match s {
+        Status::Pending => {
+            print("Status is Pending");
+        }
+        Status::Active => {
+            print("Status is Active");
+        }
+        Status::Completed(val) => {
+            print("Status is Completed with payload:");
+            print(val);
+        }
+    }
+
+    print("Rust structs and tagged enums parity verified successfully!");
+}

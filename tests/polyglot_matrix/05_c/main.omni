@@ -1,0 +1,5 @@
+import 'c' c_math
+
+sum = c_math.c_add(15, 25)
+scaled = c_math.c_scale(sum, 2)
+print(f"C scaled sum: {}", scaled)

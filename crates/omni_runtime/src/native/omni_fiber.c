@@ -2,6 +2,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#define OMNI_HAS_WIN32_VM 1
+#elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#define OMNI_HAS_MMAP 1
+#endif
+
 static OmniFiber* g_current_fiber = NULL;
 static OmniFiber g_main_fiber = {0};
 static OmniFiber* g_dead_fibers = NULL;
@@ -27,8 +36,29 @@ __attribute__((naked)) static void swap_g_context(void** from_rsp, void* to_rsp)
         "retq\n\t"
     );
 }
+#elif defined(__aarch64__)
+__attribute__((naked)) static void swap_g_context(void** from_rsp, void* to_rsp) {
+    __asm__ volatile (
+        "stp x19, x20, [sp, #-16]!\n\t"
+        "stp x21, x22, [sp, #-16]!\n\t"
+        "stp x23, x24, [sp, #-16]!\n\t"
+        "stp x25, x26, [sp, #-16]!\n\t"
+        "stp x27, x28, [sp, #-16]!\n\t"
+        "stp x29, x30, [sp, #-16]!\n\t"
+        "mov x2, sp\n\t"
+        "str x2, [x0]\n\t"
+        "mov sp, x1\n\t"
+        "ldp x29, x30, [sp], #16\n\t"
+        "ldp x27, x28, [sp], #16\n\t"
+        "ldp x25, x26, [sp], #16\n\t"
+        "ldp x23, x24, [sp], #16\n\t"
+        "ldp x21, x22, [sp], #16\n\t"
+        "ldp x19, x20, [sp], #16\n\t"
+        "ret\n\t"
+    );
+}
 #else
-// Fallback stub for architectures without naked asm inline
+// Fallback stub for environments without direct naked asm inline
 static void swap_g_context(void** from_rsp, void* to_rsp) {
     (void)from_rsp;
     (void)to_rsp;
@@ -84,29 +114,71 @@ static void fiber_entry_stub(void) {
 OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_size) {
     __omni_fiber_init();
 
-    if (stack_size < 16384) {
-        stack_size = 16384; // 16 KB default
+    size_t page_size = 4096;
+#if defined(OMNI_HAS_MMAP)
+    long sc_page = sysconf(_SC_PAGESIZE);
+    if (sc_page > 0) page_size = (size_t)sc_page;
+#endif
+
+    // Minimum 64 KB for foreign FFI and nested calls
+    if (stack_size < 65536) {
+        stack_size = 65536;
     }
+    // Align stack_size to page boundary
+    stack_size = (stack_size + page_size - 1) & ~(page_size - 1);
+    size_t total_mmap_size = stack_size + page_size; // +1 guard page at the bottom
 
     OmniFiber* fiber = (OmniFiber*)malloc(sizeof(OmniFiber));
     if (!fiber) return NULL;
 
+#if defined(OMNI_HAS_WIN32_VM)
+    void* vm_base = VirtualAlloc(NULL, total_mmap_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!vm_base) {
+        free(fiber);
+        return NULL;
+    }
+    DWORD old_protect;
+    VirtualProtect(vm_base, page_size, PAGE_NOACCESS, &old_protect);
+
+    fiber->stack_base = (char*)vm_base + page_size;
+    fiber->stack_size = stack_size;
+    fiber->total_mmap_size = total_mmap_size;
+    fiber->guard_page_size = page_size;
+#elif defined(OMNI_HAS_MMAP)
+    void* mmap_base = mmap(NULL, total_mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mmap_base == MAP_FAILED) {
+        free(fiber);
+        return NULL;
+    }
+    // Bottom page is PROT_NONE hardware guard page
+    mprotect(mmap_base, page_size, PROT_NONE);
+
+    fiber->stack_base = (char*)mmap_base + page_size;
+    fiber->stack_size = stack_size;
+    fiber->total_mmap_size = total_mmap_size;
+    fiber->guard_page_size = page_size;
+#else
     fiber->stack_base = malloc(stack_size);
     if (!fiber->stack_base) {
         free(fiber);
         return NULL;
     }
     fiber->stack_size = stack_size;
+    fiber->total_mmap_size = 0;
+    fiber->guard_page_size = 0;
+#endif
+
     fiber->arena = __omni_arena_create(32 * 1024); // 32 KB Task Arena per fiber
     fiber->status = OMNI_FIBER_RUNNABLE;
     fiber->entry = entry;
     fiber->arg = arg;
     fiber->next = NULL;
 
-    // 16-byte aligned stack top for System V x86_64 ABI
+    // 16-byte aligned stack top for AAPCS64 / System V x86_64 ABI
     uintptr_t stack_top = (uintptr_t)fiber->stack_base + stack_size;
     stack_top &= ~((uintptr_t)15);
 
+#if defined(__x86_64__)
     // To satisfy System V AMD64 ABI:
     // At function entry (immediately following a `call` instruction which pushes 8 bytes),
     // (%rsp + 8) % 16 == 0.
@@ -122,8 +194,27 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
     *(--sp) = 0;                          // r12
     *(--sp) = 0;                          // rbx
     *(--sp) = 0;                          // rbp
-
     fiber->rsp = (void*)sp;
+#elif defined(__aarch64__)
+    // AAPCS64: 12 callee-saved registers (x19-x30) = 96 bytes (aligned to 16 bytes).
+    // x30 is the Link Register (return address for ret instruction).
+    uint64_t* sp = (uint64_t*)stack_top;
+    *(--sp) = (uint64_t)fiber_entry_stub; // x30 (lr)
+    *(--sp) = 0;                          // x29 (fp)
+    *(--sp) = 0;                          // x28
+    *(--sp) = 0;                          // x27
+    *(--sp) = 0;                          // x26
+    *(--sp) = 0;                          // x25
+    *(--sp) = 0;                          // x24
+    *(--sp) = 0;                          // x23
+    *(--sp) = 0;                          // x22
+    *(--sp) = 0;                          // x21
+    *(--sp) = 0;                          // x20
+    *(--sp) = 0;                          // x19
+    fiber->rsp = (void*)sp;
+#else
+    fiber->rsp = (void*)stack_top;
+#endif
     return fiber;
 }
 
@@ -144,12 +235,35 @@ void __omni_fiber_destroy(OmniFiber* fiber) {
             __omni_arena_destroy(fiber->arena);
             fiber->arena = NULL;
         }
+#if defined(OMNI_HAS_WIN32_VM)
+        if (fiber->total_mmap_size > 0 && fiber->stack_base) {
+            void* vm_base = (char*)fiber->stack_base - fiber->guard_page_size;
+            VirtualFree(vm_base, 0, MEM_RELEASE);
+            fiber->stack_base = NULL;
+        }
+#elif defined(OMNI_HAS_MMAP)
+        if (fiber->total_mmap_size > 0 && fiber->stack_base) {
+            void* mmap_base = (char*)fiber->stack_base - fiber->guard_page_size;
+            munmap(mmap_base, fiber->total_mmap_size);
+            fiber->stack_base = NULL;
+        }
+#else
         if (fiber->stack_base) {
             free(fiber->stack_base);
             fiber->stack_base = NULL;
         }
+#endif
         free(fiber);
     }
+}
+
+void* __omni_fiber_run_on_main_stack(void* (*fn)(void*), void* arg) {
+    // If already running on OS thread / main stack, execute directly
+    if (!__omni_fiber_is_in_fiber()) {
+        return fn(arg);
+    }
+    // Otherwise execute the foreign call (future: can pivot rsp to host thread stack)
+    return fn(arg);
 }
 
 void __omni_go_spawn(void (*entry)(void*), void* arg) {

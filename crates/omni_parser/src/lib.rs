@@ -8,8 +8,29 @@ pub struct OmniModule {
     pub name: String,
     pub imports: Vec<ImportDirective>,
     pub structs_and_classes: Vec<ClassDef>,
+    pub enums: Vec<EnumDef>,
     pub functions: Vec<FunctionDef>,
     pub top_level_statements: Vec<Statement>,
+    pub base_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnumVariant {
+    pub name: String,
+    pub tag: usize,
+    pub payload_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: String,
+    pub body: Vec<Statement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,10 +49,21 @@ pub struct FieldDef {
     pub default_val: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotationDef {
+    /// Raw polyglot decorator/annotation syntax (e.g. `@app.route("/")`, `#[inline(always)]`, `@GetMapping("/api")`)
+    pub raw_syntax: String,
+    /// Target callable or attribute path (e.g. `app.route`, `inline`, `GetMapping`)
+    pub target_expr: String,
+    /// Parsed argument expressions passed to the annotation
+    pub arguments: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionDef {
     pub name: String,
     pub is_method: bool,
+    pub annotations: Vec<AnnotationDef>,
     pub params: Vec<ParamDef>,
     pub return_type: Option<String>,
     pub body: Vec<Statement>,
@@ -88,6 +120,11 @@ pub enum Statement {
     Return {
         expr: Option<String>,
     },
+    /// Pattern matching: `match expr { Variant => stmt, ... }`
+    Match {
+        target: String,
+        arms: Vec<MatchArm>,
+    },
     /// Explicit Unified Memory Operation embedded in statement sequence
     MemOp {
         op: UnifiedMemOp,
@@ -110,6 +147,12 @@ pub enum Statement {
         target: Option<String>,
         channel: String,
         is_scoped_decl: bool,
+    },
+    /// Native Pythonic context manager: `with Expr() as var:` or `with Expr():`
+    WithContext {
+        context_expr: String,
+        var_alias: Option<String>,
+        body: Vec<Statement>,
     },
     /// Polyglot List / Slice creation: `items = [10, 20, 30]`, `items := []`
     ListInit {
@@ -152,6 +195,11 @@ pub enum Statement {
         physical_source: String,
         idiom: IdiomFamily,
     },
+    /// First-class polyglot annotation / decorator binding applied to a function or class symbol
+    AnnotationBinding {
+        target_symbol: String,
+        annotation: AnnotationDef,
+    },
     /// Fallback concrete or polyglot statement
     Concrete {
         code: String,
@@ -170,6 +218,7 @@ pub struct OmniParser {
     c_for_re: Regex,
     print_re: Regex,
     return_re: Regex,
+    with_re: Regex,
     walrus_assign_re: Regex,
     assign_re: Regex,
     make_chan_re: Regex,
@@ -188,11 +237,69 @@ impl Default for OmniParser {
 }
 
 impl OmniParser {
+    pub fn clean_param_name(p: &str) -> String {
+        let p_trimmed = p.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        if p_trimmed == "self" {
+            return "self".to_string();
+        }
+        if let Some(pos) = p_trimmed.find(':') {
+            return p_trimmed[..pos]
+                .trim()
+                .split_whitespace()
+                .last()
+                .unwrap_or(p_trimmed)
+                .to_string();
+        }
+        let parts: Vec<&str> = p_trimmed.split_whitespace().collect();
+        if parts.len() <= 1 {
+            return p_trimmed.to_string();
+        }
+        let known_types = [
+            "int", "int32", "int64", "long", "float", "double", "bool", "boolean",
+            "string", "String", "i32", "i64", "f32", "f64", "u32", "u64", "usize",
+            "isize", "byte", "char*", "auto",
+        ];
+        if known_types.contains(&parts[0]) {
+            return parts.last().unwrap_or(&parts[0]).to_string();
+        }
+        if known_types.contains(&parts[parts.len() - 1]) {
+            return parts[0].to_string();
+        }
+        parts.last().unwrap_or(&parts[0]).to_string()
+    }
+
+    pub fn parse_param(p: &str) -> ParamDef {
+        let p_trimmed = p.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        if p_trimmed == "self" {
+            return ParamDef {
+                name: "self".to_string(),
+                type_hint: Some("&self".to_string()),
+            };
+        }
+        if let Some(pos) = p_trimmed.find(':') {
+            let name = p_trimmed[..pos]
+                .trim()
+                .split_whitespace()
+                .last()
+                .unwrap_or(p_trimmed)
+                .to_string();
+            let hint = p_trimmed[pos + 1..].trim().to_string();
+            return ParamDef {
+                name,
+                type_hint: Some(hint),
+            };
+        }
+        ParamDef {
+            name: Self::clean_param_name(p),
+            type_hint: None,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
-            // Matches def foo():, int foo() {, fn foo() -> i32 {, func foo() {, function foo() {
+            // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++
             fn_re: Regex::new(
-                r#"^(?:def|fn|func|function|(?:(?:int|int32|int64|float|double|bool|void|char\*|auto)\s+))\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub)\s+)?(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String)\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*|[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -218,48 +325,53 @@ impl OmniParser {
                 r#"^for\s*\(\s*(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s*=\s*0\s*;\s*[a-zA-Z_0-9]+\s*<\s*(.+?)\s*;\s*[^)]*\)\s*(?::|\{)?$"#,
             )
             .unwrap(),
-            print_re: Regex::new(r#"^print\s*\(\s*(.*)\s*\)$"#).unwrap(),
-            return_re: Regex::new(r#"^return(?:\s+(.*))?$"#).unwrap(),
+            print_re: Regex::new(
+                r#"^(?:print|println!|console\.log|fmt\.Println|puts)\s*\(\s*(.*)\s*\)\s*;?$"#,
+            )
+            .unwrap(),
+            return_re: Regex::new(r#"^return(?:\s+(.*?))?\s*;?$"#).unwrap(),
+            // Matches with Resource() as r:, with Mutex():
+            with_re: Regex::new(r#"^with\s+(.*?)(?:\s+as\s+([a-zA-Z_0-9]+))?\s*(?::|\{)?$"#).unwrap(),
             // Go scoped declaration: count := 0
-            walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+)$"#).unwrap(),
-            // Matches x = 5, int x = 0, let count = 10, var y = 2
+            walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+?)\s*;?$"#).unwrap(),
+            // Matches x = 5, int x = 0, let count = 10, let mut acc = 20, let total: i64 = 0, self.val = 20, var y = 2
             assign_re: Regex::new(
-                r#"^(?:(let|var|int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+)\s*=\s*(.+)$"#,
+                r#"^(?:(let(?:\s+mut)?|const|var|int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>]+)?\s*=\s*(.+?)\s*;?$"#,
             )
             .unwrap(),
             // Matches ch := make(chan int, 8), ch = Channel(10), let ch = Chan(4)
             make_chan_re: Regex::new(
-                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*(?:make\s*\(\s*chan\s+[a-zA-Z_0-9*]+\s*(?:,\s*([0-9]+))?\s*\)|(?:Channel|Chan)\s*\(\s*([0-9]+)?\s*\))$"#,
+                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*(?:make\s*\(\s*chan\s+[a-zA-Z_0-9*]+\s*(?:,\s*([0-9]+))?\s*\)|(?:Channel|Chan)\s*\(\s*([0-9]+)?\s*\))\s*;?$"#,
             )
             .unwrap(),
             // Matches ch <- 42, out_chan.send(val)
             chan_send_re: Regex::new(
-                r#"^(?:([a-zA-Z_0-9]+)\s+<-\s+(.+)|([a-zA-Z_0-9]+)\.send\s*\(\s*(.+)\s*\))$"#,
+                r#"^(?:([a-zA-Z_0-9]+)\s+<-\s+(.+)|([a-zA-Z_0-9]+)\.send\s*\(\s*(.+)\s*\))\s*;?$"#,
             )
             .unwrap(),
             // Matches val := <-ch, val = <-ch, val = ch.recv(), <-ch
             chan_recv_re: Regex::new(
-                r#"^(?:(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))$"#,
+                r#"^(?:(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))\s*;?$"#,
             )
             .unwrap(),
-            // Matches items = [10, 20, 30], items := []
+            // Matches items = [10, 20, 30], items := [], const items = [1, 2]
             list_init_re: Regex::new(
-                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\[(.*)\]$"#,
+                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\[(.*)\]\s*;?$"#,
             )
             .unwrap(),
             // Matches items.append(40), items.push(50)
             list_append_re: Regex::new(
-                r#"^([a-zA-Z_0-9]+)\.(?:append|push)\s*\(\s*(.+)\s*\)$"#,
+                r#"^([a-zA-Z_0-9]+)\.(?:append|push)\s*\(\s*(.+)\s*\)\s*;?$"#,
             )
             .unwrap(),
             // Matches items[0] = 99, m["key"] = 10
             index_set_re: Regex::new(
-                r#"^([a-zA-Z_0-9]+)\[(.+?)\]\s*=\s*(.+)$"#,
+                r#"^([a-zA-Z_0-9]+)\[(.+?)\]\s*=\s*(.+?)\s*;?$"#,
             )
             .unwrap(),
             // Matches m = {"alice": 100, "bob": 200}, m := {}
             map_init_re: Regex::new(
-                r#"^(?:(let|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\{(.*)\}$"#,
+                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\{(.*)\}\s*;?$"#,
             )
             .unwrap(),
         }
@@ -315,6 +427,13 @@ impl OmniParser {
     /// and increments (`i++`) into hierarchical canonical AST lines.
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
+        let base_indent = source
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| Self::indent_level(l))
+            .min()
+            .unwrap_or(0);
+
         let raw_lines = source.lines();
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
@@ -323,7 +442,16 @@ impl OmniParser {
         let dec_re = Regex::new(r#"^([a-zA-Z_0-9]+)\-\-$"#).unwrap();
         let postfix_if_re = Regex::new(r#"^(.*?)\s+if\s+(.*)$"#).unwrap();
 
-        for line in raw_lines {
+        for raw_line in raw_lines {
+            let line = if base_indent > 0
+                && raw_line.len() >= base_indent
+                && raw_line[..base_indent].trim().is_empty()
+            {
+                &raw_line[base_indent..]
+            } else {
+                raw_line
+            };
+
             let mut trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -412,14 +540,64 @@ impl OmniParser {
         line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
     }
 
+    /// Parse a polyglot decorator / annotation / attribute line (`@expr`, `#[attr]`, `[Attr]`)
+    /// into a structured `AnnotationDef` without framework-specific assumptions.
+    pub fn parse_annotation_line(trimmed: &str) -> Option<AnnotationDef> {
+        let inner = if let Some(s) = trimmed.strip_prefix('@') {
+            s.trim()
+        } else if trimmed.starts_with("#[") && trimmed.ends_with(']') {
+            trimmed[2..trimmed.len() - 1].trim()
+        } else if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+            trimmed[2..trimmed.len() - 2].trim()
+        } else {
+            return None;
+        };
+
+        if inner.is_empty() {
+            return None;
+        }
+
+        let (target_expr, arguments) = if let Some(lp) = inner.find('(') {
+            let rp = inner.rfind(')').unwrap_or(inner.len());
+            let head = inner[..lp].trim().to_string();
+            let args_raw = inner[lp + 1..rp].trim();
+            let args = if args_raw.is_empty() {
+                Vec::new()
+            } else {
+                Self::split_respecting_quotes(args_raw, ',')
+            };
+            (head, args)
+        } else {
+            (inner.to_string(), Vec::new())
+        };
+
+        Some(AnnotationDef {
+            raw_syntax: trimmed.to_string(),
+            target_expr,
+            arguments,
+        })
+    }
+
     /// Parse an OmniScript source string into an `OmniModule`
     pub fn parse_module(&self, module_name: &str, raw_source: &str) -> OmniModule {
+        self.parse_module_with_dir(module_name, raw_source, None)
+    }
+
+    /// Parse an OmniScript source string with explicit base directory context
+    pub fn parse_module_with_dir(
+        &self,
+        module_name: &str,
+        raw_source: &str,
+        base_dir: Option<&std::path::Path>,
+    ) -> OmniModule {
         let source = Self::canonicalize_source(raw_source);
         let mem_norm = MemoryNormalizer::new();
         let mut imports = Vec::new();
         let mut functions = Vec::new();
         let mut classes = Vec::new();
+        let mut enums = Vec::new();
         let mut top_level = Vec::new();
+        let mut top_level_lines: Vec<(usize, String)> = Vec::new();
 
         let raw_lines: Vec<&str> = source.lines().collect();
         let mut idx = 0;
@@ -434,19 +612,277 @@ impl OmniParser {
                 continue;
             }
 
-            // Decorators
-            if trimmed.starts_with('@') {
+            // Decorators / Annotations / Attributes (`@...`, `#[...]`, `[[...]]`)
+            if trimmed.starts_with('@')
+                || (trimmed.starts_with("#[") && trimmed.ends_with(']'))
+                || (trimmed.starts_with("[[") && trimmed.ends_with("]]"))
+            {
                 current_decorators.push(trimmed.to_string());
                 idx += 1;
                 continue;
             }
 
             // Import directives
-            if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
+            if trimmed.starts_with("import ") || trimmed.starts_with("from ") || trimmed.starts_with("use ") {
                 if let Some(directive) = omni_preamble::SymbolCarver::parse_directive(trimmed) {
                     imports.push(directive);
                 }
                 idx += 1;
+                continue;
+            }
+
+            // Struct definitions: `struct Point { ... }` or `pub struct Point { ... }`
+            let is_struct = trimmed.starts_with("struct ")
+                || trimmed.starts_with("pub struct ")
+                || trimmed.starts_with("pub(crate) struct ");
+            if is_struct {
+                let after_struct = if let Some(pos) = trimmed.find("struct ") {
+                    &trimmed[pos + 7..]
+                } else {
+                    trimmed
+                };
+                let struct_name = after_struct
+                    .split(|c: char| c == '{' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                let mut class_fields = Vec::new();
+                let parent_indent = Self::indent_level(line);
+
+                if trimmed.contains('{') && trimmed.contains('}') {
+                    if let Some(open) = trimmed.find('{') {
+                        if let Some(close) = trimmed.rfind('}') {
+                            let inner = &trimmed[open + 1..close];
+                            for field_part in inner.split(',') {
+                                let f_trim = field_part.trim().trim_start_matches("pub ").trim();
+                                if let Some((f_name, f_type)) = f_trim.split_once(':') {
+                                    class_fields.push(FieldDef {
+                                        name: f_name.trim().to_string(),
+                                        type_hint: Some(f_type.trim().to_string()),
+                                        default_val: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    idx += 1;
+                } else {
+                    idx += 1;
+                    while idx < raw_lines.len() {
+                        let next_line = raw_lines[idx];
+                        let next_trimmed = next_line.trim();
+
+                        if next_trimmed.is_empty() || next_trimmed.starts_with('#') || next_trimmed.starts_with("//") {
+                            idx += 1;
+                            continue;
+                        }
+
+                        if next_trimmed == "}" || next_trimmed.starts_with("};") {
+                            idx += 1;
+                            break;
+                        }
+
+                        let cur_indent = Self::indent_level(next_line);
+                        if cur_indent <= parent_indent && !next_trimmed.contains(':') {
+                            break;
+                        }
+
+                        let f_trim = next_trimmed.trim_end_matches(',').trim().trim_start_matches("pub ").trim();
+                        if let Some((f_name, f_type)) = f_trim.split_once(':') {
+                            class_fields.push(FieldDef {
+                                name: f_name.trim().to_string(),
+                                type_hint: Some(f_type.trim().to_string()),
+                                default_val: None,
+                            });
+                        }
+
+                        idx += 1;
+                    }
+                }
+
+                classes.push(ClassDef {
+                    name: struct_name,
+                    decorators: current_decorators.clone(),
+                    base_classes: Vec::new(),
+                    fields: class_fields,
+                    methods: Vec::new(),
+                });
+                current_decorators.clear();
+                continue;
+            }
+
+            // Inherent impl blocks: `impl Point { ... }`
+            if trimmed.starts_with("impl ") {
+                let impl_line = trimmed.trim_start_matches("impl ").trim_end_matches('{').trim();
+                let struct_name = impl_line.split_whitespace().next().unwrap_or("").to_string();
+
+                let parent_indent = Self::indent_level(line);
+                idx += 1;
+
+                let mut impl_methods = Vec::new();
+
+                while idx < raw_lines.len() {
+                    let next_line = raw_lines[idx];
+                    let next_trimmed = next_line.trim();
+
+                    if next_trimmed.is_empty() || next_trimmed.starts_with('#') || next_trimmed.starts_with("//") {
+                        idx += 1;
+                        continue;
+                    }
+
+                    if next_trimmed == "}" {
+                        idx += 1;
+                        break;
+                    }
+
+                    let cur_indent = Self::indent_level(next_line);
+                    if cur_indent <= parent_indent && !next_trimmed.starts_with("fn ") && !next_trimmed.starts_with("pub fn ") {
+                        break;
+                    }
+
+                    if let Some(caps) = self.fn_re.captures(next_trimmed) {
+                        let method_name = caps[1].to_string();
+                        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let params: Vec<ParamDef> = raw_params
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|p| Self::parse_param(p))
+                            .collect();
+                        let method_indent = cur_indent;
+                        idx += 1;
+
+                        let mut method_lines = Vec::new();
+                        while idx < raw_lines.len() {
+                            let m_line = raw_lines[idx];
+                            let m_trimmed = m_line.trim();
+                            if m_trimmed.is_empty() {
+                                idx += 1;
+                                continue;
+                            }
+                            if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                                idx += 1;
+                                break;
+                            }
+                            let m_indent = Self::indent_level(m_line);
+                            if m_indent > method_indent {
+                                method_lines.push((m_indent, m_trimmed.to_string()));
+                                idx += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let body = self.parse_block(&method_lines, &method_name, &mem_norm);
+                        let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                        let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
+
+                        impl_methods.push(FunctionDef {
+                            name: method_name,
+                            is_method: true,
+                            annotations: Vec::new(),
+                            params,
+                            return_type: None,
+                            body,
+                            memory_ops,
+                        });
+                        continue;
+                    }
+
+                    idx += 1;
+                }
+
+                if let Some(existing) = classes.iter_mut().find(|c| c.name == struct_name) {
+                    existing.methods.extend(impl_methods);
+                } else {
+                    classes.push(ClassDef {
+                        name: struct_name,
+                        decorators: Vec::new(),
+                        base_classes: Vec::new(),
+                        fields: Vec::new(),
+                        methods: impl_methods,
+                    });
+                }
+                continue;
+            }
+
+            // Enum definitions: `enum Status { ... }` or `pub enum Status { ... }`
+            let is_enum = trimmed.starts_with("enum ")
+                || trimmed.starts_with("pub enum ")
+                || trimmed.starts_with("pub(crate) enum ");
+            if is_enum {
+                let after_enum = if let Some(pos) = trimmed.find("enum ") {
+                    &trimmed[pos + 5..]
+                } else {
+                    trimmed
+                };
+                let enum_name = after_enum
+                    .split(|c: char| c == '{' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                let mut variants = Vec::new();
+                let mut tag = 0;
+                let parent_indent = Self::indent_level(line);
+
+                if trimmed.contains('{') && trimmed.contains('}') {
+                    if let Some(open) = trimmed.find('{') {
+                        if let Some(close) = trimmed.rfind('}') {
+                            let inner = &trimmed[open + 1..close];
+                            for var_part in inner.split(',') {
+                                let v_trim = var_part.trim();
+                                if v_trim.is_empty() { continue; }
+                                let (v_name, p_type) = if let Some((n, rest)) = v_trim.split_once('(') {
+                                    (n.trim().to_string(), Some(rest.trim_end_matches(')').trim().to_string()))
+                                } else {
+                                    (v_trim.to_string(), None)
+                                };
+                                variants.push(EnumVariant { name: v_name, tag, payload_type: p_type });
+                                tag += 1;
+                            }
+                        }
+                    }
+                    idx += 1;
+                } else {
+                    idx += 1;
+                    while idx < raw_lines.len() {
+                        let next_line = raw_lines[idx];
+                        let next_trimmed = next_line.trim();
+                        if next_trimmed.is_empty() || next_trimmed.starts_with('#') || next_trimmed.starts_with("//") {
+                            idx += 1;
+                            continue;
+                        }
+                        if next_trimmed == "}" || next_trimmed.starts_with("};") {
+                            idx += 1;
+                            break;
+                        }
+                        let cur_indent = Self::indent_level(next_line);
+                        if cur_indent <= parent_indent && !next_trimmed.contains(',') {
+                            break;
+                        }
+                        for var_part in next_trimmed.split(',') {
+                            let v_trim = var_part.trim();
+                            if v_trim.is_empty() { continue; }
+                            let (v_name, p_type) = if let Some((n, rest)) = v_trim.split_once('(') {
+                                (n.trim().to_string(), Some(rest.trim_end_matches(')').trim().to_string()))
+                            } else {
+                                (v_trim.to_string(), None)
+                            };
+                            variants.push(EnumVariant { name: v_name, tag, payload_type: p_type });
+                            tag += 1;
+                        }
+                        idx += 1;
+                    }
+                }
+
+                enums.push(EnumDef {
+                    name: enum_name,
+                    variants,
+                });
                 continue;
             }
 
@@ -489,6 +925,13 @@ impl OmniParser {
 
                     if let Some(caps) = self.fn_re.captures(next_trimmed) {
                         let method_name = caps[1].to_string();
+                        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let params: Vec<ParamDef> = raw_params
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|p| Self::parse_param(p))
+                            .collect();
                         let method_indent = cur_indent;
                         idx += 1;
 
@@ -516,7 +959,8 @@ impl OmniParser {
                         class_methods.push(FunctionDef {
                             name: method_name,
                             is_method: true,
-                            params: Vec::new(),
+                            annotations: Vec::new(),
+                            params,
                             return_type: None,
                             body,
                             memory_ops,
@@ -534,6 +978,24 @@ impl OmniParser {
                     }
 
                     idx += 1;
+                }
+
+                // Auto-discover dynamically assigned instance fields in methods (e.g. Python self.val = ...)
+                for m in &class_methods {
+                    for stmt in &m.body {
+                        if let Statement::Assign { target, .. } = stmt {
+                            if let Some(fld) = target.strip_prefix("self.") {
+                                let fld_name = fld.trim().to_string();
+                                if !class_fields.iter().any(|f| f.name == fld_name) {
+                                    class_fields.push(FieldDef {
+                                        name: fld_name,
+                                        type_hint: Some("i64".to_string()),
+                                        default_val: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
 
                 classes.push(ClassDef {
@@ -555,13 +1017,7 @@ impl OmniParser {
                     .split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .map(|p| {
-                        let name = p.split(':').next().unwrap_or(p).trim().split_whitespace().last().unwrap_or(p);
-                        ParamDef {
-                            name: name.to_string(),
-                            type_hint: None,
-                        }
-                    })
+                    .map(|p| Self::parse_param(p))
                     .collect();
 
                 let fn_indent = Self::indent_level(line);
@@ -591,9 +1047,28 @@ impl OmniParser {
                 let raw_joined = block_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
                 let memory_ops = mem_norm.normalize_block(&raw_joined, &fn_name);
 
+                let annotations: Vec<AnnotationDef> = current_decorators
+                    .iter()
+                    .filter_map(|d| Self::parse_annotation_line(d))
+                    .collect();
+
+                for ann in &annotations {
+                    let is_compiler_attr = matches!(
+                        ann.target_expr.as_str(),
+                        "inline" | "alwaysinline" | "noinline" | "cold" | "derive" | "Override"
+                    );
+                    if !is_compiler_attr {
+                        top_level_lines.push((
+                            0,
+                            format!("__omni_annotate__::{}::{}", fn_name, ann.raw_syntax),
+                        ));
+                    }
+                }
+
                 functions.push(FunctionDef {
                     name: fn_name,
                     is_method: false,
+                    annotations,
                     params,
                     return_type: None,
                     body,
@@ -603,12 +1078,32 @@ impl OmniParser {
                 continue;
             }
 
-            // Top-level statement
-            top_level.push(Statement::Concrete {
-                code: trimmed.to_string(),
-                idiom: IdiomFamily::Standard,
-            });
+            // Top-level statement line (preserve indentation for block constructs like top-level if/else/for)
+            top_level_lines.push((Self::indent_level(line), trimmed.to_string()));
             idx += 1;
+        }
+
+        if !top_level_lines.is_empty() {
+            let parsed_top = self.parse_block(&top_level_lines, "main", &mem_norm);
+            let raw_joined = top_level_lines
+                .iter()
+                .map(|(_, s)| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let memory_ops = mem_norm.normalize_block(&raw_joined, "main");
+            top_level = parsed_top.clone();
+
+            if !functions.iter().any(|f| f.name == "main") {
+                functions.push(FunctionDef {
+                    name: "main".to_string(),
+                    is_method: false,
+                    annotations: Vec::new(),
+                    params: Vec::new(),
+                    return_type: None,
+                    body: parsed_top,
+                    memory_ops,
+                });
+            }
         }
 
         // If top-level functions were empty but methods exist, lift methods to top-level functions
@@ -624,8 +1119,10 @@ impl OmniParser {
             name: module_name.to_string(),
             imports,
             structs_and_classes: classes,
+            enums,
             functions,
             top_level_statements: top_level,
+            base_dir: base_dir.map(|p| p.to_path_buf()),
         }
     }
 
@@ -641,6 +1138,90 @@ impl OmniParser {
 
         while i < lines.len() {
             let (indent, ref text) = lines[i];
+            let trimmed_text = text.trim();
+            if trimmed_text.is_empty() || trimmed_text.starts_with("//") || trimmed_text.starts_with('#') || trimmed_text == "}" {
+                i += 1;
+                continue;
+            }
+
+            // 0. First-class polyglot Annotation / Decorator binding (`__omni_annotate__::<fn>::<raw>`)
+            if let Some(rest) = text.strip_prefix("__omni_annotate__::") {
+                if let Some((target_sym, raw_ann)) = rest.split_once("::") {
+                    if let Some(annotation) = Self::parse_annotation_line(raw_ann) {
+                        stmts.push(Statement::AnnotationBinding {
+                            target_symbol: target_sym.to_string(),
+                            annotation,
+                        });
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Pattern Matching: `match expr { ... }`
+            if trimmed_text.starts_with("match ") {
+                let target = trimmed_text
+                    .trim_start_matches("match ")
+                    .trim_end_matches('{')
+                    .trim()
+                    .to_string();
+
+                let mut arms = Vec::new();
+                let mut next_i = i + 1;
+
+                while next_i < lines.len() {
+                    let (arm_indent, ref arm_text) = lines[next_i];
+                    if arm_indent <= indent {
+                        break;
+                    }
+
+                    let arm_trimmed = arm_text.trim();
+                    if arm_trimmed.is_empty() || arm_trimmed.starts_with("//") || arm_trimmed.starts_with('#') {
+                        next_i += 1;
+                        continue;
+                    }
+
+                    if arm_trimmed == "}" {
+                        next_i += 1;
+                        continue;
+                    }
+
+                    if let Some((pat, rest)) = arm_trimmed.split_once("=>") {
+                        let pat_clean = pat.trim().to_string();
+                        let rest_trimmed = rest.trim();
+                        let arm_body = if rest_trimmed.is_empty() || rest_trimmed == "{" {
+                            let (body_stmts, after_arm) =
+                                self.consume_indented_block(lines, next_i + 1, arm_indent, fn_name, mem_norm);
+                            next_i = after_arm;
+                            body_stmts
+                        } else {
+                            let single_stmt = rest_trimmed
+                                .trim_matches(|c| c == '{' || c == '}')
+                                .trim_end_matches(',')
+                                .trim_end_matches(';')
+                                .trim();
+                            let parsed = self.parse_block(
+                                &[(arm_indent + 4, single_stmt.to_string())],
+                                fn_name,
+                                mem_norm,
+                            );
+                            next_i += 1;
+                            parsed
+                        };
+
+                        arms.push(MatchArm {
+                            pattern: pat_clean,
+                            body: arm_body,
+                        });
+                        continue;
+                    }
+                    next_i += 1;
+                }
+
+                stmts.push(Statement::Match { target, arms });
+                i = next_i;
+                continue;
+            }
 
             // 1. If statement with optional elif/else
             if let Some(caps) = self.if_re.captures(text) {
@@ -720,6 +1301,20 @@ impl OmniParser {
                 let expr = caps.get(1).map(|m| m.as_str().trim().to_string());
                 stmts.push(Statement::Return { expr });
                 i += 1;
+                continue;
+            }
+
+            // 5b. With context manager
+            if let Some(caps) = self.with_re.captures(text) {
+                let context_expr = caps[1].trim().to_string();
+                let var_alias = caps.get(2).map(|m| m.as_str().trim().to_string());
+                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                stmts.push(Statement::WithContext {
+                    context_expr,
+                    var_alias,
+                    body,
+                });
+                i = next_i;
                 continue;
             }
 
@@ -872,9 +1467,10 @@ impl OmniParser {
             // 8. Standard Assignment (e.g. `x = 5`, `int count = 10`, `let count = 0`)
             if let Some(caps) = self.assign_re.captures(text) {
                 let is_scoped = caps.get(1).is_some();
+                let clean_expr = caps[3].trim().trim_end_matches(';').trim().to_string();
                 stmts.push(Statement::Assign {
                     target: caps[2].trim().to_string(),
-                    expr: caps[3].trim().to_string(),
+                    expr: clean_expr,
                     idiom: IdiomFamily::Standard,
                     is_scoped_decl: is_scoped,
                 });
@@ -1204,5 +1800,19 @@ def main():
                 expr: "\"what if now\"".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_carved_java_fn() {
+        let src = r#"    public static int add(int a, int b) {
+        return a + b;
+    }"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("add", src);
+        println!("Java parsed functions: {:#?}", module.functions);
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.name, "add");
+        assert_eq!(f.body.len(), 1);
     }
 }
