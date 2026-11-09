@@ -42,6 +42,12 @@ Make sure you have `Clang` installed on your system!
 Or for windows folks:
 Make sure you've installed `clang.exe` and its available in your `%PATH%`
 
+___
+#### Disclaimer
+As of this readme, 
+
+We only have true syntax parity with Rust, Python and C right now -- so there's definitely some glitches and outright problems to be identified when trying to compile other languages as of right this moment. *Mileage may vary*
+___
 ### Background
 OmniScript is a language I wrote over a weekend, after considering the paradigm of: *"What if I could just put python, into my Go, and Java, and C, and Rust, and Javascript"* 
 
