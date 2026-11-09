@@ -81,6 +81,33 @@ Foundational zero-GC primitives are located in [`crates/omni_runtime/src/native`
 
 ---
 
+## Installation & Standalone Binary Releases
+
+Pre-compiled standalone binaries containing the compiler and embedded local AI weights are available from [GitHub Releases](https://github.com/actes2/omniscript/releases/tag/v0.1.0).
+
+### Download Standalone Binary (Linux x86_64 ELF)
+Includes the full compiler, zero-GC systems runtime, and embedded 1.05 GB GGUF model weights in a single self-contained executable:
+```bash
+curl -L -o omnic https://github.com/actes2/omniscript/releases/download/v0.1.0/omnic-linux-x86_64
+chmod +x omnic
+./omnic --version
+```
+
+### Building From Source
+
+```bash
+git clone https://github.com/actes2/omniscript.git
+cd omniscript
+
+# 1. Standard build (~30 MB binary, loads models/omni-coder.gguf from disk)
+cargo build --release -p omni_cli
+
+# 2. Full build (~1.1 GB self-contained binary with embedded weights)
+cargo build --release -p omni_cli --features full-build
+```
+
+---
+
 ## CLI Usage
 
 ### Install Dependencies from Unified Manifest
