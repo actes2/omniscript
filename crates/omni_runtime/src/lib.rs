@@ -25,18 +25,39 @@ pub fn host_target_triple() -> &'static str {
     return "unknown-unknown-unknown";
 }
 
-/// Returns paths to all bundled C runtime sources (Arena, Channels, etc.)
+/// The compiled native C systems runtime static archive (Arena, Channels, Fibers, Slices, Robin Hood Map).
+/// Embedded directly into the binary to ensure 100% standalone execution without depending on source repos.
+pub static EMBEDDED_LIBOMNI_RUNTIME: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/libomni_runtime_native.a"));
+
+/// Returns the path to the native runtime static library (`libomni_runtime_native.a`).
+/// If not already present in `~/.omnicache/lib/` (or if bytes have changed), it writes
+/// the embedded static archive out atomically.
+pub fn runtime_archive_path() -> PathBuf {
+    let cache_dir = if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        PathBuf::from(home).join(".omnicache").join("lib")
+    } else {
+        std::env::temp_dir().join("omnicache").join("lib")
+    };
+    let lib_path = cache_dir.join("libomni_runtime_native.a");
+
+    let needs_write = match std::fs::read(&lib_path) {
+        Ok(existing) => existing != EMBEDDED_LIBOMNI_RUNTIME,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let _ = std::fs::write(&lib_path, EMBEDDED_LIBOMNI_RUNTIME);
+    }
+
+    lib_path
+}
+
+/// Returns the paths of all native runtime libraries required for Clang binary linking.
+/// Returns the self-contained static archive path, ensuring zero dependencies on local source trees.
 pub fn runtime_c_sources() -> Vec<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let native_dir = manifest_dir.join("src").join("native");
-    vec![
-        native_dir.join("omni_arena.c"),
-        native_dir.join("omni_chan.c"),
-        native_dir.join("omni_value.c"),
-        native_dir.join("omni_fiber.c"),
-        native_dir.join("omni_slice.c"),
-        native_dir.join("omni_map.c"),
-    ]
+    vec![runtime_archive_path()]
 }
 
 /// Returns the C header declarations for LLVM IR module inclusion
@@ -128,9 +149,11 @@ mod tests {
     #[test]
     fn test_runtime_sources_exist() {
         let sources = runtime_c_sources();
-        assert_eq!(sources.len(), 6);
+        assert_eq!(sources.len(), 1);
         for s in sources {
             assert!(s.exists(), "Source does not exist: {}", s.display());
+            let metadata = std::fs::metadata(&s).expect("Failed to get metadata");
+            assert!(metadata.len() > 10_000, "Archive size too small: {}", metadata.len());
         }
     }
 }

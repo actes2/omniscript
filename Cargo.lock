@@ -1291,6 +1291,7 @@ name = "omni_runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "thiserror 1.0.69",
 ]
 
