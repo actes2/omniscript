@@ -294,19 +294,33 @@ impl OmniParser {
             let known_types = [
                 "int", "int32", "int64", "long", "float", "double", "bool", "boolean",
                 "string", "String", "i32", "i64", "f32", "f64", "u32", "u64", "usize",
-                "isize", "byte", "char*", "auto",
+                "isize", "byte", "char*", "auto", "void*",
             ];
-            if known_types.contains(&parts[parts.len() - 1]) {
-                // Go style: `base int` -> name: base, type: int
+            let last = parts[parts.len() - 1];
+            let first = parts[0];
+            let last_is_type = known_types.contains(&last)
+                || last.starts_with('*')
+                || last.starts_with("[]")
+                || last.starts_with('&');
+            let first_is_type = known_types.contains(&first)
+                || first.ends_with('*')
+                || first.ends_with("[]")
+                || first.ends_with('&');
+
+            if last_is_type && !first_is_type {
+                // Go style: `base int`, `items []string`, `node *Node`
+                let name = parts[..parts.len() - 1].join(" ");
                 return ParamDef {
-                    name: parts[0].to_string(),
-                    type_hint: Some(parts[parts.len() - 1].to_string()),
+                    name,
+                    type_hint: Some(last.to_string()),
                 };
             }
-            // C/Java style: `String username` or `int base`
+            // C/Java style: `String username`, `int base`, `const char* s`
+            let name = parts[parts.len() - 1].to_string();
+            let type_str = parts[..parts.len() - 1].join(" ");
             return ParamDef {
-                name: parts[parts.len() - 1].to_string(),
-                type_hint: Some(parts[0].to_string()),
+                name,
+                type_hint: Some(type_str),
             };
         }
         ParamDef {

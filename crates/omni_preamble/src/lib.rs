@@ -620,7 +620,14 @@ impl DependencyDriller {
             }
         }
         // 4. Walk up parent directories looking for oenv / .oenv or omni-env.json
-        let mut curr = base_dir.parent();
+        let abs_base = base_dir.canonicalize().unwrap_or_else(|_| {
+            if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(base_dir)
+            } else {
+                base_dir.to_path_buf()
+            }
+        });
+        let mut curr = abs_base.parent();
         while let Some(parent) = curr {
             let p1 = parent.join("oenv");
             if p1.is_dir() {
@@ -2937,35 +2944,76 @@ impl DependencyDriller {
             ..Default::default()
         };
 
-        // 1. Locate entry JS/TS file (Workspace -> ./node_modules -> system node_modules)
         let mut entry_opt: Option<(PathBuf, String)> = None;
-        for ext in &["js", "ts", "mjs", "cjs"] {
-            let cand = base_dir.join(format!("{}.{}", module, ext));
-            if cand.is_file() {
-                entry_opt = Some((cand, format!("workspace-local (.{})", ext)));
-                break;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/node, <oenv>/node_modules)
+        let mut oenv_nm_dirs = Vec::new();
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_node = oenv.join("packages").join("node");
+            if oenv_node.is_dir() {
+                let prefix = format!("{}-", module);
+                if let Ok(entries) = fs::read_dir(&oenv_node) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix) || name == module {
+                            oenv_nm_dirs.push(e.path());
+                        }
+                    }
+                }
+            }
+            let oenv_nm = oenv.join("node_modules");
+            if oenv_nm.is_dir() {
+                oenv_nm_dirs.push(oenv_nm);
             }
         }
-        if entry_opt.is_none() {
-            let mut nm_dirs = Vec::new();
-            if let Some(oenv) = self.effective_oenv(base_dir) {
-                let oenv_node = oenv.join("packages").join("node");
-                if oenv_node.is_dir() {
-                    let prefix = format!("{}-", module);
-                    if let Ok(entries) = fs::read_dir(&oenv_node) {
-                        for e in entries.filter_map(|e| e.ok()) {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if name.starts_with(&prefix) || name == module {
-                                nm_dirs.push(e.path());
+        for nm in oenv_nm_dirs {
+            let pkg_dir = if nm.join("package.json").is_file() {
+                nm.clone()
+            } else {
+                nm.join(module)
+            };
+            if pkg_dir.is_dir() {
+                let pkg_json = pkg_dir.join("package.json");
+                if pkg_json.is_file() {
+                    if let Ok(c) = fs::read_to_string(&pkg_json) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&c) {
+                            let cand_rel = json.get("main")
+                                .or_else(|| json.get("module"))
+                                .and_then(|v| v.as_str());
+                            if let Some(rel) = cand_rel {
+                                let rel_clean = rel.trim_start_matches("./");
+                                let target_path = pkg_dir.join(rel_clean);
+                                if target_path.is_file() {
+                                    entry_opt = Some((target_path, format!("oenv-node ({})", nm.display())));
+                                    break;
+                                } else if pkg_dir.join(format!("{}.js", rel_clean)).is_file() {
+                                    entry_opt = Some((pkg_dir.join(format!("{}.js", rel_clean)), format!("oenv-node ({})", nm.display())));
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-                let oenv_nm = oenv.join("node_modules");
-                if oenv_nm.is_dir() {
-                    nm_dirs.push(oenv_nm);
+                let idx_js = pkg_dir.join("index.js");
+                if idx_js.is_file() {
+                    entry_opt = Some((idx_js, format!("oenv-node ({})", nm.display())));
+                    break;
                 }
             }
+        }
+
+        // 1. Fall-through to workspace-local (.js, .ts, etc.)
+        if entry_opt.is_none() {
+            for ext in &["js", "ts", "mjs", "cjs"] {
+                let cand = base_dir.join(format!("{}.{}", module, ext));
+                if cand.is_file() {
+                    entry_opt = Some((cand, format!("workspace-local (.{})", ext)));
+                    break;
+                }
+            }
+        }
+        if entry_opt.is_none() {
+            let mut nm_dirs = Vec::new();
             nm_dirs.push(base_dir.join("node_modules"));
             if let Some(np) = std::env::var_os("NODE_PATH") {
                 for p in std::env::split_paths(&np) {

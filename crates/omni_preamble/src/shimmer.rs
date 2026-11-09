@@ -679,8 +679,15 @@ impl PackageShimmer {
             if components.len() <= strip_components {
                 continue;
             }
+            // Mitigate Tar Slip: reject any entry containing ParentDir (..)
+            if components.iter().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                continue;
+            }
             let stripped_path: PathBuf = components[strip_components..].iter().map(|c| c.as_os_str()).collect();
             let dest = target_dir.join(&stripped_path);
+            if !dest.starts_with(target_dir) {
+                continue;
+            }
 
             if let Some(parent) = dest.parent() {
                 let _ = fs::create_dir_all(parent);

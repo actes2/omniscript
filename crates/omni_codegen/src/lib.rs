@@ -980,6 +980,31 @@ impl<'a> CodeGenerator<'a> {
                                             continue;
                                         }
                                     }
+                                    if Self::is_string_expr(a_trim, scope_tree) {
+                                        let str_ptr = self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        let str_i64 = format!("%ctor_str_i64_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", str_i64, str_ptr));
+                                        arg_regs.push(str_i64);
+                                        continue;
+                                    }
+                                    if let Some(b) = scope_tree.resolve(a_trim) {
+                                        let tl = b.type_hint.to_lowercase();
+                                        let is_ptr_or_64 = b.type_hint.ends_with('*')
+                                            || tl.contains("string")
+                                            || tl.contains("char*")
+                                            || tl == "i64"
+                                            || tl == "u64"
+                                            || tl == "long"
+                                            || tl == "usize";
+                                        if is_ptr_or_64 {
+                                            let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
+                                            arg_regs.push(ld_ptr);
+                                            continue;
+                                        }
+                                    }
                                     let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
                                     let ext = format!("%init_ext_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -2294,20 +2319,31 @@ impl<'a> CodeGenerator<'a> {
                         1 => "%arg2",
                         _ => "%arg3",
                     };
-                    let is_str = param
+                    let is_64bit = param
                         .type_hint
                         .as_deref()
-                        .map(|t| t.to_lowercase().contains("string") || t.contains("char*"))
+                        .map(|t| {
+                            let tl = t.to_lowercase();
+                            tl.contains("string")
+                                || tl.contains("char*")
+                                || t.ends_with('*')
+                                || tl == "i64"
+                                || tl == "u64"
+                                || tl == "long"
+                                || tl == "usize"
+                                || tl == "int64"
+                        })
                         .unwrap_or(false);
-                    if is_str {
+                    if is_64bit {
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
                         functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
                         functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", reg_src, ptr));
+                        let th = param.type_hint.clone().unwrap_or_else(|| "i64".to_string());
                         scope_tree.insert(param.name.clone(), SymbolBinding {
                             name: param.name.clone(),
                             llvm_ptr: ptr,
-                            type_hint: "String".to_string(),
+                            type_hint: th,
                             is_scoped: true,
                         });
                     } else {

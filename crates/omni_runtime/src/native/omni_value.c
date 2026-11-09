@@ -178,19 +178,16 @@ void __omni_print_str(const char* s) {
 }
 
 void __omni_print_int(int64_t v) {
-    printf("%ld\n", v);
+    printf("%lld\n", (long long)v);
 }
 
 char* __omni_str_concat(const char* a, const char* b) {
-    if (!a && !b) return "";
-    if (!a) return (char*)b;
-    if (!b) return (char*)a;
-    size_t la = strlen(a);
-    size_t lb = strlen(b);
+    size_t la = a ? strlen(a) : 0;
+    size_t lb = b ? strlen(b) : 0;
     char* res = (char*)malloc(la + lb + 1);
     if (!res) return "";
-    memcpy(res, a, la);
-    memcpy(res + la, b, lb);
+    if (la > 0) memcpy(res, a, la);
+    if (lb > 0) memcpy(res + la, b, lb);
     res[la + lb] = '\0';
     return res;
 }
@@ -198,7 +195,7 @@ char* __omni_str_concat(const char* a, const char* b) {
 char* __omni_int_to_str(int64_t v) {
     char* buf = (char*)malloc(32);
     if (!buf) return "";
-    snprintf(buf, 32, "%ld", (long)v);
+    snprintf(buf, 32, "%lld", (long long)v);
     return buf;
 }
 
