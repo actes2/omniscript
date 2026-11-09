@@ -37,11 +37,13 @@ flowchart TD
 
 ---
 
-## 3. Placement & Configuration
+## 3. Placement & Download
 
-Place the model file at:
+### Direct Download from Release v0.1.0
+To download the compiled model weights into the `models/` directory:
 ```bash
-models/omni-coder.gguf
+mkdir -p models
+curl -L -o models/omni-coder.gguf https://github.com/actes2/omniscript/releases/download/v0.1.0/omni-coder.gguf
 ```
 
 You can customize the model directory path via the environment variable:
@@ -55,3 +57,4 @@ python3 scripts/upload_server.py
 # In another terminal:
 curl -T omni-coder.gguf http://<HOST_IP>:8080/upload
 ```
+
