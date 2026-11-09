@@ -26,3 +26,5 @@ omni_runtime = { path = "../omni_runtime" }
 [features]
 default = []
 cuda = ["omni_engine/cuda"]
+full-build = ["omni_engine/full-build"]
+

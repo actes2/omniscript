@@ -943,12 +943,33 @@ pub struct CandleGgufEngine {
     pub eos_token_id: u32,
 }
 
-impl CandleGgufEngine {
-    pub fn new_with_device(model_path: PathBuf, pref: DevicePreference) -> Result<Self, EngineError> {
-        if !model_path.exists() {
-            return Err(EngineError::ModelNotFound(model_path));
-        }
+#[cfg(feature = "full-build")]
+extern "C" {
+    static omni_embedded_model_start: u8;
+    static omni_embedded_model_end: u8;
+}
 
+/// Returns a reference to the embedded model weights linked directly into the binary's `.rodata` section.
+#[cfg(feature = "full-build")]
+pub fn embedded_model_weights() -> &'static [u8] {
+    unsafe {
+        let start = std::ptr::addr_of!(omni_embedded_model_start);
+        let end = std::ptr::addr_of!(omni_embedded_model_end);
+        let len = (end as usize).saturating_sub(start as usize);
+        std::slice::from_raw_parts(start, len)
+    }
+}
+
+#[cfg(feature = "full-build")]
+pub static EMBEDDED_MODEL_WEIGHTS: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(embedded_model_weights);
+
+impl CandleGgufEngine {
+    pub fn new_from_reader<R: std::io::Read + std::io::Seek>(
+        mut reader: R,
+        pref: DevicePreference,
+        label: &str,
+    ) -> Result<Self, EngineError> {
         let device = match pref {
             DevicePreference::Cpu => Device::Cpu,
             DevicePreference::Cuda(ord) => {
@@ -966,9 +987,7 @@ impl CandleGgufEngine {
             }
         };
 
-        let mut file = std::fs::File::open(&model_path)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed to open model file: {}", e)))?;
-        let content = gguf_file::Content::read(&mut file)
+        let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| EngineError::InferenceFailed(format!("Failed reading GGUF content: {}", e)))?;
 
         let tokenizer = Tokenizer::from_gguf(&content)
@@ -984,18 +1003,42 @@ impl CandleGgufEngine {
             })
             .unwrap_or(151645);
 
-        let model = Qwen2Weights::from_gguf(content, &mut file, &device)
+        let model = Qwen2Weights::from_gguf(content, &mut reader, &device)
             .map_err(|e| EngineError::InferenceFailed(format!("Failed initializing Qwen2 model from GGUF on {:?}: {}", device, e)))?;
 
         Ok(Self {
             model: Mutex::new(model),
             tokenizer,
             device,
-            model_path,
+            model_path: PathBuf::from(label),
             system_prompt: "You are OmniCoder, an autonomous polyglot compiler lowering engine. You translate polyglot statements into valid, SSA-compliant LLVM IR basic blocks. Synthesize ONLY the LLVM IR instructions for the basic block body.".to_string(),
             sample_len: 96,
             eos_token_id,
         })
+    }
+
+    pub fn new_with_device(model_path: PathBuf, pref: DevicePreference) -> Result<Self, EngineError> {
+        if !model_path.exists() {
+            return Err(EngineError::ModelNotFound(model_path));
+        }
+
+        let file = std::fs::File::open(&model_path)
+            .map_err(|e| EngineError::InferenceFailed(format!("Failed to open model file: {}", e)))?;
+        let label = model_path.to_string_lossy().to_string();
+        let mut engine = Self::new_from_reader(file, pref, &label)?;
+        engine.model_path = model_path;
+        Ok(engine)
+    }
+
+    #[cfg(feature = "full-build")]
+    pub fn new_embedded_with_device(pref: DevicePreference) -> Result<Self, EngineError> {
+        let cursor = std::io::Cursor::new(embedded_model_weights());
+        Self::new_from_reader(cursor, pref, "[embedded:omni-coder.gguf]")
+    }
+
+    #[cfg(feature = "full-build")]
+    pub fn new_embedded() -> Result<Self, EngineError> {
+        Self::new_embedded_with_device(DevicePreference::Auto)
     }
 
     pub fn new(model_path: PathBuf) -> Result<Self, EngineError> {
@@ -1004,6 +1047,13 @@ impl CandleGgufEngine {
 
     /// Automatically discover standard model locations on the host system
     pub fn discover_default_with_device(pref: DevicePreference) -> Option<Self> {
+        #[cfg(feature = "full-build")]
+        {
+            if let Ok(engine) = Self::new_embedded_with_device(pref) {
+                return Some(engine);
+            }
+        }
+
         if let Ok(env_path) = std::env::var("OMNI_MODEL_PATH") {
             let p = PathBuf::from(env_path);
             if p.exists() {
@@ -1012,6 +1062,7 @@ impl CandleGgufEngine {
                 }
             }
         }
+
 
         let candidate_paths = [
             PathBuf::from("models/omni-coder.gguf"),
@@ -1325,4 +1376,14 @@ Let me know if you need any adjustments!
             }
         }
     }
+
+    #[test]
+    #[cfg(feature = "full-build")]
+    fn test_embedded_candle_gguf_engine() {
+        let engine = CandleGgufEngine::new_embedded().expect("Failed to initialize embedded GGUF engine");
+        assert_eq!(engine.model_path.to_str().unwrap(), "[embedded:omni-coder.gguf]");
+        assert!(embedded_model_weights().len() > 1_000_000_000);
+        assert!(EMBEDDED_MODEL_WEIGHTS.len() > 1_000_000_000);
+    }
 }
+
