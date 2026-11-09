@@ -2,7 +2,110 @@
 
 > **Autonomous Polyglot Systems Compiler & Zero-GC Runtime with In-Process AI Lowering**
 
-OmniScript (`omnic`) is a high-performance polyglot systems programming compiler and runtime written in Rust and low-level C. It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **Go**, **JavaScript**, **C/C++**, **Java**, **C#**, and **Lua** within single translation units. OmniScript lowers directly to verified **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution—**completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
+OmniScript (`omnic`) is a high-performance polyglot systems programming compiler and runtime written in Rust and low-level C. 
+
+It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **Go**, **JavaScript**, **C/C++**, **Java**, **C#**, and **Lua** within single translation units. 
+
+OmniScript lowers directly to **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution; **completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
+
+## What is OmniScript
+
+It's all the languages, but its none-of-them at the same time, simply write in any language you want
+```python
+import 'python' time
+import 'go' "fmt"
+
+func whoaThatsNotPython() {
+   fmt.Println("hi mom!");
+   time.sleep(3)
+   println!("Hello from also rust, go-routine complete");
+}
+
+
+def main():
+   print("hello world")
+   go whoaThatsNotPython()
+   time.sleep(5)
+   return 0
+```
+> *test.omni*
+
+and invoke it with:
+`omnic build ./test.omni -o test && ./test`
+
+Make sure you have `Clang` installed on your system!
+
+* `pacman -S clang`
+* `apt install clang`
+* `brew install llvm`
+
+Or for windows folks:
+Make sure you've installed `clang.exe` and its available in your `%PATH%`
+
+### Background
+OmniScript is a language I wrote over a weekend, after considering the paradigm of: *"What if I could just put python, into my Go, and Java, and C, and Rust, and Javascript"* 
+
+After considering the notion and understanding the fundamentals behind compiler theory, and my own working experience with building transpilers I took on the task to make this unification of an omni-applicable language that can run just about any language you throw at it.
+
+### How does it work?
+OmniScript essentially is a top-level AST (Abstract Syntax Tree), that converts incoming common programming language syntax into decorated IR (Intermediate Representation) code, with various type-hints and primitive LLVM constructs. In our 1st layer, we perform a **semi-stringent** pass where we convert most common language stuff to the same LLVM references. Then as part of that pass we find anonymous abstract code blocks that are unknown to our static-assignment maps; and we decorate them in a way that our LLM can properly read them.
+
+
+#### For example:
+```python
+# We're writing Javascript inside of python here
+
+offset = 100
+transform = (x) => x * 2 + offset
+
+result = transform(42)  # In python we'd just straight up error out!
+```
+> Because of the odd nature around this, we don't know what a 'transform' call is under the hood; therefore it's impossible to match naturally to a standard `SYSCALL`, and no import here references it.
+
+We get to run through a whole host of different mechanisms to try and infer what that line is trying to do (if anything at all!), after taking our best matching guesses, we notate this in the XML that we feed our LLM something like this:
+```xml
+<omni_ir_task>
+    <interpretive_anchor id="12"/>
+    <action_directive>LOWER_ANONYMOUS_CLOSURE_OR_LAMBDA</action_directive>   <!-- What our compiler thinks it maybe could kind-of be -->
+    <physical_source>
+    transform = (x) => x * 2 + offset   <!-- The raw code for the LLM -->
+    </physical_source>
+    <target_abi>x86_64-pc-linux-gnu</target_abi>
+    <function name="__omni_fn_main" ret="i32"/>   <!-- Because our AST Polyglot mechanism detected no function block, we default to __omni_fn_main -->
+    <concurrency_mode>SequentialOrCooperative</concurrency_mode>   <!-- Our latch for Concurrency -->
+    <yield_expectation>NonBlocking</yield_expectation>   <!-- Does this thing block, or does our IR transpiler think so -->
+    <live_registers>   <!-- Actual LLVM registers, or to what we believe it to be -->
+    <reg var="offset" llvm="%var_offset_1" type="i32*"/>
+    <reg var="arena" llvm="%var_arena_0" type="i8*"/>
+    </live_registers>
+    <structs>
+    <!-- Captured Lexical Environment Struct -->
+    <type>%struct.omni_closure_env_12 = type { i32 }</type>   <!-- our IR knows it closes with a void-of-sorts so we set it to a numeric return even if 0  -->
+    </structs>
+    <idiom_hint>ClosureLambda</idiom_hint>   <!-- We know this looks like a Lambda of sorts, and because of that we latch onto the recognized symbol -->
+    <ecosystem_context>javascript (arrow_closure)</ecosystem_context>   <!-- Since this particular closureLambda symbol is latched, we infer it as javascript here (though honestly the llm figures it out regardless) -->
+    <lifetime_context>ScopeArenaBound</lifetime_context>   <!-- We tell the LLM what arena we're active in and if we're out of bounds yet -->
+    <ssa_contract>
+    <start_register>%t_4</start_register>
+    <continuation_label>post_closure_12</continuation_label>
+    </ssa_contract>
+</omni_ir_task>
+```
+> These overly verbose comments on this *IR Contract* are what we 'tell' the LLM ahead of schedule to help in it's inference **when creating the LLVM Instructions**
+> > At the moment, we do not batch these tasks, we just sequentially hand them off down the line to the LLM; though I have plans of introducing batching in the future and this comment will be dated.
+
+During this task-processing portion we do a *lot of things*, one of those things is the LLM tests the LLVM code against CLANG to make sure things compile right, then if it doesn't it reads the failure and tries to fix it 2 more times (failing with a proper English result on why it was stumped if it completely gives up)
+
+Afterwards we walk through all the 'tasks' delegated to the LLM, we end up with a fully functional LLVM-glomp that we save in `./omnicache/llvm.ll` this serves as a cache to help with recompilation.
+Clang then ingests the `.ll` and includes any `.so` shared objects or `.a` static archives; along with any identified C source files that the `omni_preamble` found during it's hunt through imports.
+
+Finally, we link against:
+* `omni_fiber.c` for our assembly fibers
+* `omni_chan.c` for our channel mutexes
+* `omni_map.c` for our hash-tables
+* `omni_arena.c` for our scope arenas
+
+..and finally we emit our binary!
 
 ---
 
@@ -78,33 +181,6 @@ Foundational zero-GC primitives are located in [`crates/omni_runtime/src/native`
 - **Tombstone-Protected Hash Maps ([`omni_map.c`](./crates/omni_runtime/src/native/omni_map.c))**: FNV-1a hash map with open addressing and linear probing. Incorporates tombstone tracking in load factor evaluations to eliminate $O(N)$ probing degradation, and performs direct pointer migrations on table resize.
 - **Scope Arenas ([`omni_arena.c`](./crates/omni_runtime/src/native/omni_arena.c))**: Monotonic contiguous memory arenas (`__omni_arena_create`, `__omni_arena_alloc`, `__omni_arena_reset`, `__omni_arena_destroy`). Sockets, route tokenizers (`__omni_str_token_arena`), and HTTP payloads use per-request arenas with $O(1)$ bulk resets to completely eliminate heap fragmentation.
 - **Thin OS Syscall Boundaries ([`omni_value.c`](./crates/omni_runtime/src/native/omni_value.c))**: Direct OS socket file-descriptor boundaries (`__omni_os_socket_listen`, `__omni_os_socket_accept`, `__omni_os_socket_read_arena`, `__omni_os_socket_write_http`, `__omni_os_socket_close`) with POSIX Berkeley Sockets and Windows Winsock2 compatibility.
-
----
-
-## Installation & Standalone Binary Releases
-
-Pre-compiled standalone binaries containing the compiler and embedded local AI weights are available from [GitHub Releases](https://github.com/actes2/omniscript/releases/tag/v0.1.0).
-
-### Download Standalone Binary (Linux x86_64 ELF)
-Includes the full compiler, zero-GC systems runtime, and embedded 1.05 GB GGUF model weights in a single self-contained executable:
-```bash
-curl -L -o omnic https://github.com/actes2/omniscript/releases/download/v0.1.0/omnic-linux-x86_64
-chmod +x omnic
-./omnic --version
-```
-
-### Building From Source
-
-```bash
-git clone https://github.com/actes2/omniscript.git
-cd omniscript
-
-# 1. Standard build (~30 MB binary, loads models/omni-coder.gguf from disk)
-cargo build --release -p omni_cli
-
-# 2. Full build (~1.1 GB self-contained binary with embedded weights)
-cargo build --release -p omni_cli --features full-build
-```
 
 ---
 
