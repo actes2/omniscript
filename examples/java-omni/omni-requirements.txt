@@ -1,0 +1,3 @@
+# OmniScript Polyglot Requirements Manifest
+# Pull Project Lombok directly from Maven Central without Gradle or Maven installed
+'java' org.projectlombok:lombok == 1.18.36

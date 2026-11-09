@@ -259,7 +259,7 @@ impl OmniParser {
             "string", "String", "i32", "i64", "f32", "f64", "u32", "u64", "usize",
             "isize", "byte", "char*", "auto",
         ];
-        if known_types.contains(&parts[0]) {
+        if known_types.contains(&parts[0]) || parts[0].ends_with("[]") {
             return parts.last().unwrap_or(&parts[0]).to_string();
         }
         if known_types.contains(&parts[parts.len() - 1]) {
@@ -270,10 +270,10 @@ impl OmniParser {
 
     pub fn parse_param(p: &str) -> ParamDef {
         let p_trimmed = p.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
-        if p_trimmed == "self" {
+        if p_trimmed == "self" || p_trimmed == "this" {
             return ParamDef {
-                name: "self".to_string(),
-                type_hint: Some("&self".to_string()),
+                name: p_trimmed.to_string(),
+                type_hint: Some(format!("&{}", p_trimmed)),
             };
         }
         if let Some(pos) = p_trimmed.find(':') {
@@ -289,6 +289,26 @@ impl OmniParser {
                 type_hint: Some(hint),
             };
         }
+        let parts: Vec<&str> = p_trimmed.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let known_types = [
+                "int", "int32", "int64", "long", "float", "double", "bool", "boolean",
+                "string", "String", "i32", "i64", "f32", "f64", "u32", "u64", "usize",
+                "isize", "byte", "char*", "auto",
+            ];
+            if known_types.contains(&parts[parts.len() - 1]) {
+                // Go style: `base int` -> name: base, type: int
+                return ParamDef {
+                    name: parts[0].to_string(),
+                    type_hint: Some(parts[parts.len() - 1].to_string()),
+                };
+            }
+            // C/Java style: `String username` or `int base`
+            return ParamDef {
+                name: parts[parts.len() - 1].to_string(),
+                type_hint: Some(parts[0].to_string()),
+            };
+        }
         ParamDef {
             name: Self::clean_param_name(p),
             type_hint: None,
@@ -299,7 +319,7 @@ impl OmniParser {
         Self {
             // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++
             fn_re: Regex::new(
-                r#"^(?:(?:(?:public|private|protected|internal|pub)\s+)?(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String)\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*|[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub)\s+)?(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String)\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*|[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -326,7 +346,7 @@ impl OmniParser {
             )
             .unwrap(),
             print_re: Regex::new(
-                r#"^(?:print|println!|console\.log|fmt\.Println|puts)\s*\(\s*(.*)\s*\)\s*;?$"#,
+                r#"^(?:print|println!|console\.log|fmt\.Println|puts|System\.out\.println|System\.out\.print)\s*\(\s*(.*)\s*\)\s*;?$"#,
             )
             .unwrap(),
             return_re: Regex::new(r#"^return(?:\s+(.*?))?\s*;?$"#).unwrap(),
@@ -334,9 +354,9 @@ impl OmniParser {
             with_re: Regex::new(r#"^with\s+(.*?)(?:\s+as\s+([a-zA-Z_0-9]+))?\s*(?::|\{)?$"#).unwrap(),
             // Go scoped declaration: count := 0
             walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+?)\s*;?$"#).unwrap(),
-            // Matches x = 5, int x = 0, let count = 10, let mut acc = 20, let total: i64 = 0, self.val = 20, var y = 2
+            // Matches x = 5, int x = 0, let count = 10, let mut acc = 20, let total: i64 = 0, self.val = 20, var y = 2, User u = new User(...)
             assign_re: Regex::new(
-                r#"^(?:(let(?:\s+mut)?|const|var|int|int32|int64|float|double|bool|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>]+)?\s*=\s*(.+?)\s*;?$"#,
+                r#"^(?:(let(?:\s+mut)?|const|var|[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|float|double|bool|boolean|String|string|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>]+)?\s*=\s*(.+?)\s*;?$"#,
             )
             .unwrap(),
             // Matches ch := make(chan int, 8), ch = Channel(10), let ch = Chan(4)
@@ -608,6 +628,12 @@ impl OmniParser {
             let trimmed = line.trim();
 
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                idx += 1;
+                continue;
+            }
+
+            // Java / package statement: `package com.omni.example;`
+            if trimmed.starts_with("package ") {
                 idx += 1;
                 continue;
             }
@@ -886,9 +912,19 @@ impl OmniParser {
                 continue;
             }
 
-            // Class definitions: `class DataPipeline:` or `class Foo(Bar):`
-            if trimmed.starts_with("class ") {
-                let class_line = trimmed.trim_start_matches("class ").trim_end_matches(':').trim();
+            // Class definitions: `class DataPipeline:`, `public class User {`, `class Foo(Bar):`
+            let is_class = trimmed.starts_with("class ")
+                || trimmed.starts_with("public class ")
+                || trimmed.starts_with("private class ")
+                || trimmed.starts_with("protected class ")
+                || trimmed.starts_with("public final class ")
+                || trimmed.starts_with("final class ");
+            if is_class {
+                let class_line = if let Some(pos) = trimmed.find("class ") {
+                    trimmed[pos + 6..].trim().trim_end_matches(':').trim()
+                } else {
+                    trimmed.trim_end_matches(':').trim()
+                };
                 let (class_name, bases) = if let Some(open) = class_line.find('(') {
                     let name = class_line[..open].trim().to_string();
                     let end = class_line.rfind(')').unwrap_or(class_line.len());
@@ -899,8 +935,30 @@ impl OmniParser {
                         .filter(|s| !s.is_empty())
                         .collect();
                     (name, base_list)
+                } else if class_line.contains(" extends ") || class_line.contains(" implements ") {
+                    let parts: Vec<&str> = class_line.split_whitespace().collect();
+                    let name = parts.get(0).unwrap_or(&"").trim_end_matches('{').to_string();
+                    let mut base_list = Vec::new();
+                    let mut is_base = false;
+                    for part in &parts[1..] {
+                        if *part == "extends" || *part == "implements" {
+                            is_base = true;
+                            continue;
+                        }
+                        let cleaned = part.trim_matches(|c| c == ',' || c == '{');
+                        if is_base && !cleaned.is_empty() {
+                            base_list.push(cleaned.to_string());
+                        }
+                    }
+                    (name, base_list)
                 } else {
-                    (class_line.to_string(), Vec::new())
+                    let name = class_line
+                        .split(|c: char| c.is_whitespace() || c == '{')
+                        .next()
+                        .unwrap_or(class_line)
+                        .trim()
+                        .to_string();
+                    (name, Vec::new())
                 };
 
                 let parent_indent = Self::indent_level(line);
@@ -918,20 +976,43 @@ impl OmniParser {
                         continue;
                     }
 
+                    if next_trimmed == "}" {
+                        idx += 1;
+                        break;
+                    }
+
                     let cur_indent = Self::indent_level(next_line);
                     if cur_indent <= parent_indent {
                         break;
                     }
 
-                    if let Some(caps) = self.fn_re.captures(next_trimmed) {
-                        let method_name = caps[1].to_string();
-                        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                        let params: Vec<ParamDef> = raw_params
+                    // Check for constructor: `public User(...)`, `User(...)`
+                    let clean_ctor = next_trimmed
+                        .trim_start_matches("public ")
+                        .trim_start_matches("private ")
+                        .trim_start_matches("protected ")
+                        .trim();
+                    let is_constructor = clean_ctor.starts_with(&class_name)
+                        && clean_ctor[class_name.len()..].trim_start().starts_with('(');
+
+                    if is_constructor {
+                        let method_name = "__init__".to_string();
+                        let open_idx = clean_ctor.find('(').unwrap();
+                        let close_idx = clean_ctor.rfind(')').unwrap_or(clean_ctor.len());
+                        let raw_params = &clean_ctor[open_idx + 1..close_idx];
+                        let mut params: Vec<ParamDef> = raw_params
                             .split(',')
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty())
                             .map(|p| Self::parse_param(p))
                             .collect();
+                        // Prepend receiver parameter `this`
+                        if params.is_empty() || (params[0].name != "self" && params[0].name != "this") {
+                            params.insert(0, ParamDef {
+                                name: "this".to_string(),
+                                type_hint: None,
+                            });
+                        }
                         let method_indent = cur_indent;
                         idx += 1;
 
@@ -942,6 +1023,10 @@ impl OmniParser {
                             if m_trimmed.is_empty() {
                                 idx += 1;
                                 continue;
+                            }
+                            if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                                idx += 1;
+                                break;
                             }
                             let m_indent = Self::indent_level(m_line);
                             if m_indent > method_indent {
@@ -968,23 +1053,125 @@ impl OmniParser {
                         continue;
                     }
 
-                    if next_trimmed.contains('=') && !next_trimmed.starts_with("if") {
-                        let parts: Vec<&str> = next_trimmed.splitn(2, '=').collect();
-                        class_fields.push(FieldDef {
-                            name: parts[0].trim().to_string(),
-                            type_hint: None,
-                            default_val: Some(parts[1].trim().to_string()),
+                    if let Some(caps) = self.fn_re.captures(next_trimmed) {
+                        let method_name = caps[1].to_string();
+                        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let mut params: Vec<ParamDef> = raw_params
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|p| Self::parse_param(p))
+                            .collect();
+                        let is_static = next_trimmed.contains("static ");
+                        if !is_static && (params.is_empty() || (params[0].name != "self" && params[0].name != "this")) {
+                            params.insert(0, ParamDef {
+                                name: "this".to_string(),
+                                type_hint: None,
+                            });
+                        }
+                        let method_indent = cur_indent;
+                        idx += 1;
+
+                        let mut method_lines = Vec::new();
+                        while idx < raw_lines.len() {
+                            let m_line = raw_lines[idx];
+                            let m_trimmed = m_line.trim();
+                            if m_trimmed.is_empty() {
+                                idx += 1;
+                                continue;
+                            }
+                            if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                                idx += 1;
+                                break;
+                            }
+                            let m_indent = Self::indent_level(m_line);
+                            if m_indent > method_indent {
+                                method_lines.push((m_indent, m_trimmed.to_string()));
+                                idx += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let body = self.parse_block(&method_lines, &method_name, &mem_norm);
+                        let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                        let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
+
+                        // If static method is `main`, also expose it at top-level module functions
+                        if method_name == "main" {
+                            functions.push(FunctionDef {
+                                name: "main".to_string(),
+                                is_method: false,
+                                annotations: Vec::new(),
+                                params: Vec::new(),
+                                return_type: None,
+                                body: body.clone(),
+                                memory_ops: memory_ops.clone(),
+                            });
+                        }
+
+                        class_methods.push(FunctionDef {
+                            name: method_name,
+                            is_method: !is_static,
+                            annotations: Vec::new(),
+                            params,
+                            return_type: None,
+                            body,
+                            memory_ops,
                         });
+                        continue;
+                    }
+
+                    // Field definitions
+                    if !next_trimmed.contains('(') && !next_trimmed.contains(')') && !next_trimmed.starts_with("return") {
+                        let clean_line = next_trimmed.trim_end_matches(';').trim();
+                        if clean_line.contains('=') && !clean_line.starts_with("if") {
+                            let parts: Vec<&str> = clean_line.splitn(2, '=').collect();
+                            let decl = parts[0].trim();
+                            let default_val = parts[1].trim().to_string();
+                            let f_tokens: Vec<&str> = decl.split_whitespace().collect();
+                            let f_name = f_tokens.last().unwrap_or(&decl).to_string();
+                            class_fields.push(FieldDef {
+                                name: f_name,
+                                type_hint: None,
+                                default_val: Some(default_val),
+                            });
+                        } else {
+                            let clean_decl = clean_line
+                                .trim_start_matches("public ")
+                                .trim_start_matches("private ")
+                                .trim_start_matches("protected ")
+                                .trim_start_matches("static ")
+                                .trim_start_matches("final ")
+                                .trim();
+                            let tokens: Vec<&str> = clean_decl.split_whitespace().collect();
+                            if tokens.len() >= 2 {
+                                let type_str = tokens[0].to_string();
+                                let f_name = tokens[tokens.len() - 1].to_string();
+                                class_fields.push(FieldDef {
+                                    name: f_name,
+                                    type_hint: Some(type_str),
+                                    default_val: None,
+                                });
+                            } else if tokens.len() == 1 {
+                                class_fields.push(FieldDef {
+                                    name: tokens[0].to_string(),
+                                    type_hint: None,
+                                    default_val: None,
+                                });
+                            }
+                        }
                     }
 
                     idx += 1;
                 }
 
-                // Auto-discover dynamically assigned instance fields in methods (e.g. Python self.val = ...)
+                // Auto-discover dynamically assigned instance fields in methods (e.g. self.val = ... or this.val = ...)
                 for m in &class_methods {
                     for stmt in &m.body {
                         if let Statement::Assign { target, .. } = stmt {
-                            if let Some(fld) = target.strip_prefix("self.") {
+                            let fld_opt = target.strip_prefix("self.").or_else(|| target.strip_prefix("this."));
+                            if let Some(fld) = fld_opt {
                                 let fld_name = fld.trim().to_string();
                                 if !class_fields.iter().any(|f| f.name == fld_name) {
                                     class_fields.push(FieldDef {
@@ -1319,15 +1506,17 @@ impl OmniParser {
             }
 
             // 6. Explicit Memory Operations (e.g. `temp_buf = alloc(2048)`, `defer free(temp_buf)`)
-            if let Some(op) = mem_norm.normalize_line(text, fn_name) {
-                match op {
-                    UnifiedMemOp::Alloc { .. } | UnifiedMemOp::Free { .. } => {
-                        let is_deferred = text.trim().starts_with("defer ");
-                        stmts.push(Statement::MemOp { op, is_deferred });
-                        i += 1;
-                        continue;
+            if text.contains("alloc(") || text.contains("free(") || text.trim().starts_with("defer ") {
+                if let Some(op) = mem_norm.normalize_line(text, fn_name) {
+                    match op {
+                        UnifiedMemOp::Alloc { .. } | UnifiedMemOp::Free { .. } => {
+                            let is_deferred = text.trim().starts_with("defer ");
+                            stmts.push(Statement::MemOp { op, is_deferred });
+                            i += 1;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 

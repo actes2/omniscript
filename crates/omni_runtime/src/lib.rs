@@ -71,6 +71,8 @@ declare i32 @usleep(i32)
 ; Printing, Time & Hashing helpers
 declare void @__omni_print_str(i8*)
 declare void @__omni_print_int(i64)
+declare i8* @__omni_str_concat(i8*, i8*)
+declare i8* @__omni_int_to_str(i64)
 declare void @__omni_sleep_s(i64)
 declare void @__omni_sleep_ms(i64)
 declare void @fast_hash_block(i8*, i64, i8*)

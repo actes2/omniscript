@@ -1,0 +1,13 @@
+package com.omni.example;
+
+import "./user.omni" as user_mod;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("=== OmniScript Pure Java App with Lombok ===");
+        User u = new User("actes", "actes@omniscript.org", 28);
+        System.out.println("User username: " + u.username);
+        System.out.println("User email: " + u.email);
+        System.out.println("User isAdult check: " + u.isAdult());
+    }
+}

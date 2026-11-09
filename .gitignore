@@ -1,11 +1,15 @@
 /target/
-/.omnicache/
+.omnicache/
+**/.omnicache/
 /tests/outputs/*
 !/tests/outputs/.gitkeep
 **/*.rs.bk
 *.swp
 *.orig
 .venv/
+venv/
+oenv/
+.oenv/
 *_bin
 *.exe
 a.out

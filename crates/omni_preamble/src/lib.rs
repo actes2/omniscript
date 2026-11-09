@@ -554,6 +554,7 @@ impl EcosystemWalkReport {
 }
 
 pub struct DependencyDriller {
+    pub oenv_root: Option<PathBuf>,
     visited: HashSet<PathBuf>,
     include_c_re: Regex,
     py_from_import_re: Regex,
@@ -571,6 +572,7 @@ impl Default for DependencyDriller {
 impl DependencyDriller {
     pub fn new() -> Self {
         Self {
+            oenv_root: None,
             visited: HashSet::new(),
             include_c_re: Regex::new(r#"^\s*#include\s*[<"]([^>"]+)[>"]"#).unwrap(),
             py_from_import_re: Regex::new(
@@ -581,6 +583,67 @@ impl DependencyDriller {
             py_def_re: Regex::new(r#"^(\s*)def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)"#).unwrap(),
             py_class_re: Regex::new(r#"^(\s*)class\s+([a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap(),
         }
+    }
+
+    pub fn with_oenv(mut self, oenv_root: Option<PathBuf>) -> Self {
+        self.oenv_root = oenv_root;
+        self
+    }
+
+    /// Auto-discover an active polyglot environment (`oenv` or `.oenv`)
+    pub fn discover_oenv(base_dir: &Path) -> Option<PathBuf> {
+        // 1. Explicit environment variable
+        if let Some(val) = std::env::var_os("OMNI_ENV").or_else(|| std::env::var_os("OENV")) {
+            let p = PathBuf::from(val);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+        // 2. Direct base directory
+        let cand1 = base_dir.join("oenv");
+        if cand1.is_dir() {
+            return Some(cand1);
+        }
+        let cand2 = base_dir.join(".oenv");
+        if cand2.is_dir() {
+            return Some(cand2);
+        }
+        // 3. Current working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd1 = cwd.join("oenv");
+            if cwd1.is_dir() {
+                return Some(cwd1);
+            }
+            let cwd2 = cwd.join(".oenv");
+            if cwd2.is_dir() {
+                return Some(cwd2);
+            }
+        }
+        // 4. Walk up parent directories looking for oenv / .oenv or omni-env.json
+        let mut curr = base_dir.parent();
+        while let Some(parent) = curr {
+            let p1 = parent.join("oenv");
+            if p1.is_dir() {
+                return Some(p1);
+            }
+            let p2 = parent.join(".oenv");
+            if p2.is_dir() {
+                return Some(p2);
+            }
+            if parent.join("omni-env.json").is_file() {
+                return Some(parent.to_path_buf());
+            }
+            curr = parent.parent();
+        }
+        None
+    }
+
+    /// Determine effective oenv root: explicit field takes precedence, otherwise auto-scan
+    pub fn effective_oenv(&self, base_dir: &Path) -> Option<PathBuf> {
+        if self.oenv_root.is_some() {
+            return self.oenv_root.clone();
+        }
+        Self::discover_oenv(base_dir)
     }
 
     /// Extract dotted member/method symbols (e.g. `request.get(url)`, `response.status_code`, `response.json()`)
@@ -637,7 +700,34 @@ impl DependencyDriller {
         target_symbols: &[String],
     ) -> EcosystemWalkReport {
         let eco_lower = ecosystem.to_lowercase();
-        if eco_lower == "python" || eco_lower == "py" || eco_lower == "polyglot" {
+        if eco_lower == "polyglot" {
+            let py_rep = self.crawl_python_module(base_dir, ecosystem, module, target_symbols);
+            if py_rep.resolution_source != "unresolved" {
+                return py_rep;
+            }
+            let js_rep = self.crawl_javascript_module(base_dir, ecosystem, module, target_symbols);
+            if js_rep.resolution_source != "unresolved" {
+                return js_rep;
+            }
+            let java_rep = self.crawl_java_module(base_dir, ecosystem, module, target_symbols);
+            if java_rep.resolution_source != "unresolved" {
+                return java_rep;
+            }
+            let rs_rep = self.crawl_rust_module(base_dir, ecosystem, module, target_symbols);
+            if rs_rep.resolution_source != "unresolved" {
+                return rs_rep;
+            }
+            let go_rep = self.crawl_go_module(base_dir, ecosystem, module, target_symbols);
+            if go_rep.resolution_source != "unresolved" {
+                return go_rep;
+            }
+            let c_rep = self.crawl_c_cpp_module(base_dir, ecosystem, module, target_symbols);
+            if c_rep.resolution_source != "unresolved" {
+                return c_rep;
+            }
+            return py_rep;
+        }
+        if eco_lower == "python" || eco_lower == "py" {
             return self.crawl_python_module(base_dir, ecosystem, module, target_symbols);
         }
         if matches!(
@@ -702,13 +792,54 @@ impl DependencyDriller {
             ..Default::default()
         };
 
-        // 1. Locate Rust entry point (local .rs file, ./vendor/<crate>, ./src/<mod>.rs, ~/.cargo)
+        // 1. Locate Rust entry point (oenv, local .rs file, ./vendor/<crate>, ./src/<mod>.rs, ~/.cargo)
         let mut entry_opt: Option<(PathBuf, String)> = None;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/rust, <oenv>/git/rust)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_pkg = oenv.join("packages").join("rust");
+            if oenv_pkg.is_dir() {
+                let prefix1 = format!("{}-", module);
+                let prefix2 = format!("{}-", module.replace('_', "-"));
+                if let Ok(entries) = fs::read_dir(&oenv_pkg) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        let cname = e.file_name().to_string_lossy().to_string();
+                        if cname.starts_with(&prefix1) || cname.starts_with(&prefix2) || cname == module {
+                            let lib_rs = e.path().join("src").join("lib.rs");
+                            if lib_rs.is_file() {
+                                entry_opt = Some((lib_rs, format!("oenv-rust ({})", cname)));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if entry_opt.is_none() {
+                let oenv_git = oenv.join("git").join("rust");
+                if oenv_git.is_dir() {
+                    for entry in WalkDir::new(&oenv_git).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_dir() {
+                            let dname = entry.file_name().to_string_lossy().to_string();
+                            if dname.starts_with(module) {
+                                let lib_rs = entry.path().join("src").join("lib.rs");
+                                if lib_rs.is_file() {
+                                    entry_opt = Some((lib_rs, format!("oenv-git-rust ({})", dname)));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let direct_file = base_dir.join(format!("{}.rs", module));
         let src_mod_file = base_dir.join("src").join(format!("{}.rs", module));
         let src_mod_dir = base_dir.join("src").join(module).join("mod.rs");
 
-        if direct_file.is_file() {
+        if entry_opt.is_some() {
+            // Already resolved in oenv
+        } else if direct_file.is_file() {
             entry_opt = Some((direct_file, "workspace-local (.rs)".to_string()));
         } else if src_mod_file.is_file() {
             entry_opt = Some((src_mod_file, "workspace-local (src/<mod>.rs)".to_string()));
@@ -876,10 +1007,51 @@ impl DependencyDriller {
         };
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/git/go, <oenv>/packages/go)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_go = oenv.join("git").join("go");
+            if oenv_go.is_dir() {
+                for entry in WalkDir::new(&oenv_go).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with(module) {
+                        if let Ok(entries) = fs::read_dir(entry.path()) {
+                            for e in entries.filter_map(|e| e.ok()) {
+                                if e.path().extension().and_then(|s| s.to_str()) == Some("go") {
+                                    entry_opt = Some((e.path(), format!("oenv-git-go ({})", module)));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if entry_opt.is_some() { break; }
+                }
+            }
+            if entry_opt.is_none() {
+                let oenv_pkg_go = oenv.join("packages").join("go");
+                if oenv_pkg_go.is_dir() {
+                    for entry in WalkDir::new(&oenv_pkg_go).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with(module) {
+                            if let Ok(entries) = fs::read_dir(entry.path()) {
+                                for e in entries.filter_map(|e| e.ok()) {
+                                    if e.path().extension().and_then(|s| s.to_str()) == Some("go") {
+                                        entry_opt = Some((e.path(), format!("oenv-go ({})", module)));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if entry_opt.is_some() { break; }
+                    }
+                }
+            }
+        }
+
         let direct_file = base_dir.join(format!("{}.go", module));
         let pkg_dir = base_dir.join(module);
 
-        if direct_file.is_file() {
+        if entry_opt.is_some() {
+            // Already resolved in oenv
+        } else if direct_file.is_file() {
             entry_opt = Some((direct_file, "workspace-local (.go)".to_string()));
         } else if pkg_dir.is_dir() {
             if let Ok(entries) = fs::read_dir(&pkg_dir) {
@@ -1019,16 +1191,58 @@ impl DependencyDriller {
         };
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
-        for ext in &["h", "hpp", "c", "cpp", "cc"] {
-            let cand = base_dir.join(format!("{}.{}", module, ext));
-            if cand.is_file() {
-                entry_opt = Some((cand, format!("workspace-local (.{})", ext)));
-                break;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/c, <oenv>/git/c, <oenv>/include)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_c = oenv.join("packages").join("c");
+            if oenv_c.is_dir() {
+                let prefix = format!("{}-", module);
+                if let Ok(entries) = fs::read_dir(&oenv_c) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix) || name == module {
+                            for ext in &["h", "hpp", "c", "cpp"] {
+                                let cand = e.path().join(format!("{}.{}", module, ext));
+                                let cand_inc = e.path().join("include").join(format!("{}.{}", module, ext));
+                                if cand.is_file() {
+                                    entry_opt = Some((cand, format!("oenv-c ({})", name)));
+                                    break;
+                                } else if cand_inc.is_file() {
+                                    entry_opt = Some((cand_inc, format!("oenv-c ({})", name)));
+                                    break;
+                                }
+                            }
+                        }
+                        if entry_opt.is_some() { break; }
+                    }
+                }
             }
-            let inc_cand = base_dir.join("include").join(format!("{}.{}", module, ext));
-            if inc_cand.is_file() {
-                entry_opt = Some((inc_cand, format!("workspace-include (.{})", ext)));
-                break;
+            if entry_opt.is_none() {
+                let oenv_inc = oenv.join("include");
+                if oenv_inc.is_dir() {
+                    for ext in &["h", "hpp"] {
+                        let cand = oenv_inc.join(format!("{}.{}", module, ext));
+                        if cand.is_file() {
+                            entry_opt = Some((cand, format!("oenv-include (.{})", ext)));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if entry_opt.is_none() {
+            for ext in &["h", "hpp", "c", "cpp", "cc"] {
+                let cand = base_dir.join(format!("{}.{}", module, ext));
+                if cand.is_file() {
+                    entry_opt = Some((cand, format!("workspace-local (.{})", ext)));
+                    break;
+                }
+                let inc_cand = base_dir.join("include").join(format!("{}.{}", module, ext));
+                if inc_cand.is_file() {
+                    entry_opt = Some((inc_cand, format!("workspace-include (.{})", ext)));
+                    break;
+                }
             }
         }
 
@@ -1439,11 +1653,37 @@ impl DependencyDriller {
         };
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/java, <oenv>/git/java)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_java = oenv.join("packages").join("java");
+            if oenv_java.is_dir() {
+                let pkg_name = module.split('.').next().unwrap_or(module);
+                let prefix = format!("{}-", pkg_name);
+                if let Ok(entries) = fs::read_dir(&oenv_java) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix) || name == pkg_name || name.starts_with(&format!("{}-", module)) || name == module {
+                            let class_candidate = e.path().join(format!("{}.class", module.replace('.', "/")));
+                            if class_candidate.is_file() {
+                                entry_opt = Some((class_candidate, format!("oenv-java-class ({})", name)));
+                                break;
+                            }
+                            entry_opt = Some((e.path(), format!("oenv-java ({})", name)));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let direct_file = base_dir.join(format!("{}.java", module));
         let direct_class = base_dir.join(format!("{}.class", module));
         let src_main = base_dir.join("src").join("main").join("java").join(format!("{}.java", module.replace('.', "/")));
 
-        if direct_file.is_file() {
+        if entry_opt.is_some() {
+            // Already resolved in oenv
+        } else if direct_file.is_file() {
             entry_opt = Some((direct_file, "workspace-local (.java)".to_string()));
         } else if direct_class.is_file() {
             entry_opt = Some((direct_class, "workspace-local (.class)".to_string()));
@@ -1453,11 +1693,17 @@ impl DependencyDriller {
             let home_path = PathBuf::from(home);
             let omni_java = home_path.join(".omnicache").join("packages").join("java");
             if omni_java.is_dir() {
-                let prefix = format!("{}-", module);
+                let pkg_name = module.split('.').next().unwrap_or(module);
+                let prefix = format!("{}-", pkg_name);
                 if let Ok(entries) = fs::read_dir(&omni_java) {
                     for e in entries.filter_map(|e| e.ok()) {
                         let name = e.file_name().to_string_lossy().to_string();
-                        if name.starts_with(&prefix) || name == module {
+                        if name.starts_with(&prefix) || name == pkg_name || name.starts_with(&format!("{}-", module)) || name == module {
+                            let class_candidate = e.path().join(format!("{}.class", module.replace('.', "/")));
+                            if class_candidate.is_file() {
+                                entry_opt = Some((class_candidate, format!("omnicache-java-class ({})", name)));
+                                break;
+                            }
                             entry_opt = Some((e.path(), format!("omnicache-java ({})", name)));
                             break;
                         }
@@ -1521,8 +1767,22 @@ impl DependencyDriller {
         };
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/csharp)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_cs = oenv.join("packages").join("csharp");
+            if oenv_cs.is_dir() {
+                let cand = oenv_cs.join(module.to_lowercase());
+                if cand.is_dir() {
+                    entry_opt = Some((cand, format!("oenv-csharp ({})", module)));
+                }
+            }
+        }
+
         let direct_file = base_dir.join(format!("{}.cs", module));
-        if direct_file.is_file() {
+        if entry_opt.is_some() {
+            // Already resolved in oenv
+        } else if direct_file.is_file() {
             entry_opt = Some((direct_file, "workspace-local (.cs)".to_string()));
         } else {
             // Check global NuGet caches & omnicache:
@@ -1670,6 +1930,71 @@ impl DependencyDriller {
             None
         };
 
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/python, <oenv>/git/python, <oenv>/site-packages)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_pkg = oenv.join("packages").join("python");
+            if oenv_pkg.is_dir() {
+                if let Some((origin, pkg_dir)) = check_root(&oenv_pkg) {
+                    return (Some(origin), Some(pkg_dir), format!("oenv-python ({})", top_mod));
+                }
+                let prefix1 = format!("{}-", top_mod);
+                let prefix2 = format!("{}-", top_mod.replace('_', "-"));
+                if let Ok(entries) = fs::read_dir(&oenv_pkg) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix1) || name.starts_with(&prefix2) || name == top_mod {
+                            if let Some((origin, pkg_dir)) = check_root(&e.path()) {
+                                return (Some(origin), Some(pkg_dir), format!("oenv-python ({})", name));
+                            }
+                            let init_py = e.path().join("__init__.py");
+                            if init_py.is_file() {
+                                return (Some(init_py), Some(e.path()), format!("oenv-python ({})", name));
+                            }
+                        }
+                    }
+                }
+            }
+            let oenv_git = oenv.join("git").join("python");
+            if oenv_git.is_dir() {
+                for entry in WalkDir::new(&oenv_git).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_dir() {
+                        let dname = entry.file_name().to_string_lossy().to_string();
+                        if dname.starts_with(top_mod) {
+                            if let Some((origin, pkg_dir)) = check_root(&entry.path()) {
+                                return (Some(origin), Some(pkg_dir), format!("oenv-git-python ({})", dname));
+                            }
+                        }
+                    }
+                }
+            }
+            let unix_lib = oenv.join("lib");
+            if let Ok(entries) = fs::read_dir(&unix_lib) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("python") {
+                        let sp = entry.path().join("site-packages");
+                        if sp.is_dir() {
+                            if let Some((origin, pkg_dir)) = check_root(&sp) {
+                                return (Some(origin), Some(pkg_dir), format!("oenv-site-packages ({})", sp.display()));
+                            }
+                        }
+                    }
+                }
+            }
+            let win_sp = oenv.join("Lib").join("site-packages");
+            if win_sp.is_dir() {
+                if let Some((origin, pkg_dir)) = check_root(&win_sp) {
+                    return (Some(origin), Some(pkg_dir), format!("oenv-site-packages ({})", win_sp.display()));
+                }
+            }
+            let direct_sp = oenv.join("site-packages");
+            if direct_sp.is_dir() {
+                if let Some((origin, pkg_dir)) = check_root(&direct_sp) {
+                    return (Some(origin), Some(pkg_dir), format!("oenv-site-packages ({})", direct_sp.display()));
+                }
+            }
+        }
+
         // 1. Workspace-local (`<base_dir>/<module>.py` or `<base_dir>/<module>/__init__.py`)
         if let Some((origin, pkg_dir)) = check_root(base_dir) {
             return (Some(origin), Some(pkg_dir), "workspace-local".to_string());
@@ -1792,6 +2117,9 @@ impl DependencyDriller {
             let home_path = PathBuf::from(home);
             let omni_py = home_path.join(".omnicache").join("packages").join("python");
             if omni_py.is_dir() {
+                if let Some((origin, pkg_dir)) = check_root(&omni_py) {
+                    return (Some(origin), Some(pkg_dir), format!("omnicache-python ({})", top_mod));
+                }
                 let prefix1 = format!("{}-", top_mod);
                 let prefix2 = format!("{}-", top_mod.replace('_', "-"));
                 if let Ok(entries) = fs::read_dir(&omni_py) {
@@ -1800,6 +2128,10 @@ impl DependencyDriller {
                         if name.starts_with(&prefix1) || name.starts_with(&prefix2) || name == top_mod {
                             if let Some((origin, pkg_dir)) = check_root(&e.path()) {
                                 return (Some(origin), Some(pkg_dir), format!("omnicache-python ({})", name));
+                            }
+                            let init_py = e.path().join("__init__.py");
+                            if init_py.is_file() {
+                                return (Some(init_py), Some(e.path()), format!("omnicache-python ({})", name));
                             }
                         }
                     }
@@ -2615,7 +2947,26 @@ impl DependencyDriller {
             }
         }
         if entry_opt.is_none() {
-            let mut nm_dirs = vec![base_dir.join("node_modules")];
+            let mut nm_dirs = Vec::new();
+            if let Some(oenv) = self.effective_oenv(base_dir) {
+                let oenv_node = oenv.join("packages").join("node");
+                if oenv_node.is_dir() {
+                    let prefix = format!("{}-", module);
+                    if let Ok(entries) = fs::read_dir(&oenv_node) {
+                        for e in entries.filter_map(|e| e.ok()) {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.starts_with(&prefix) || name == module {
+                                nm_dirs.push(e.path());
+                            }
+                        }
+                    }
+                }
+                let oenv_nm = oenv.join("node_modules");
+                if oenv_nm.is_dir() {
+                    nm_dirs.push(oenv_nm);
+                }
+            }
+            nm_dirs.push(base_dir.join("node_modules"));
             if let Some(np) = std::env::var_os("NODE_PATH") {
                 for p in std::env::split_paths(&np) {
                     nm_dirs.push(p);
@@ -2927,6 +3278,83 @@ impl DependencyDriller {
     }
 }
 
+/// Tier 2 static heuristic fallback when LLM is unavailable or undecided
+pub fn static_infer_dialect(source_context: &str, candidate_import: &str) -> Option<String> {
+    let lower_import = candidate_import.to_lowercase();
+    let lower_ctx = source_context.to_lowercase();
+
+    // Java hints
+    if lower_import.starts_with("lombok")
+        || lower_import.starts_with("java.")
+        || lower_import.starts_with("javax.")
+        || lower_import.starts_with("org.projectlombok")
+        || lower_ctx.contains("public class ")
+        || lower_ctx.contains("private class ")
+        || lower_ctx.contains("public static void main")
+        || lower_ctx.contains("system.out.print")
+        || lower_ctx.contains("@data")
+        || lower_ctx.contains("@builder")
+    {
+        return Some("java".to_string());
+    }
+
+    // Python hints
+    if lower_import.starts_with("requests")
+        || lower_import.starts_with("numpy")
+        || lower_import.starts_with("torch")
+        || lower_import.starts_with("scipy")
+        || lower_import.starts_with("flask")
+        || lower_import.starts_with("fastapi")
+        || lower_import.starts_with("pytest")
+        || lower_ctx.contains("def ")
+        || lower_ctx.contains("self.")
+        || lower_ctx.contains("__init__")
+    {
+        return Some("python".to_string());
+    }
+
+    // Rust hints
+    if lower_import.starts_with("serde")
+        || lower_import.starts_with("tokio")
+        || lower_import.contains("::")
+        || lower_ctx.contains("fn ")
+        || lower_ctx.contains("let mut ")
+        || lower_ctx.contains("impl ")
+    {
+        return Some("rust".to_string());
+    }
+
+    // Go hints
+    if lower_import.contains('/')
+        || lower_ctx.contains("func ")
+        || lower_ctx.contains(":=")
+        || lower_ctx.contains("chan ")
+        || lower_ctx.contains("fmt.println")
+    {
+        return Some("go".to_string());
+    }
+
+    // JS / Node hints
+    if lower_import.starts_with("express")
+        || lower_import.starts_with("react")
+        || lower_ctx.contains("console.log")
+        || lower_ctx.contains("require(")
+        || lower_ctx.contains("export ")
+    {
+        return Some("javascript".to_string());
+    }
+
+    // C / C++ hints
+    if lower_import.ends_with(".h")
+        || lower_ctx.contains("#include")
+        || lower_ctx.contains("malloc(")
+    {
+        return Some("c".to_string());
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3094,6 +3522,47 @@ func (r *RateLimiter) allow() bool {{
             .native_frontier
             .iter()
             .any(|f| f.contains("json (C-stdlib native module)")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_oenv_priority_and_discovery() {
+        let temp_dir = std::env::temp_dir().join("omni_test_oenv_priority");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let workspace = temp_dir.join("workspace");
+        let oenv = workspace.join("oenv");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // 1. Initialize oenv structure
+        PackageShimmer::init_oenv(&oenv).unwrap();
+        assert!(oenv.join("packages").is_dir());
+        assert!(oenv.join("omni-env.json").is_file());
+
+        // 2. Install mock package into oenv
+        let oenv_py = oenv.join("packages").join("python").join("fastmath");
+        fs::create_dir_all(&oenv_py).unwrap();
+        fs::write(oenv_py.join("__init__.py"), "def calculate(): return 42\n").unwrap();
+
+        // 3. Put conflicting/shadowed version in workspace
+        let ws_py = workspace.join("fastmath.py");
+        fs::write(&ws_py, "def calculate(): return 1\n").unwrap();
+
+        // 4. Test discovery
+        let discovered = DependencyDriller::discover_oenv(&workspace);
+        assert_eq!(discovered, Some(oenv.clone()));
+
+        // 5. Test priority: oenv MUST have priority over workspace-local
+        let mut driller = DependencyDriller::new();
+        let report = driller.crawl_ecosystem_import(&workspace, "python", "fastmath", &[]);
+        assert!(report.resolved_origin.is_some());
+        assert!(report.resolution_source.starts_with("oenv-python"), "Expected oenv-python, got {}", report.resolution_source);
+
+        // 6. Test 'or' fall-through: if a package only exists in workspace, it should resolve workspace-local
+        fs::write(workspace.join("local_helper.py"), "def help(): pass\n").unwrap();
+        let report_local = driller.crawl_ecosystem_import(&workspace, "python", "local_helper", &[]);
+        assert!(report_local.resolved_origin.is_some());
+        assert_eq!(report_local.resolution_source, "workspace-local");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

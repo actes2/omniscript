@@ -181,6 +181,27 @@ void __omni_print_int(int64_t v) {
     printf("%ld\n", v);
 }
 
+char* __omni_str_concat(const char* a, const char* b) {
+    if (!a && !b) return "";
+    if (!a) return (char*)b;
+    if (!b) return (char*)a;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    char* res = (char*)malloc(la + lb + 1);
+    if (!res) return "";
+    memcpy(res, a, la);
+    memcpy(res + la, b, lb);
+    res[la + lb] = '\0';
+    return res;
+}
+
+char* __omni_int_to_str(int64_t v) {
+    char* buf = (char*)malloc(32);
+    if (!buf) return "";
+    snprintf(buf, 32, "%ld", (long)v);
+    return buf;
+}
+
 void __omni_sleep_s(int64_t seconds) {
     if (seconds > 0) {
 #ifdef _WIN32

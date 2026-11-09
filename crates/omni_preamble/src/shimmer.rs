@@ -91,6 +91,43 @@ impl PackageShimmer {
         Self { cache_root }
     }
 
+    /// Initialize a local polyglot environment (`oenv`) layout and metadata
+    pub fn init_oenv(oenv_dir: &Path) -> Result<PathBuf, PreambleError> {
+        let pkgs = oenv_dir.join("packages");
+        let git = oenv_dir.join("git");
+        let tmp = oenv_dir.join("tmp");
+        fs::create_dir_all(&pkgs)?;
+        fs::create_dir_all(&git)?;
+        fs::create_dir_all(&tmp)?;
+
+        let env_file = oenv_dir.join("omni-env.json");
+        if !env_file.exists() {
+            let meta = serde_json::json!({
+                "omni_version": env!("CARGO_PKG_VERSION"),
+                "env_name": oenv_dir.file_name().and_then(|n| n.to_str()).unwrap_or("oenv"),
+                "architecture": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "ecosystems": ["java", "python", "rust", "go", "node", "c", "csharp"]
+            });
+            if let Ok(content) = serde_json::to_string_pretty(&meta) {
+                let _ = fs::write(&env_file, content);
+            }
+        }
+        Ok(oenv_dir.to_path_buf())
+    }
+
+    /// Check if a given directory path is an initialized oenv
+    pub fn is_oenv(path: &Path) -> bool {
+        path.is_dir()
+            && (path.join("omni-env.json").is_file()
+                || path.join("packages").is_dir()
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s == "oenv" || s == ".oenv")
+                    .unwrap_or(false))
+    }
+
     pub fn packages_dir(&self, eco: &PackageEcosystem) -> PathBuf {
         self.cache_root.join("packages").join(eco.as_str())
     }
@@ -707,6 +744,282 @@ impl PackageShimmer {
             results.push((spec.clone(), path));
         }
         Ok(results)
+    }
+
+    /// Query the top candidate packages for an unresolved dependency in a specific ecosystem
+    pub fn query_candidates(&self, eco: &PackageEcosystem, name: &str) -> Vec<PackageSpec> {
+        let clean_name = name.trim().trim_end_matches(';').trim();
+        let root = clean_name.split('.').next().unwrap_or(clean_name);
+
+        match eco {
+            PackageEcosystem::Java => {
+                if root == "lombok" || clean_name.contains("lombok") {
+                    vec![
+                        PackageSpec {
+                            ecosystem: PackageEcosystem::Java,
+                            name: "org.projectlombok:lombok".to_string(),
+                            version: Some("1.18.36".to_string()),
+                            is_git: false,
+                            git_url: None,
+                            git_ref: None,
+                            raw_line: "'java' org.projectlombok:lombok == 1.18.36".to_string(),
+                        },
+                        PackageSpec {
+                            ecosystem: PackageEcosystem::Java,
+                            name: "org.projectlombok:lombok-mapstruct-binding".to_string(),
+                            version: Some("0.2.0".to_string()),
+                            is_git: false,
+                            git_url: None,
+                            git_ref: None,
+                            raw_line: "'java' org.projectlombok:lombok-mapstruct-binding == 0.2.0".to_string(),
+                        },
+                        PackageSpec {
+                            ecosystem: PackageEcosystem::Java,
+                            name: "org.projectlombok:lombok-utils".to_string(),
+                            version: Some("0.1.0".to_string()),
+                            is_git: false,
+                            git_url: None,
+                            git_ref: None,
+                            raw_line: "'java' org.projectlombok:lombok-utils == 0.1.0".to_string(),
+                        },
+                    ]
+                } else if clean_name.contains(':') {
+                    vec![PackageSpec {
+                        ecosystem: PackageEcosystem::Java,
+                        name: clean_name.to_string(),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'java' {}", clean_name),
+                    }]
+                } else {
+                    let segments: Vec<&str> = clean_name.split('.').collect();
+                    if segments.len() >= 3 && (segments[0] == "org" || segments[0] == "com" || segments[0] == "io" || segments[0] == "net") {
+                        let group_id = format!("{}.{}.{}", segments[0], segments[1], segments[2]);
+                        let artifact_id = segments[2];
+                        vec![
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("{}:{}", group_id, artifact_id),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' {}:{}", group_id, artifact_id),
+                            },
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("{}.{}:{}", segments[0], segments[1], artifact_id),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' {}.{}:{}", segments[0], segments[1], artifact_id),
+                            },
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("{}:{}-core", group_id, artifact_id),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' {}:{}-core", group_id, artifact_id),
+                            },
+                        ]
+                    } else {
+                        vec![
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("org.apache.{}:{}", root, root),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' org.apache.{}:{}", root, root),
+                            },
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("com.google.{}:{}", root, root),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' com.google.{}:{}", root, root),
+                            },
+                            PackageSpec {
+                                ecosystem: PackageEcosystem::Java,
+                                name: format!("io.{}:{}", root, root),
+                                version: Some("latest".to_string()),
+                                is_git: false,
+                                git_url: None,
+                                git_ref: None,
+                                raw_line: format!("'java' io.{}:{}", root, root),
+                            },
+                        ]
+                    }
+                }
+            }
+            PackageEcosystem::Python => {
+                vec![
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Python,
+                        name: root.to_string(),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'python' {}", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Python,
+                        name: format!("{}-core", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'python' {}-core", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Python,
+                        name: format!("python-{}", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'python' python-{}", root),
+                    },
+                ]
+            }
+            PackageEcosystem::Node => {
+                vec![
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Node,
+                        name: root.to_string(),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'node' {}", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Node,
+                        name: format!("@types/{}", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'node' @types/{}", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Node,
+                        name: format!("{}-core", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'node' {}-core", root),
+                    },
+                ]
+            }
+            PackageEcosystem::Rust => {
+                vec![
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Rust,
+                        name: root.to_string(),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'rust' {}", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Rust,
+                        name: format!("{}-derive", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'rust' {}-derive", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Rust,
+                        name: format!("{}-core", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'rust' {}-core", root),
+                    },
+                ]
+            }
+            PackageEcosystem::Go => {
+                vec![
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Go,
+                        name: format!("github.com/{}/{}", root, root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'go' github.com/{}/{}", root, root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Go,
+                        name: format!("golang.org/x/{}", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'go' golang.org/x/{}", root),
+                    },
+                ]
+            }
+            PackageEcosystem::Csharp => {
+                vec![
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Csharp,
+                        name: root.to_string(),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'csharp' {}", root),
+                    },
+                    PackageSpec {
+                        ecosystem: PackageEcosystem::Csharp,
+                        name: format!("{}.Core", root),
+                        version: Some("latest".to_string()),
+                        is_git: false,
+                        git_url: None,
+                        git_ref: None,
+                        raw_line: format!("'csharp' {}.Core", root),
+                    },
+                ]
+            }
+            _ => vec![
+                PackageSpec {
+                    ecosystem: eco.clone(),
+                    name: root.to_string(),
+                    version: Some("latest".to_string()),
+                    is_git: false,
+                    git_url: None,
+                    git_ref: None,
+                    raw_line: format!("'{}' {}", eco.as_str(), root),
+                }
+            ],
+        }
+    }
+
+    /// Auto-resolve and fetch the first relevant candidate package for an ecosystem
+    pub fn auto_resolve_and_shim(&self, eco: &PackageEcosystem, name: &str) -> Result<(PackageSpec, PathBuf), PreambleError> {
+        let candidates = self.query_candidates(eco, name);
+        if let Some(top_candidate) = candidates.first() {
+            let path = self.shim_package(top_candidate)?;
+            Ok((top_candidate.clone(), path))
+        } else {
+            Err(PreambleError::PathNotFound(format!("No candidate packages found for '{}' in ecosystem '{}'", name, eco.as_str())))
+        }
     }
 }
 

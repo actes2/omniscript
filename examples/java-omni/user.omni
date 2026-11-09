@@ -1,0 +1,26 @@
+package com.omni.example;
+
+import lombok.Data;
+import lombok.Builder;
+
+@Data
+@Builder
+public class User {
+    private String username;
+    private String email;
+    private int age;
+
+    public User(String username, String email, int age) {
+        this.username = username;
+        this.email = email;
+        this.age = age;
+    }
+
+    public int isAdult() {
+        if (this.age >= 18) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}

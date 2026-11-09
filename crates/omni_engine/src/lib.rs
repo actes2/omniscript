@@ -185,6 +185,15 @@ pub trait InferenceEngine: Send + Sync {
         envelope: &SsaContextEnvelope,
         temp: f32,
     ) -> Result<String, EngineError>;
+
+    /// Autonomously validates and classifies the target language ecosystem for an import statement
+    fn infer_dialect(
+        &self,
+        _source_context: &str,
+        _candidate_import: &str,
+    ) -> Result<String, EngineError> {
+        Err(EngineError::InferenceFailed("Dialect inference not supported by this engine".to_string()))
+    }
 }
 
 /// Offline, deterministic rule/template synthesis engine.
@@ -263,6 +272,31 @@ impl InferenceEngine for MockSynthesisEngine {
             "  ; [Synthesized generic intent block: {}]\n",
             envelope.raw_intent.trim()
         ))
+    }
+
+    fn infer_dialect(
+        &self,
+        source_context: &str,
+        candidate_import: &str,
+    ) -> Result<String, EngineError> {
+        let lower_imp = candidate_import.to_lowercase();
+        let lower_ctx = source_context.to_lowercase();
+        if lower_imp.contains("lombok") || lower_imp.contains("java.") || lower_imp.contains("javax.") || lower_ctx.contains("public class") || lower_ctx.contains("package ") {
+            return Ok("java".to_string());
+        }
+        if lower_imp.contains("requests") || lower_imp.contains("numpy") || lower_imp.contains("torch") || lower_ctx.contains("def ") {
+            return Ok("python".to_string());
+        }
+        if lower_imp.contains("express") || lower_imp.contains("react") || lower_ctx.contains("console.log") {
+            return Ok("javascript".to_string());
+        }
+        if lower_imp.contains("serde") || lower_imp.contains("tokio") || lower_ctx.contains("fn ") {
+            return Ok("rust".to_string());
+        }
+        if lower_imp.contains("gin") || lower_ctx.contains("func ") {
+            return Ok("go".to_string());
+        }
+        Err(EngineError::InferenceFailed("Dialect not determined".to_string()))
     }
 }
 
@@ -893,6 +927,14 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
 
         Err(EngineError::InferenceFailed(stumped_report))
     }
+
+    fn infer_dialect(
+        &self,
+        source_context: &str,
+        candidate_import: &str,
+    ) -> Result<String, EngineError> {
+        self.backend.infer_dialect(source_context, candidate_import)
+    }
 }
 
 /// Fallback engine that tries the primary engine first, then gracefully degrades to offline mock engine
@@ -921,6 +963,16 @@ impl<P: InferenceEngine, F: InferenceEngine> InferenceEngine for FallbackEngine<
                 self.fallback.lower_intent(envelope, temp)
             }
         }
+    }
+
+    fn infer_dialect(
+        &self,
+        source_context: &str,
+        candidate_import: &str,
+    ) -> Result<String, EngineError> {
+        self.primary
+            .infer_dialect(source_context, candidate_import)
+            .or_else(|_| self.fallback.infer_dialect(source_context, candidate_import))
     }
 }
 
@@ -1095,6 +1147,91 @@ impl CandleGgufEngine {
         self.sample_len = len;
         self
     }
+
+    pub fn generate_raw_text(&self, prompt: &str, max_tokens: usize, temp: f32) -> Result<String, EngineError> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer encode error: {}", e)))?;
+        let tokens = encoding.get_ids();
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| EngineError::InferenceFailed(format!("Mutex poison: {}", e)))?;
+
+        model.clear_kv_cache();
+
+        let sampling = if temp <= 0.05 {
+            Sampling::ArgMax
+        } else {
+            Sampling::All {
+                temperature: temp as f64,
+            }
+        };
+
+        let mut logits_processor = LogitsProcessor::from_sampling(299792458, sampling);
+
+        let input = Tensor::new(tokens, &self.device)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
+            .unsqueeze(0)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+        let logits = model
+            .forward(&input, 0)
+            .map_err(|e| EngineError::InferenceFailed(format!("Model forward prefill failed: {}", e)))?;
+        let logits = logits
+            .squeeze(0)
+            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+        let mut next_token = logits_processor
+            .sample(&logits)
+            .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
+
+        let mut generated_tokens = Vec::new();
+
+        let is_stop_token = |t: u32| -> bool {
+            t == self.eos_token_id || t == 151645 || t == 151643
+        };
+
+        if !is_stop_token(next_token) {
+            generated_tokens.push(next_token);
+        }
+
+        for step in 0..max_tokens {
+            if is_stop_token(next_token) {
+                break;
+            }
+
+            let input = Tensor::new(&[next_token], &self.device)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
+                .unsqueeze(0)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+            let logits = model
+                .forward(&input, tokens.len() + step)
+                .map_err(|e| EngineError::InferenceFailed(format!("Model forward step failed: {}", e)))?;
+            let logits = logits
+                .squeeze(0)
+                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
+
+            next_token = logits_processor
+                .sample(&logits)
+                .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
+
+            if is_stop_token(next_token) {
+                break;
+            }
+            generated_tokens.push(next_token);
+        }
+
+        let raw_output = self
+            .tokenizer
+            .decode(&generated_tokens, true)
+            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
+
+        Ok(raw_output)
+    }
 }
 
 pub fn cuda_is_available() -> bool {
@@ -1214,6 +1351,35 @@ impl InferenceEngine for CandleGgufEngine {
             .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
 
         Ok(sanitize_llvm_ir(&raw_output))
+    }
+
+    fn infer_dialect(
+        &self,
+        source_context: &str,
+        candidate_import: &str,
+    ) -> Result<String, EngineError> {
+        let snippet: String = source_context.lines().take(30).collect::<Vec<_>>().join("\n");
+        let prompt = format!(
+            "<|im_start|>system\nYou are OmniScript Polyglot Dialect Classifier. Identify the programming language ecosystem for this import. Output strictly one lowercase word: java, python, rust, go, javascript, c, csharp, lua, or zig.<|im_end|>\n<|im_start|>user\nContext:\n{}\n\nImport:\n{}\n\nDialect:<|im_end|>\n<|im_start|>assistant\n",
+            snippet, candidate_import
+        );
+        let output = self.generate_raw_text(&prompt, 8, 0.0)?;
+        let first_word = output
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|w| !w.is_empty())
+            .unwrap_or("")
+            .to_lowercase();
+        let valid_dialects = [
+            "java", "python", "py", "rust", "rs", "go", "javascript", "js", "node", "c", "cpp", "csharp", "cs", "lua", "zig",
+        ];
+        if valid_dialects.contains(&first_word.as_str()) {
+            Ok(first_word)
+        } else {
+            Err(EngineError::InferenceFailed(format!("Model produced unverified dialect token: '{}'", first_word)))
+        }
     }
 }
 

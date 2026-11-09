@@ -1,8 +1,8 @@
 use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
-use omni_engine::{CandleGgufEngine, FallbackEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
+use omni_engine::{CandleGgufEngine, FallbackEngine, InferenceEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
-use omni_preamble::{DependencyDriller, ImportDirective, PackageShimmer, SymbolCarver};
+use omni_preamble::{DependencyDriller, ImportDirective, PackageEcosystem, PackageShimmer, PackageSpec, SymbolCarver};
 use omni_verify::LlvmVerifier;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -44,6 +44,14 @@ struct Cli {
     /// Target execution device for AI intent lowering: "auto" (default), "cuda", or "cpu"
     #[arg(long, global = true, default_value = "auto")]
     device: String,
+
+    /// Automatically fetch and cache missing third-party dependencies from package indices
+    #[arg(long, global = true, default_value_t = false)]
+    auto_resolve_dependencies: bool,
+
+    /// Polyglot virtual environment directory (e.g. --oenv oenv). Auto-scans if present.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "oenv")]
+    oenv: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -66,11 +74,41 @@ enum Commands {
     },
     /// Launch the interactive polyglot OmniScript REPL
     Repl,
-    /// Install dependencies declared in omni-requirements.txt or custom manifest
+    /// Install dependencies declared in omni-requirements.txt or individual package
+    #[command(
+        about = "Install dependencies from an omni-requirements manifest or package spec",
+        long_about = "Synchronize polyglot third-party dependencies into a local oenv or ~/.omnicache/.\n\n\
+POLYGLOT ENVIRONMENT (--oenv):\n  \
+omnic install --oenv [dir]     Wrap all dependencies into an isolated local environment (defaults to './oenv').\n  \
+                               Zero-sourcing: omnic run and build automatically scan for ./oenv or ./.oenv\n  \
+                               in the project root with priority over local paths and host caches.\n\n\
+MANIFEST SYNTAX (omni-requirements.txt):\n  \
+# Ecosystem Registry Packages:\n  \
+'python' requests == 2.31.0\n  \
+'java'   org.projectlombok:lombok == 1.18.36\n  \
+'node'   express >= 4.18.2\n  \
+'rust'   serde == 1.0.197\n  \
+'go'     github.com/gin-gonic/gin\n\n  \
+# Direct Git Repositories:\n  \
+[git]'python' https://github.com/psf/requests.git#v2.31.0\n  \
+[git]'rust'   https://github.com/serde-rs/serde.git#v1.0.197\n\n\
+OMNISCRIPT IMPORT STYLES:\n  \
+1. Explicit Dialect:  import 'java' lombok.Data;\n  \
+2. Bare Polyglot:     import lombok.Data;  (Tier 1 AI / Tier 2 AST cues auto-detects dialect)\n  \
+3. Auto-Fetch Mode:   omnic run --auto-resolve-dependencies app.omni\n\n\
+EXAMPLES:\n  \
+omnic install                            # Installs from ./omni-requirements.txt into active oenv or ~/.omnicache\n  \
+omnic install --oenv oenv                # Creates ./oenv and installs from ./omni-requirements.txt\n  \
+omnic install --oenv oenv 'java' lombok   # Installs lombok into ./oenv\n  \
+omnic install 'java' lombok               # Installs lombok into active oenv (if present) or ~/.omnicache\n  \
+omnic install 'python' fastapi           # Installs fastapi"
+    )]
     Install {
-        /// Manifest path (defaults to omni-requirements.txt)
+        /// Manifest path (e.g. omni-requirements.txt) or ecosystem dialect (e.g. 'java')
         #[arg(default_value = "omni-requirements.txt")]
-        manifest: PathBuf,
+        target: String,
+        /// Optional package name when target is an ecosystem (e.g. 'org.projectlombok:lombok')
+        package: Option<String>,
     },
     /// Generate a verified synthetic dataset of <omni_ir_task> <-> LLVM IR pairs (Zero external downloads)
     #[command(alias = "export-dataset")]
@@ -89,21 +127,21 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Commands::Repl) => run_repl()?,
-        Some(Commands::Install { manifest }) => {
-            install_dependencies(&manifest, args.verbose)?;
+        Some(Commands::Install { target, package }) => {
+            install_dependencies(&target, package.as_deref(), args.oenv.as_deref(), args.verbose)?;
         }
         Some(Commands::SynthDataset { count, output }) => {
             synth_dataset(count, &output)?;
         }
         Some(Commands::Run { source, args: prog_args }) => {
-            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
+            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
         }
         Some(Commands::Build { source, output }) => {
-            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
+            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
         }
         None => {
             if let Some(ref source) = args.source {
-                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device)?;
+                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
             } else {
                 // If no arguments or subcommands provided, launch interactive REPL
                 run_repl()?;
@@ -134,39 +172,126 @@ fn synth_dataset(count: usize, output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn install_dependencies(manifest_path: &Path, verbose: bool) -> anyhow::Result<()> {
-    if !manifest_path.exists() {
-        anyhow::bail!("Requirements manifest '{}' not found.", manifest_path.display());
-    }
-    let shimmer = PackageShimmer::new();
-    let specs = shimmer
-        .parse_requirements_file(manifest_path)
-        .map_err(|e| anyhow::anyhow!("Failed parsing requirements: {}", e))?;
+fn install_dependencies(
+    target: &str,
+    package: Option<&str>,
+    oenv_arg: Option<&str>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let target_path = Path::new(target);
+    let effective_oenv: Option<PathBuf> = oenv_arg
+        .map(PathBuf::from)
+        .or_else(|| DependencyDriller::discover_oenv(Path::new(".")));
 
-    println!("OmniScript Package Shimmer: installing {} packages from {}...", specs.len(), manifest_path.display());
-    let mut installed = 0;
-    for spec in &specs {
-        let desc = if spec.is_git {
-            format!("[git]'{}' {}", spec.ecosystem.as_str(), spec.git_url.as_deref().unwrap_or(""))
-        } else {
-            format!("'{}' {} (version: {})", spec.ecosystem.as_str(), spec.name, spec.version.as_deref().unwrap_or("latest"))
-        };
-        print!("  -> Resolving {} ... ", desc);
-        let _ = io::stdout().flush();
-        match shimmer.shim_package(spec) {
-            Ok(cached_path) => {
-                println!("OK");
-                if verbose {
-                    println!("     Cache: {}", cached_path.display());
+    let (shimmer, dest_desc) = match effective_oenv {
+        Some(ref p) => {
+            PackageShimmer::init_oenv(p)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize oenv directory '{}': {}", p.display(), e))?;
+            println!("[OMNIC] Active polyglot environment target: {}", p.display());
+            (PackageShimmer::with_cache_root(p.clone()), format!("{}/", p.display()))
+        }
+        None => (PackageShimmer::new(), "~/.omnicache/".to_string()),
+    };
+
+    if package.is_none()
+        && (target_path.is_file()
+            || target.ends_with(".txt")
+            || target.ends_with(".json")
+            || target.ends_with(".toml"))
+    {
+        if !target_path.exists() {
+            anyhow::bail!("Requirements manifest '{}' not found.", target_path.display());
+        }
+        let specs = shimmer
+            .parse_requirements_file(target_path)
+            .map_err(|e| anyhow::anyhow!("Failed parsing requirements: {}", e))?;
+
+        println!(
+            "OmniScript Package Shimmer: installing {} packages from {} into {}...",
+            specs.len(),
+            target_path.display(),
+            dest_desc
+        );
+        let mut installed = 0;
+        for spec in &specs {
+            let desc = if spec.is_git {
+                format!(
+                    "[git]'{}' {}",
+                    spec.ecosystem.as_str(),
+                    spec.git_url.as_deref().unwrap_or("")
+                )
+            } else {
+                format!(
+                    "'{}' {} (version: {})",
+                    spec.ecosystem.as_str(),
+                    spec.name,
+                    spec.version.as_deref().unwrap_or("latest")
+                )
+            };
+            print!("  -> Resolving {} ... ", desc);
+            let _ = io::stdout().flush();
+            match shimmer.shim_package(spec) {
+                Ok(cached_path) => {
+                    println!("OK");
+                    if verbose {
+                        println!("     Cache: {}", cached_path.display());
+                    }
+                    installed += 1;
                 }
-                installed += 1;
-            }
-            Err(e) => {
-                println!("FAILED: {}", e);
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                }
             }
         }
+        println!(
+            "Successfully synchronized {}/{} packages into {}",
+            installed,
+            specs.len(),
+            dest_desc
+        );
+        return Ok(());
     }
-    println!("Successfully synchronized {}/{} packages into ~/.omnicache/", installed, specs.len());
+
+    // Direct single package installation
+    let spec = if let Some(pkg) = package {
+        let clean_eco = target.trim_matches('\'').trim_matches('"');
+        let eco = PackageEcosystem::from_str(clean_eco);
+        PackageSpec {
+            ecosystem: eco,
+            name: pkg.to_string(),
+            version: None,
+            is_git: false,
+            git_url: None,
+            git_ref: None,
+            raw_line: format!("'{}' {}", clean_eco, pkg),
+        }
+    } else {
+        let specs = PackageShimmer::parse_requirements(target);
+        if let Some(first) = specs.into_iter().next() {
+            first
+        } else {
+            PackageSpec {
+                ecosystem: PackageEcosystem::from_str("polyglot"),
+                name: target.to_string(),
+                version: None,
+                is_git: false,
+                git_url: None,
+                git_ref: None,
+                raw_line: target.to_string(),
+            }
+        }
+    };
+
+    println!(
+        "OmniScript Package Shimmer: resolving single package '{}' (ecosystem: {}) into {}...",
+        spec.name,
+        spec.ecosystem.as_str(),
+        dest_desc
+    );
+    let cached = shimmer
+        .shim_package(&spec)
+        .map_err(|e| anyhow::anyhow!("Failed to shim package: {}", e))?;
+    println!("Successfully cached '{}' at {}", spec.name, cached.display());
     Ok(())
 }
 
@@ -189,8 +314,10 @@ fn run_file(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    auto_resolve_dependencies: bool,
+    oenv: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device, auto_resolve_dependencies, oenv)?;
     let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
     println!(
         "[COMPILE] Ready in {:.2?} (Parse: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?})",
@@ -213,15 +340,17 @@ fn build_file(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    auto_resolve_dependencies: bool,
+    oenv: Option<&str>,
 ) -> anyhow::Result<()> {
     let build_start = std::time::Instant::now();
     println!("==================================================");
     println!(" OmniScript Compiler (omnic v0.1.0)");
     println!(" Target Source: {}", source_path.display());
-    println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {} | Device: {}", temp, opt_level, !no_cache, device);
+    println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {} | Device: {} | Auto-Resolve: {}", temp, opt_level, !no_cache, device, auto_resolve_dependencies);
     println!("==================================================");
 
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device, auto_resolve_dependencies, oenv)?;
     let verifier = LlvmVerifier::new()?;
 
     println!("\n[5/5] Linking native ELF binary...");
@@ -248,12 +377,27 @@ fn compile_source(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    auto_resolve_dependencies: bool,
+    oenv: Option<&str>,
 ) -> anyhow::Result<(String, Vec<PathBuf>, CompilationStats)> {
     let start_compile = std::time::Instant::now();
     if !source_path.exists() {
         eprintln!("[ERROR] Source file '{}' does not exist.", source_path.display());
         std::process::exit(1);
     }
+
+    let pref = match device.to_lowercase().as_str() {
+        "cuda" | "gpu" => {
+            if !omni_engine::cuda_is_available() {
+                eprintln!("[ERROR] Explicit device '--device cuda' requested, but CUDA acceleration is not available or drivers/toolkit are missing.");
+                std::process::exit(1);
+            }
+            omni_engine::DevicePreference::Cuda(0)
+        }
+        "cpu" => omni_engine::DevicePreference::Cpu,
+        _ => omni_engine::DevicePreference::Auto,
+    };
+    let candle_engine_opt = CandleGgufEngine::discover_default_with_device(pref);
 
     let source_content = fs::read_to_string(source_path)?;
     let module_name = source_path
@@ -262,6 +406,15 @@ fn compile_source(
         .unwrap_or("main");
 
     let base_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let effective_oenv_path: Option<PathBuf> = oenv
+        .map(PathBuf::from)
+        .or_else(|| DependencyDriller::discover_oenv(base_dir));
+
+    if verbose {
+        if let Some(ref env_p) = effective_oenv_path {
+            println!("  -> Active polyglot environment (oenv): {}", env_p.display());
+        }
+    }
 
     // 1. Parse AST & Memory Instructions
     let t_parse_start = std::time::Instant::now();
@@ -275,10 +428,17 @@ fn compile_source(
     let mut foreign_c_files = omni_runtime::runtime_c_sources();
     let mut all_dependency_files = Vec::new();
 
-    for import in &module.imports {
+    let mut pending_imports = module.imports.clone();
+    let mut processed_imports = std::collections::HashSet::new();
+
+    while let Some(import) = pending_imports.pop() {
+        let import_key = format!("{:?}", import);
+        if !processed_imports.insert(import_key) {
+            continue;
+        }
         match import {
             ImportDirective::FileAlias { path, alias } => {
-                let full_path = base_dir.join(path);
+                let full_path = base_dir.join(&path);
                 if !full_path.exists() {
                     eprintln!(
                         "  [ERROR] Import file '{}' not found at '{}'",
@@ -290,7 +450,7 @@ fn compile_source(
                 all_dependency_files.push(full_path.clone());
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "c" || ext == "cpp" {
-                    let mut driller = DependencyDriller::new();
+                    let mut driller = DependencyDriller::new().with_oenv(effective_oenv_path.clone());
                     let slice = driller.drill(&full_path);
                     for src in slice.local_sources {
                         if !foreign_c_files.contains(&src) {
@@ -299,6 +459,31 @@ fn compile_source(
                     }
                     if verbose && !slice.external_frontier.is_empty() {
                         println!("  -> External frontier dependencies detected: {:?}", slice.external_frontier);
+                    }
+                } else if ext == "omni" || ext == "py" || ext == "java" || ext == "rs" || ext == "js" {
+                    if let Ok(src) = fs::read_to_string(&full_path) {
+                        let sub_mod = parser.parse_module(path.file_stem().and_then(|s| s.to_str()).unwrap_or("module"), &src);
+                        for f in sub_mod.functions {
+                            if !module.functions.iter().any(|existing| existing.name == f.name) {
+                                module.functions.push(f);
+                            }
+                        }
+                        for s in sub_mod.structs_and_classes {
+                            if !module.structs_and_classes.iter().any(|existing| existing.name == s.name) {
+                                module.structs_and_classes.push(s);
+                            }
+                        }
+                        for e in sub_mod.enums {
+                            if !module.enums.iter().any(|existing| existing.name == e.name) {
+                                module.enums.push(e);
+                            }
+                        }
+                        for imp in sub_mod.imports {
+                            if !module.imports.iter().any(|existing| existing == &imp) {
+                                module.imports.push(imp.clone());
+                                pending_imports.push(imp);
+                            }
+                        }
                     }
                 }
                 if verbose {
@@ -317,13 +502,126 @@ fn compile_source(
                         target_symbols.push(sym.clone());
                     }
                 }
-                let mut driller = DependencyDriller::new();
-                let walk = driller.crawl_ecosystem_import(
+                let mut driller = DependencyDriller::new().with_oenv(effective_oenv_path.clone());
+                let mut walk = driller.crawl_ecosystem_import(
                     base_dir,
-                    ecosystem,
-                    mod_name,
+                    &ecosystem,
+                    &mod_name,
                     &target_symbols,
                 );
+
+                // Tiered dialect classification & missing package resolution
+                if walk.resolved_origin.is_none() && walk.resolution_source == "unresolved" {
+                    let mut inferred_dialect = if ecosystem != "polyglot" && ecosystem != "unknown" {
+                        Some(ecosystem.clone())
+                    } else {
+                        None
+                    };
+
+                    // Tier 1: Local AI Inference (Hypothesis)
+                    if inferred_dialect.is_none() {
+                        if let Some(ref engine) = candle_engine_opt {
+                            if let Ok(dial) = engine.infer_dialect(&source_content, &mod_name) {
+                                if verbose {
+                                    println!("  -> [Tier 1 LLM] Inferred dialect '{}' for import '{}'", dial, mod_name);
+                                }
+                                inferred_dialect = Some(dial);
+                            }
+                        }
+                    }
+
+                    // Tier 2: Static Parser Fallback
+                    if inferred_dialect.is_none() {
+                        if let Some(dial) = omni_preamble::static_infer_dialect(&source_content, &mod_name) {
+                            if verbose {
+                                println!("  -> [Tier 2 Static] Inferred dialect '{}' for import '{}'", dial, mod_name);
+                            }
+                            inferred_dialect = Some(dial);
+                        }
+                    }
+
+                    if let Some(dial) = inferred_dialect {
+                        let eco = PackageEcosystem::from_str(&dial);
+
+                        // Retry crawling with inferred dialect if previously tried as polyglot
+                        if ecosystem == "polyglot" {
+                            walk = driller.crawl_ecosystem_import(base_dir, &dial, &mod_name, &target_symbols);
+                        }
+
+                        // If still unresolved, missing package handling
+                        if walk.resolved_origin.is_none() && walk.resolution_source == "unresolved" {
+                            let shimmer = match effective_oenv_path {
+                                Some(ref p) => {
+                                    let _ = PackageShimmer::init_oenv(p);
+                                    PackageShimmer::with_cache_root(p.clone())
+                                }
+                                None => PackageShimmer::new(),
+                            };
+                            let dest_label = if let Some(ref p) = effective_oenv_path {
+                                format!("oenv ({})", p.display())
+                            } else {
+                                "~/.omnicache".to_string()
+                            };
+
+                            if auto_resolve_dependencies {
+                                println!("[OMNIC] Missing dependency '{}' for ecosystem '{}' in {}.", mod_name, dial, dest_label);
+                                println!("  -> Auto-resolving dependency via upstream package index (--auto-resolve-dependencies)...");
+                                match shimmer.auto_resolve_and_shim(&eco, &mod_name) {
+                                    Ok((spec, path)) => {
+                                        println!("  -> Successfully auto-resolved '{}' into: {}", spec.name, path.display());
+                                        walk = driller.crawl_ecosystem_import(base_dir, &dial, &mod_name, &target_symbols);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ERROR] Auto-resolution failed for '{}' ({:?}): {}", mod_name, eco, e);
+                                        let candidates = shimmer.query_candidates(&eco, &mod_name);
+                                        if !candidates.is_empty() {
+                                            eprintln!("  Top candidate packages for {}:", dial);
+                                            for c in candidates.iter().take(3) {
+                                                eprintln!("    - {}", c.name);
+                                            }
+                                        }
+                                        std::process::exit(1);
+                                    }
+                                }
+                            } else {
+                                let candidates = shimmer.query_candidates(&eco, &mod_name);
+                                eprintln!("\n[ERROR] Missing dependency '{}' for ecosystem '{}' in {}.", mod_name, dial, dest_label);
+                                eprintln!("To install this dependency manually, run:");
+                                let env_flag = if let Some(ref p) = effective_oenv_path {
+                                    format!(" --oenv {}", p.display())
+                                } else {
+                                    String::new()
+                                };
+                                if let Some(top) = candidates.first() {
+                                    eprintln!("  omnic install{} '{}' {}", env_flag, dial, top.name);
+                                } else {
+                                    eprintln!("  omnic install{} '{}' {}", env_flag, dial, mod_name);
+                                }
+                                if !candidates.is_empty() {
+                                    eprintln!("\nTop 3 candidate packages for {}:", dial);
+                                    for (idx, c) in candidates.iter().take(3).enumerate() {
+                                        let ver = c.version.as_deref().unwrap_or("latest");
+                                        eprintln!("  {}. {} (version: {})", idx + 1, c.name, ver);
+                                    }
+                                }
+                                eprintln!("\nAlternatively, re-run with '--auto-resolve-dependencies' to fetch and shim automatically.\n");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        // Tier 3: Unknown dialect warning
+                        let dest_label = if let Some(ref p) = effective_oenv_path {
+                            format!("oenv ({})", p.display())
+                        } else {
+                            "~/.omnicache".to_string()
+                        };
+                        println!(
+                            "[WARN] Unresolved import '{}' (ecosystem: unknown). No matching package found in workspace or {}.",
+                            mod_name, dest_label
+                        );
+                    }
+                }
+
                 for f in &walk.visited_files {
                     if !all_dependency_files.contains(f) {
                         all_dependency_files.push(f.clone());
@@ -361,7 +659,7 @@ fn compile_source(
                                     format!("return {}", decompiled_expr.trim())
                                 };
                                 let func_src = format!("fn {}({}) {{\n  {}\n}}\n", m_name, params.join(", "), body);
-                                let sub_mod = parser.parse_module(mod_name, &func_src);
+                                let sub_mod = parser.parse_module(&mod_name, &func_src);
                                 for f in sub_mod.functions {
                                     if !module.functions.iter().any(|existing| existing.name == f.name) {
                                         module.functions.push(f);
@@ -371,7 +669,7 @@ fn compile_source(
                         }
                     } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
                         if let Ok(src) = fs::read_to_string(vf) {
-                            let sub_mod = parser.parse_module(mod_name, &src);
+                            let sub_mod = parser.parse_module(&mod_name, &src);
                             for f in sub_mod.functions {
                                 if !module.functions.iter().any(|existing| existing.name == f.name) {
                                     module.functions.push(f);
@@ -447,7 +745,7 @@ fn compile_source(
             }
             ImportDirective::FromDirectory { dir_path, symbols } => {
                 for sym_name in symbols {
-                    match carver.carve_symbol_from_dir(base_dir, dir_path, sym_name) {
+                    match carver.carve_symbol_from_dir(base_dir, &dir_path, &sym_name) {
                         Ok(sym) => {
                             if verbose {
                                 let uncaged_str = if sym.is_uncaged { " [UN-CAGED]" } else { "" };
@@ -517,24 +815,12 @@ fn compile_source(
         let verifier = LlvmVerifier::new()?;
         let fallback = MockSynthesisEngine::new();
 
-        let pref = match device.to_lowercase().as_str() {
-            "cuda" | "gpu" => {
-                if !omni_engine::cuda_is_available() {
-                    eprintln!("[ERROR] Explicit device '--device cuda' requested, but CUDA acceleration is not available or drivers/toolkit are missing.");
-                    std::process::exit(1);
-                }
-                omni_engine::DevicePreference::Cuda(0)
-            }
-            "cpu" => omni_engine::DevicePreference::Cpu,
-            _ => omni_engine::DevicePreference::Auto,
-        };
-
-        let generated = if let Some(candle_engine) = CandleGgufEngine::discover_default_with_device(pref) {
+        let generated = if let Some(ref candle_engine) = candle_engine_opt {
             let dev_tag = if candle_engine.is_cuda() { "CUDA GPU" } else { "CPU (AVX2/SIMD)" };
             if verbose {
                 println!("  -> [Inference] Using in-process Candle GGUF engine on {} ({})", dev_tag, candle_engine.model_path.display());
             }
-            let primary_verified = VerifiedSynthesisEngine::new(&candle_engine, &verifier);
+            let primary_verified = VerifiedSynthesisEngine::new(candle_engine, &verifier);
             let codegen = CodeGenerator::new(&primary_verified);
             codegen.generate_module_ir(&module, temp)?
         } else {

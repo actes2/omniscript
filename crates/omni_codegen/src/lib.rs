@@ -29,6 +29,7 @@ pub struct SymbolBinding {
 pub struct ScopeTree {
     scopes: Vec<HashMap<String, SymbolBinding>>,
     pub class_fields: HashMap<String, HashMap<String, usize>>,
+    pub class_field_types: HashMap<String, HashMap<String, String>>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
 }
@@ -38,6 +39,7 @@ impl ScopeTree {
         Self {
             scopes: vec![HashMap::new()],
             class_fields: HashMap::new(),
+            class_field_types: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
         }
@@ -291,21 +293,8 @@ impl<'a> CodeGenerator<'a> {
         for stmt in stmts {
             match stmt {
                 Statement::Print { expr } => {
-                    let trimmed = expr.trim();
-                    if trimmed.contains("{}") && trimmed.contains(',') {
-                        if let Some(comma_pos) = trimmed.rfind(',') {
-                            let fmt = trimmed[..comma_pos]
-                                .trim()
-                                .trim_start_matches('f')
-                                .trim_matches('"')
-                                .trim_matches('\'');
-                            Self::intern_string(string_constants, counter, fmt);
-                        }
-                    } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-                        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-                    {
-                        let text = &trimmed[1..trimmed.len() - 1];
-                        Self::intern_string(string_constants, counter, text);
+                    for cap in quote_re.captures_iter(expr) {
+                        Self::intern_string(string_constants, counter, &cap[1]);
                     }
                 }
                 Statement::MapInit { entries, .. } => {
@@ -342,6 +331,136 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    pub fn is_string_expr(expr: &str, scope_tree: &ScopeTree) -> bool {
+        let trimmed = expr.trim();
+        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        {
+            return true;
+        }
+        if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
+            if op == "+" {
+                return Self::is_string_expr(&left, scope_tree) || Self::is_string_expr(&right, scope_tree);
+            }
+        }
+        if trimmed.contains('.') && !trimmed.contains('(') {
+            let parts: Vec<&str> = trimmed.split('.').collect();
+            if parts.len() == 2 {
+                let rec = parts[0].trim();
+                let fld = parts[1].trim();
+                if let Some(b) = scope_tree.resolve(rec) {
+                    if b.type_hint.starts_with("%struct.") {
+                        let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        return scope_tree
+                            .class_field_types
+                            .get(cls_name)
+                            .and_then(|m| m.get(fld))
+                            .map(|th| th.to_lowercase().contains("string") || th.contains("char*"))
+                            .unwrap_or(false);
+                    }
+                }
+            }
+        }
+        if let Some(b) = scope_tree.resolve(trimmed) {
+            return b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*");
+        }
+        false
+    }
+
+    pub fn eval_str_ptr(
+        &self,
+        expr: &str,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> String {
+        let trimmed = expr.trim();
+
+        // 1. String literal
+        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        {
+            let text = &trimmed[1..trimmed.len() - 1];
+            if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                let str_ptr = format!("%str_lit_eval_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                    str_ptr, len, len, const_name
+                ));
+                return str_ptr;
+            }
+        }
+
+        // 2. Binary concatenation: left + right
+        if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
+            if op == "+" {
+                let left_ptr = self.eval_str_ptr(&left, ir, scope_tree, string_constants, temp_counter);
+                let right_ptr = self.eval_str_ptr(&right, ir, scope_tree, string_constants, temp_counter);
+                let concat_res = format!("%concat_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = call i8* @__omni_str_concat(i8* {}, i8* {})\n",
+                    concat_res, left_ptr, right_ptr
+                ));
+                return concat_res;
+            }
+        }
+
+        // 3. Struct field access: rec.fld
+        if trimmed.contains('.') && !trimmed.contains('(') {
+            let parts: Vec<&str> = trimmed.split('.').collect();
+            if parts.len() == 2 {
+                let rec = parts[0].trim();
+                let fld = parts[1].trim();
+                if let Some(b) = scope_tree.resolve(rec) {
+                    if b.type_hint.starts_with("%struct.") {
+                        let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fld)) {
+                            let inst_ld = format!("%inst_fld_str_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
+                            let gep = format!("%str_gep_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
+                            let val64 = format!("%val64_str_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
+                            return str_ptr;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Local string variable in scope
+        if let Some(b) = scope_tree.resolve(trimmed) {
+            if b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*") {
+                let val64 = format!("%var_val64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, b.llvm_ptr));
+                let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
+                return str_ptr;
+            }
+        }
+
+        // 5. Fallback: evaluate integer / expression and convert to string via @__omni_int_to_str
+        let int_val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
+        let ext = format!("%ext_concat_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, int_val));
+        let int_str = format!("%int_str_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, ext));
+        int_str
+    }
+
     /// Evaluates an expression or variable into an LLVM i32 register
     fn eval_val(
         &self,
@@ -356,6 +475,25 @@ impl<'a> CodeGenerator<'a> {
         // 1. Integer constant
         if let Ok(num) = trimmed.parse::<i32>() {
             return num.to_string();
+        }
+
+        // String constant literal: `"hello"` or `'world'`
+        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        {
+            let text = &trimmed[1..trimmed.len() - 1];
+            if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                let str_ptr = format!("%str_lit_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                    str_ptr, len, len, const_name
+                ));
+                let str_i32 = format!("%str_i32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", str_i32, str_ptr));
+                return str_i32;
+            }
         }
 
         // Struct field access: rec.fld
@@ -619,6 +757,14 @@ impl<'a> CodeGenerator<'a> {
 
         // 5. Binary arithmetic with operator precedence (+, - first, then *, /, %)
         if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
+            if op == "+" && (Self::is_string_expr(&left, scope_tree) || Self::is_string_expr(&right, scope_tree)) {
+                let str_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
+                let str_i32 = format!("%str_concat_i32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", str_i32, str_ptr));
+                return str_i32;
+            }
+
             let left_val = self.eval_val(&left, ir, scope_tree, string_constants, temp_counter);
             let right_val = self.eval_val(&right, ir, scope_tree, string_constants, temp_counter);
 
@@ -761,17 +907,29 @@ impl<'a> CodeGenerator<'a> {
                                 if b.type_hint.starts_with("%struct.") {
                                     let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                                     if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fld)) {
-                                        let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
-                                        let ext = format!("%ext_fld_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
+                                        let is_str_binding = scope_tree.resolve(trimmed_expr)
+                                            .map(|sb| sb.type_hint.to_lowercase().contains("string") || sb.type_hint.contains("char*"))
+                                            .unwrap_or(false);
+                                        let store_val = if is_str_binding {
+                                            let src_b = scope_tree.resolve(trimmed_expr).unwrap();
+                                            let ld64 = format!("%str_ld64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, src_b.llvm_ptr));
+                                            ld64
+                                        } else {
+                                            let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                            let ext = format!("%ext_fld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
+                                            ext
+                                        };
                                         let inst_ld = format!("%inst_fld_ld_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
                                         let gep = format!("%fld_gep_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
-                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", ext, gep));
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", store_val, gep));
                                         continue;
                                     }
                                 }
@@ -779,10 +937,11 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
 
-                    // Class / Struct Constructor Call: `c = Counter(10)`
-                    if let Some(open) = trimmed_expr.find('(') {
-                        if trimmed_expr.ends_with(')') {
-                            let cls_cand = trimmed_expr[..open].trim();
+                    // Class / Struct Constructor Call: `c = Counter(10)` or `u = new User(...)`
+                    let ctor_candidate_expr = trimmed_expr.strip_prefix("new ").unwrap_or(trimmed_expr).trim();
+                    if let Some(open) = ctor_candidate_expr.find('(') {
+                        if ctor_candidate_expr.ends_with(')') {
+                            let cls_cand = ctor_candidate_expr[..open].trim();
                             if scope_tree.class_fields.contains_key(cls_cand) {
                                 let cls_name = cls_cand;
                                 let inst_alloc = format!("%inst_alloc_{}_{}", target, *temp_counter);
@@ -793,7 +952,7 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_alloc));
 
-                                let inner = &trimmed_expr[open + 1..trimmed_expr.len() - 1];
+                                let inner = &ctor_candidate_expr[open + 1..ctor_candidate_expr.len() - 1];
                                 let raw_args: Vec<String> = if inner.is_empty() {
                                     Vec::new()
                                 } else {
@@ -802,7 +961,26 @@ impl<'a> CodeGenerator<'a> {
 
                                 let mut arg_regs = Vec::new();
                                 for a in &raw_args {
-                                    let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
+                                    let a_trim = a.trim();
+                                    if (a_trim.starts_with('"') && a_trim.ends_with('"'))
+                                        || (a_trim.starts_with('\'') && a_trim.ends_with('\''))
+                                    {
+                                        let text = &a_trim[1..a_trim.len() - 1];
+                                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                                            let str_ptr = format!("%ctor_str_lit_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!(
+                                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                                str_ptr, len, len, const_name
+                                            ));
+                                            let str_i64 = format!("%ctor_str_i64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", str_i64, str_ptr));
+                                            arg_regs.push(str_i64);
+                                            continue;
+                                        }
+                                    }
+                                    let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
                                     let ext = format!("%init_ext_{}", *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
@@ -1297,19 +1475,9 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
                             ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
                         }
-                    } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-                        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-                    {
-                        let text = &trimmed[1..trimmed.len() - 1];
-                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
-                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!(
-                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
-                                str_ptr, len, len, const_name
-                            ));
-                            ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
-                        }
+                    } else if Self::is_string_expr(trimmed, scope_tree) {
+                        let str_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
                     } else {
                         // Print integer / expression value via @__omni_print_int
                         let val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
@@ -2023,14 +2191,19 @@ impl<'a> CodeGenerator<'a> {
 
         // 1. Structs and Classes -> Monomorphized Field Layout
         let mut class_fields_map: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut class_field_types_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut struct_defs = Vec::new();
         let mut struct_defs_ir = String::new();
 
         for cls in &module.structs_and_classes {
             let mut field_names: Vec<String> = Vec::new();
+            let mut f_types: HashMap<String, String> = HashMap::new();
             for f in &cls.fields {
                 if !field_names.contains(&f.name) {
                     field_names.push(f.name.clone());
+                }
+                if let Some(ref th) = f.type_hint {
+                    f_types.insert(f.name.clone(), th.clone());
                 }
             }
             if field_names.is_empty() {
@@ -2042,6 +2215,7 @@ impl<'a> CodeGenerator<'a> {
                 f_map.insert(name.clone(), idx);
             }
             class_fields_map.insert(cls.name.clone(), f_map);
+            class_field_types_map.insert(cls.name.clone(), f_types);
 
             let type_list = vec!["i64"; field_names.len()].join(", ");
             let s_def = format!("%struct.{} = type {{ {} }}", cls.name, type_list);
@@ -2088,6 +2262,7 @@ impl<'a> CodeGenerator<'a> {
 
                 let mut scope_tree = ScopeTree::new();
                 scope_tree.class_fields = class_fields_map.clone();
+                scope_tree.class_field_types = class_field_types_map.clone();
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
                 let mut deferred_frees: Vec<CleanupOp> = Vec::new();
@@ -2102,6 +2277,12 @@ impl<'a> CodeGenerator<'a> {
 
                 scope_tree.insert("self".to_string(), SymbolBinding {
                     name: "self".to_string(),
+                    llvm_ptr: self_alloca.clone(),
+                    type_hint: format!("%struct.{}*", cls.name),
+                    is_scoped: true,
+                });
+                scope_tree.insert("this".to_string(), SymbolBinding {
+                    name: "this".to_string(),
                     llvm_ptr: self_alloca,
                     type_hint: format!("%struct.{}*", cls.name),
                     is_scoped: true,
@@ -2113,19 +2294,37 @@ impl<'a> CodeGenerator<'a> {
                         1 => "%arg2",
                         _ => "%arg3",
                     };
-                    let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
-                    temp_counter += 1;
-                    functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, reg_src));
-                    let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                    temp_counter += 1;
-                    functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                    functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
-                    scope_tree.insert(param.name.clone(), SymbolBinding {
-                        name: param.name.clone(),
-                        llvm_ptr: ptr,
-                        type_hint: "i32".to_string(),
-                        is_scoped: true,
-                    });
+                    let is_str = param
+                        .type_hint
+                        .as_deref()
+                        .map(|t| t.to_lowercase().contains("string") || t.contains("char*"))
+                        .unwrap_or(false);
+                    if is_str {
+                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
+                        functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", reg_src, ptr));
+                        scope_tree.insert(param.name.clone(), SymbolBinding {
+                            name: param.name.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "String".to_string(),
+                            is_scoped: true,
+                        });
+                    } else {
+                        let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, reg_src));
+                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
+                        temp_counter += 1;
+                        functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                        functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                        scope_tree.insert(param.name.clone(), SymbolBinding {
+                            name: param.name.clone(),
+                            llvm_ptr: ptr,
+                            type_hint: "i32".to_string(),
+                            is_scoped: true,
+                        });
+                    }
                 }
 
                 let custom_ret = self.lower_statements(
@@ -2170,6 +2369,7 @@ impl<'a> CodeGenerator<'a> {
 
             let mut scope_tree = ScopeTree::new();
             scope_tree.class_fields = class_fields_map.clone();
+            scope_tree.class_field_types = class_field_types_map.clone();
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
             let mut deferred_frees: Vec<CleanupOp> = Vec::new();

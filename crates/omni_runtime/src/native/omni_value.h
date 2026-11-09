@@ -53,6 +53,8 @@ bool __omni_val_truthy(OmniValue v);
 void __omni_val_print(OmniValue v);
 void __omni_print_str(const char* s);
 void __omni_print_int(int64_t v);
+char* __omni_str_concat(const char* a, const char* b);
+char* __omni_int_to_str(int64_t v);
 void __omni_sleep_s(int64_t seconds);
 void __omni_sleep_ms(int64_t milliseconds);
 
