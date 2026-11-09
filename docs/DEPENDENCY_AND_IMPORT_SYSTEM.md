@@ -64,6 +64,72 @@ OmniScript autonomously discovers, installs, and traverses native package manage
 
 ---
 
+## 2.2 Isolated Polyglot Environments (`oenv`)
+
+OmniScript supports isolated local project environments (`oenv`) akin to polyglot virtual environments, encapsulating all external dependencies (packages, extracted bytecode, and git clones) into a hermetic workspace directory:
+
+```bash
+# 1. Initialize local oenv and install dependencies
+omnic install --oenv oenv                      # Targets ./oenv from omni-requirements.txt
+omnic install --oenv oenv 'java' lombok         # Installs single package into ./oenv
+omnic install --oenv .oenv                     # Supports hidden environments
+
+# 2. Build or run with zero-sourcing auto-discovery
+omnic run app.omni                             # Automatically discovers ./oenv
+omnic build app.omni -o app_bin                # Statically links symbols from ./oenv
+```
+
+### Zero-Sourcing Architecture
+Unlike language-specific virtual environments (`venv`, `nvm`) that require sourcing shell scripts (`source venv/bin/activate`), `omnic` autonomously resolves environments via `DependencyDriller::discover_oenv`:
+1. **Explicit CLI Flag**: `--oenv <dir>` takes top precedence.
+2. **Environment Variable**: `OMNI_ENV` or `OENV`.
+3. **Workspace Auto-Scan**: Direct presence of `base_dir/oenv` or `base_dir/.oenv`.
+4. **Current Working Directory**: `./oenv` or `./.oenv`.
+5. **Parent Directory Traversal**: Traverses ancestor directories looking for `oenv/` or `omni-env.json`.
+
+### Tier 0 Resolution Priority (`OR` Fall-through Semantics)
+When an `oenv` is active:
+- **Priority Tier 0**: `<oenv>/packages/<eco>/` and `<oenv>/git/<eco>/` are searched **first** for all symbol resolution and bytecode decompilation.
+- **Fall-through (`OR`)**: If a module or symbol is absent from `oenv`, resolution transparently falls through to workspace-local files, host SDKs/virtualenvs, and global `~/.omnicache`.
+
+### Automatic Package Resolution (`--auto-resolve-dependencies`)
+When running or building with `--auto-resolve-dependencies`, missing third-party packages are automatically downloaded and unpacked directly into `<oenv>/packages/<eco>/` instead of mutating the host's global cache.
+
+---
+
+## 2.3 Autonomous Dialect Resolution & Bare Imports
+
+OmniScript supports both explicit ecosystem declarations and bare polyglot imports:
+
+```python
+# Style 1: Explicit Dialect Annotation
+import 'java' lombok.Data;
+import 'python' requests;
+
+# Style 2: Bare Polyglot Import (Auto-Detected)
+import lombok.Data;
+import requests;
+```
+
+When bare imports are encountered, the compiler executes a 3-tier dialect resolution pipeline:
+1. **Tier 1: Local AI Semantic Hypothesis**: The in-process 1.5B Candle GGUF engine (`CandleGgufEngine::infer_dialect`) evaluates the source context and candidate import to predict the target language ecosystem token.
+2. **Tier 2: Static Parser Fallback**: If the local AI is uninitialized or undecided, `omni_preamble::static_infer_dialect` performs deterministic AST cue pattern matching (e.g., `@Data`, `public static void main`, `System.out.println` -> `java`; `def`, `self.`, `__init__` -> `python`).
+3. **Tier 3: Actionable Error Diagnostics**: If the dependency is missing from the active `oenv` or `~/.omnicache`, the compiler emits an actionable error listing the top 3 candidate packages and exact `omnic install` command:
+   ```text
+   [ERROR] Missing dependency 'lombok' for ecosystem 'java' in oenv (oenv).
+   To install this dependency manually, run:
+     omnic install --oenv oenv 'java' org.projectlombok:lombok
+
+   Top 3 candidate packages for java:
+     1. org.projectlombok:lombok (version: 1.18.36)
+     2. org.projectlombok:lombok-mapstruct-binding (version: 0.2.0)
+     3. io.freefair.gradle:lombok-plugin (version: 8.4)
+
+   Alternatively, re-run with '--auto-resolve-dependencies' to fetch and shim automatically.
+   ```
+
+---
+
 ## 3. Two-Tier Symbol Resolution Engine
 
 Import resolution operates in two complementary stages:

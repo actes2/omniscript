@@ -192,23 +192,37 @@ Foundational zero-GC primitives are located in [`crates/omni_runtime/src/native`
 
 ## CLI Usage
 
-### Install Dependencies from Unified Manifest
-Downloads and unpacks dependencies from crates.io, PyPI, npm, Maven, NuGet, and Git into `~/.omnicache/`:
+### Install Dependencies & Local Polyglot Environments (`oenv`)
+Synchronize dependencies from `omni-requirements.txt` or install individual packages. Target either an isolated project environment (`--oenv`) or global cache (`~/.omnicache/`):
 ```bash
-cargo run -q -p omni_cli -- install [omni-requirements.txt]
+# 1. Global install to ~/.omnicache/
+omnic install [omni-requirements.txt]
+omnic install 'python' requests
+omnic install 'java' org.projectlombok:lombok
+
+# 2. Isolated local virtual environment (zero-sourcing, auto-scanned by omnic run/build)
+omnic install --oenv oenv                      # Creates ./oenv and installs omni-requirements.txt
+omnic install --oenv oenv 'java' lombok         # Installs package directly into ./oenv
+
+# 3. Auto-resolve missing dependencies on the fly
+omnic run --auto-resolve-dependencies app.omni
+omnic build --auto-resolve-dependencies app.omni -o app_bin
 ```
+
+> [!TIP]
+> **Zero-Sourcing `oenv`**: You never need to run `source oenv/bin/activate`. `omnic run` and `omnic build` automatically scan for `./oenv` or `./.oenv` in the project root, giving its packages and git clones strict priority over local paths and host caches (defaulting as an `OR` fall-through).
 
 ### Build Native Standalone Binary
 Compiles source into a standalone executable linked against the host target triple:
 ```bash
-cargo run -q -p omni_cli -- build examples/rust_structs_and_enums.omni -o rust_structs_bin
+omnic build examples/rust_structs_and_enums.omni -o rust_structs_bin
 ./rust_structs_bin
 ```
 
 ### Direct JIT Execution
 Directly compiles to LLVM IR, verifies the module via Clang, and executes in-memory:
 ```bash
-cargo run -q -p omni_cli -- run examples/channel_concurrency.omni
+omnic run examples/channel_concurrency.omni
 ```
 
 ### Interactive Polyglot REPL
@@ -406,6 +420,62 @@ def foo():
 
 if __name__ == "__main__":
     app.run(port=6969)
+```
+
+### 8. Pure Java Interoperability with Lombok ([`examples/java-omni/`](./examples/java-omni))
+Demonstrates pure Java classes using Lombok `@Data` and `@Builder`, compiled and linked natively with zero-GC 64-bit pointers and runtime string concatenation:
+
+```java
+// user.omni
+package com.omni.example;
+
+import lombok.Data;
+import lombok.Builder;
+
+@Data
+@Builder
+public class User {
+    private String username;
+    private String email;
+    private int age;
+
+    public User(String username, String email, int age) {
+        this.username = username;
+        this.email = email;
+        this.age = age;
+    }
+
+    public int isAdult() {
+        if (this.age >= 18) {
+            return 1;
+        }
+        return 0;
+    }
+}
+```
+
+```java
+// app.omni
+package com.omni.example;
+
+import "./user.omni" as user_mod;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("=== OmniScript Pure Java App with Lombok ===");
+        User u = new User("actes", "actes@omniscript.org", 28);
+        System.out.println("User username: " + u.username);
+        System.out.println("User email: " + u.email);
+        System.out.println("User isAdult check: " + u.isAdult());
+    }
+}
+```
+
+Execute in local isolated `oenv`:
+```bash
+cd examples/java-omni
+omnic install --oenv oenv omni-requirements.txt
+omnic run app.omni
 ```
 
 ---
