@@ -38,21 +38,21 @@ void __omni_slice_append(OmniSlice* slice, int64_t val) {
 }
 
 int64_t __omni_slice_get(OmniSlice* slice, size_t index) {
-    if (!slice || index >= slice->len) {
+    if (!slice || (uintptr_t)slice < 4096 || index >= slice->len) {
         return 0;
     }
     return slice->data[index];
 }
 
 void __omni_slice_set(OmniSlice* slice, size_t index, int64_t val) {
-    if (!slice || index >= slice->len) {
+    if (!slice || (uintptr_t)slice < 4096 || index >= slice->len) {
         return;
     }
     slice->data[index] = val;
 }
 
 size_t __omni_slice_len(OmniSlice* slice) {
-    if (!slice) return 0;
+    if (!slice || (uintptr_t)slice < 4096) return 0;
     return slice->len;
 }
 
@@ -60,6 +60,19 @@ int64_t __omni_slice_pop(OmniSlice* slice) {
     if (!slice || slice->len == 0) return 0;
     slice->len--;
     return slice->data[slice->len];
+}
+
+void __omni_slice_print(OmniSlice* slice) {
+    if (!slice) {
+        printf("[]\n");
+        return;
+    }
+    printf("[");
+    for (size_t i = 0; i < slice->len; i++) {
+        if (i > 0) printf(", ");
+        printf("%ld", (long)slice->data[i]);
+    }
+    printf("]\n");
 }
 
 void __omni_slice_destroy(OmniSlice* slice) {

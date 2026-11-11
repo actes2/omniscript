@@ -1,0 +1,112 @@
+import 'java' 'java.util.Random'
+import 'csharp' 'System.Security.Cryptography'
+import 'cpp' compare, iostream
+
+
+interface MyList<T extends Comparable<T>> {
+    void add(T element);
+    bool remove(T element);
+}
+
+
+/// <summary>
+/// Abstract base class for subclasses 
+/// that can be converted to a list of T objects
+/// </summary
+template <three_way_comparable T>
+abstract class Listifiable {
+    abstract List[T] asList();    
+}
+
+
+class LinkedList<T> 
+    extends Listifiable 
+    implements MyList<T> 
+where T : IComparable<T> {
+    sealed struct Node<T> {
+        T data
+        Node next
+
+        constructor(T data) {
+            this.data = data
+            this.next = null
+        }
+    }
+
+    private Node<T> root;
+
+    constructor() {
+        root = nil;
+    }
+
+    /**
+    * Add to tail of list
+    */
+    void add(T element) {
+        node = new Node(element);
+        current = self.root;
+        if current == null:
+            root = node
+            return
+        while (current.next != null)
+            current = current.next
+        current.next = node
+    }
+
+    def addFront(T element) -> void:
+        node = new Node(element)
+        node.next = root
+        root = node
+
+    bool remove(T element) {
+        current = root
+        if current is None: return false
+        if current.data == key:
+            self.head = current.next
+            current = None
+            return true
+
+        prev = None
+        while current != None and current.data != key:
+            prev = current
+            current = current.next
+
+        if current == nil: return false
+        
+        prev.next = current.next
+        current = null
+        return true
+    }
+
+    def asList() -> List[T] {
+        var items = []
+        current = root
+        while (current != null)
+            items.add(current.data)
+            current = current.next
+        return items
+    }
+}
+
+
+void main() {
+    let linkedlist = LinkedList();
+    for i in 1..50 {
+        int rand: i64 = RandomNumberGenerator.GetInt32(0, 100);
+        linkedlist.add(rand)
+    }
+
+    linkedlist.addFront(new Random().nextInt());
+    WriteLine(linkedlist.asList());
+
+    print("Did remove 5?", (linkedlist.remove(5)) ? "yes" : "no")
+
+    var items = linkedlist.asList()
+    let evens = items.Where(n => n % 2 == 0)
+    let evenSquaresNotDiv5 = [x**2 for x in evens if x % 5 != 0]
+    odds: list[int] = list(filter(lambda x: x % 2 != 0, items))
+    cout << (evens) << endl;
+    println(evenSquaresNotDiv5)
+    print(odds)
+    printf("First item: %d\n", items[0])
+}

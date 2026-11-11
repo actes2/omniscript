@@ -3,6 +3,9 @@ pub use omni_preamble::ImportDirective;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+pub mod diagnostic;
+pub use diagnostic::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmniModule {
     pub name: String,
@@ -12,6 +15,7 @@ pub struct OmniModule {
     pub functions: Vec<FunctionDef>,
     pub top_level_statements: Vec<Statement>,
     pub base_dir: Option<std::path::PathBuf>,
+    pub diagnostics: Vec<OmniDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,7 @@ pub struct FunctionDef {
 pub struct ParamDef {
     pub name: String,
     pub type_hint: Option<String>,
+    pub default_val: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +92,26 @@ pub enum IdiomFamily {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatchClause {
+    pub exception_type: Option<String>,
+    pub var_name: Option<String>,
+    pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Statement {
+    /// Tuple unpacking: `a, b = expr` or `(a, b) := expr`
+    TupleUnpack {
+        targets: Vec<String>,
+        expr: String,
+        is_scoped_decl: bool,
+    },
+    /// Polyglot Try / Catch / Except / Finally statement
+    TryCatch {
+        try_block: Vec<Statement>,
+        catch_clauses: Vec<CatchClause>,
+        finally_block: Option<Vec<Statement>>,
+    },
     /// Variable assignment or scoped declaration: `x = 5`, `int x = 0`, `count := 10`
     Assign {
         target: String,
@@ -207,6 +231,112 @@ pub enum Statement {
     },
 }
 
+pub fn harvest_called_symbols(stmts: &[Statement], set: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Statement::Assign { expr, .. } => {
+                for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            Statement::If { condition, then_branch, else_branch } => {
+                for word in condition.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                harvest_called_symbols(then_branch, set);
+                if let Some(eb) = else_branch {
+                    harvest_called_symbols(eb, set);
+                }
+            }
+            Statement::WhileLoop { condition, body } => {
+                for word in condition.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                harvest_called_symbols(body, set);
+            }
+            Statement::ForLoop { count, body, .. } => {
+                for word in count.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                harvest_called_symbols(body, set);
+            }
+            Statement::WithContext { context_expr, body, .. } => {
+                set.insert("__enter__".to_string());
+                set.insert("__exit__".to_string());
+                for word in context_expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                harvest_called_symbols(body, set);
+            }
+            Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                harvest_called_symbols(try_block, set);
+                for c in catch_clauses {
+                    harvest_called_symbols(&c.body, set);
+                }
+                if let Some(ref fb) = finally_block {
+                    harvest_called_symbols(fb, set);
+                }
+            }
+            Statement::Print { expr } => {
+                for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            Statement::Return { expr } => {
+                if let Some(e) = expr {
+                    for word in e.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if !word.is_empty() { set.insert(word.to_string()); }
+                    }
+                }
+            }
+            Statement::TupleUnpack { expr, .. } => {
+                for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            Statement::Concrete { code, .. } => {
+                for word in code.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            Statement::ListInit { elements, .. } => {
+                for el in elements {
+                    for word in el.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if !word.is_empty() { set.insert(word.to_string()); }
+                    }
+                }
+            }
+            Statement::ListAppend { target, expr } => {
+                for word in target.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                set.insert("add".to_string());
+                set.insert("append".to_string());
+                set.insert("push".to_string());
+            }
+            Statement::MapInit { entries, .. } => {
+                for (_, v) in entries {
+                    for word in v.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if !word.is_empty() { set.insert(word.to_string()); }
+                    }
+                }
+            }
+            Statement::IndexSet { index_expr, val_expr, .. } => {
+                for word in index_expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                for word in val_expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct OmniParser {
     fn_re: Regex,
     if_re: Regex,
@@ -269,24 +399,31 @@ impl OmniParser {
     }
 
     pub fn parse_param(p: &str) -> ParamDef {
-        let p_trimmed = p.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        let (p_no_default, default_val) = if let Some(eq_idx) = p.find('=') {
+            (&p[..eq_idx], Some(p[eq_idx + 1..].trim().to_string()))
+        } else {
+            (p, None)
+        };
+        let p_trimmed = p_no_default.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
         if p_trimmed == "self" || p_trimmed == "this" {
             return ParamDef {
                 name: p_trimmed.to_string(),
                 type_hint: Some(format!("&{}", p_trimmed)),
+                default_val: None,
             };
         }
         if let Some(pos) = p_trimmed.find(':') {
-            let name = p_trimmed[..pos]
+            let raw_name = p_trimmed[..pos]
                 .trim()
                 .split_whitespace()
                 .last()
-                .unwrap_or(p_trimmed)
-                .to_string();
+                .unwrap_or(p_trimmed);
+            let name: String = raw_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
             let hint = p_trimmed[pos + 1..].trim().to_string();
             return ParamDef {
-                name,
+                name: if name.is_empty() { "arg".to_string() } else { name },
                 type_hint: Some(hint),
+                default_val,
             };
         }
         let parts: Vec<&str> = p_trimmed.split_whitespace().collect();
@@ -309,23 +446,30 @@ impl OmniParser {
 
             if last_is_type && !first_is_type {
                 // Go style: `base int`, `items []string`, `node *Node`
-                let name = parts[..parts.len() - 1].join(" ");
+                let raw_name = parts[..parts.len() - 1].join(" ");
+                let name: String = raw_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
                 return ParamDef {
-                    name,
+                    name: if name.is_empty() { "arg".to_string() } else { name },
                     type_hint: Some(last.to_string()),
+                    default_val,
                 };
             }
             // C/Java style: `String username`, `int base`, `const char* s`
-            let name = parts[parts.len() - 1].to_string();
+            let raw_name = parts[parts.len() - 1];
+            let name: String = raw_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
             let type_str = parts[..parts.len() - 1].join(" ");
             return ParamDef {
-                name,
+                name: if name.is_empty() { "arg".to_string() } else { name },
                 type_hint: Some(type_str),
+                default_val,
             };
         }
+        let cleaned = Self::clean_param_name(p_trimmed);
+        let name: String = cleaned.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
         ParamDef {
-            name: Self::clean_param_name(p),
+            name: if name.is_empty() { "arg".to_string() } else { name },
             type_hint: None,
+            default_val,
         }
     }
 
@@ -333,7 +477,7 @@ impl OmniParser {
         Self {
             // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++
             fn_re: Regex::new(
-                r#"^(?:(?:(?:public|private|protected|internal|pub)\s+)?(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String)\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*[a-zA-Z_0-9*]+\s*|[a-zA-Z_0-9*]+\s*)?(?::|\{)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|[a-zA-Z_0-9*&\[\]:,"' .]+)|[a-zA-Z_0-9*&\[\]:]+\s*)?(?::|\{|\;)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -360,7 +504,7 @@ impl OmniParser {
             )
             .unwrap(),
             print_re: Regex::new(
-                r#"^(?:print|println!|console\.log|fmt\.Println|puts|System\.out\.println|System\.out\.print)\s*\(\s*(.*)\s*\)\s*;?$"#,
+                r#"^(?:print|println!?|WriteLine|Console\.WriteLine|console\.log|fmt\.Println|puts|printf|System\.out\.println|System\.out\.print)\s*\(\s*(.*)\s*\)\s*;?$"#,
             )
             .unwrap(),
             return_re: Regex::new(r#"^return(?:\s+(.*?))?\s*;?$"#).unwrap(),
@@ -370,7 +514,7 @@ impl OmniParser {
             walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+?)\s*;?$"#).unwrap(),
             // Matches x = 5, int x = 0, let count = 10, let mut acc = 20, let total: i64 = 0, self.val = 20, var y = 2, User u = new User(...)
             assign_re: Regex::new(
-                r#"^(?:(let(?:\s+mut)?|const|var|[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|float|double|bool|boolean|String|string|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>]+)?\s*=\s*(.+?)\s*;?$"#,
+                r#"^(?:(let(?:\s+mut)?|const|var|[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|float|double|bool|boolean|String|string|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>\[\]]+)?\s*=\s*(.+?)\s*;?$"#,
             )
             .unwrap(),
             // Matches ch := make(chan int, 8), ch = Channel(10), let ch = Chan(4)
@@ -390,12 +534,12 @@ impl OmniParser {
             .unwrap(),
             // Matches items = [10, 20, 30], items := [], const items = [1, 2]
             list_init_re: Regex::new(
-                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\[(.*)\]\s*;?$"#,
+                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)(?:\s*:\s*[a-zA-Z0-9_*&<>\[\]]+)?\s*(?::=|=)\s*\[(.*)\]\s*;?$"#,
             )
             .unwrap(),
-            // Matches items.append(40), items.push(50)
+            // Matches items.append(40), items.push(50), items.add(60)
             list_append_re: Regex::new(
-                r#"^([a-zA-Z_0-9]+)\.(?:append|push)\s*\(\s*(.+)\s*\)\s*;?$"#,
+                r#"^([a-zA-Z_0-9]+)\.(?:append|push|add)\s*\(\s*(.+)\s*\)\s*;?$"#,
             )
             .unwrap(),
             // Matches items[0] = 99, m["key"] = 10
@@ -411,13 +555,14 @@ impl OmniParser {
         }
     }
 
-    /// Token-aware splitting that respects double and single quotes
+    /// Token-aware splitting that respects double/single quotes and balanced brackets/parens
     pub fn split_respecting_quotes(s: &str, delimiter: char) -> Vec<String> {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut in_double_quote = false;
         let mut in_single_quote = false;
         let mut escape = false;
+        let mut bracket_depth: usize = 0;
 
         for c in s.chars() {
             if escape {
@@ -440,7 +585,14 @@ impl OmniParser {
                 current.push(c);
                 continue;
             }
-            if c == delimiter && !in_double_quote && !in_single_quote {
+            if !in_double_quote && !in_single_quote {
+                if c == '(' || c == '[' || c == '{' {
+                    bracket_depth += 1;
+                } else if c == ')' || c == ']' || c == '}' {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+            }
+            if c == delimiter && !in_double_quote && !in_single_quote && bracket_depth == 0 {
                 let trimmed = current.trim();
                 if !trimmed.is_empty() {
                     parts.push(trimmed.to_string());
@@ -457,6 +609,126 @@ impl OmniParser {
         parts
     }
 
+    /// Strip trailing single-line comment (`//` or `#`) outside of string quotes
+    pub fn strip_trailing_comment(line: &str) -> &str {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_backtick = false;
+        let mut escaped = false;
+        let bytes = line.as_bytes();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+
+            if b == b'\'' && !in_double && !in_backtick {
+                in_single = !in_single;
+            } else if b == b'"' && !in_single && !in_backtick {
+                in_double = !in_double;
+            } else if b == b'`' && !in_single && !in_double {
+                in_backtick = !in_backtick;
+            } else if !in_single && !in_double && !in_backtick {
+                if b == b'#' {
+                    return line[..i].trim_end();
+                }
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    // Only treat `//` as a C-style comment if there is no assignment `=` on the line
+                    // or if `//` is at the start of the line (`trimmed.starts_with("//")`), preserving Python floor division `q = a // b`.
+                    let prefix = line[..i].trim();
+                    if prefix.is_empty()
+                        || (!prefix.contains('=')
+                            && !prefix.starts_with("return ")
+                            && !prefix.starts_with("if ")
+                            && !prefix.starts_with("elif ")
+                            && !prefix.starts_with("while ")
+                            && !prefix.starts_with("print("))
+                    {
+                        return line[..i].trim_end();
+                    }
+                }
+            }
+            i += 1;
+        }
+        line
+    }
+
+    /// Parse class / interface / struct header: `class LinkedList<T> extends Listifiable implements MyList<T> {`
+    pub fn parse_class_header(line: &str) -> Option<(String, String, Vec<String>)> {
+        let mut s = line.trim().trim_end_matches(':').trim_end_matches('{').trim();
+        if s.starts_with("template") {
+            if let Some(pos) = s.rfind('>') {
+                s = s[pos + 1..].trim();
+            }
+        }
+        let tokens: Vec<&str> = s.split_whitespace().collect();
+        let qualifiers = [
+            "public", "private", "protected", "internal", "pub", "abstract",
+            "virtual", "override", "inline", "sealed", "final", "static",
+        ];
+        let mut i = 0;
+        while i < tokens.len() && qualifiers.contains(&tokens[i]) {
+            i += 1;
+        }
+        if i >= tokens.len() {
+            return None;
+        }
+        let kind = tokens[i];
+        if kind != "class" && kind != "interface" && kind != "struct" {
+            return None;
+        }
+        let rest = tokens[i + 1..].join(" ");
+        let name_end = rest
+            .find(|c: char| c == '<' || c == '(' || c == ' ' || c == ':' || c == '{')
+            .unwrap_or(rest.len());
+        let name = rest[..name_end].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        let mut bases = Vec::new();
+        if let Some(open) = rest.find('(') {
+            let end = rest.rfind(')').unwrap_or(rest.len());
+            let base_str = &rest[open + 1..end];
+            for b in base_str.split(',') {
+                let clean_b = b.trim();
+                if !clean_b.is_empty() {
+                    bases.push(clean_b.to_string());
+                }
+            }
+        } else if rest.contains(" extends ") || rest.contains(" implements ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let mut is_base = false;
+            for part in &parts {
+                if *part == "extends" || *part == "implements" {
+                    is_base = true;
+                    continue;
+                }
+                if *part == "where" {
+                    break;
+                }
+                let cleaned = part.trim_matches(|c| c == ',' || c == '{');
+                if is_base && !cleaned.is_empty() {
+                    let clean_base = cleaned.split('<').next().unwrap_or(cleaned).trim();
+                    if !clean_base.is_empty() {
+                        bases.push(clean_base.to_string());
+                    }
+                }
+            }
+        }
+
+        Some((kind.to_string(), name, bases))
+    }
+
     /// Canonicalizes source code: unifies bracket blocks (`{ ... }`), `end` blocks, postfix conditionals,
     /// and increments (`i++`) into hierarchical canonical AST lines.
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
@@ -468,15 +740,20 @@ impl OmniParser {
             .min()
             .unwrap_or(0);
 
-        let raw_lines = source.lines();
+        let raw_lines: Vec<&str> = source.lines().collect();
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
+        let mut in_docstring: Option<&'static str> = None;
+        let mut in_block_comment = false;
 
         let inc_re = Regex::new(r#"^([a-zA-Z_0-9]+)\+\+$"#).unwrap();
         let dec_re = Regex::new(r#"^([a-zA-Z_0-9]+)\-\-$"#).unwrap();
         let postfix_if_re = Regex::new(r#"^(.*?)\s+if\s+(.*)$"#).unwrap();
 
-        for raw_line in raw_lines {
+        let mut idx = 0;
+        while idx < raw_lines.len() {
+            let raw_line = raw_lines[idx];
+            idx += 1;
             let line = if base_indent > 0
                 && raw_line.len() >= base_indent
                 && raw_line[..base_indent].trim().is_empty()
@@ -486,8 +763,69 @@ impl OmniParser {
                 raw_line
             };
 
-            let mut trimmed = line.trim();
+            let stripped = Self::strip_trailing_comment(line);
+            let mut trimmed = stripped.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Some(quote) = in_docstring {
+                if trimmed.contains(quote) {
+                    in_docstring = None;
+                }
+                continue;
+            }
+
+            if in_block_comment {
+                if trimmed.contains("*/") {
+                    in_block_comment = false;
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("/*") {
+                if !trimmed.ends_with("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                let quote = if trimmed.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+                if trimmed.len() > 3 && trimmed[3..].contains(quote) {
+                    continue;
+                }
+                in_docstring = Some(quote);
+                continue;
+            }
+
+            if trimmed.starts_with(':') && (trimmed.starts_with(":param") || trimmed.starts_with(":type") || trimmed.starts_with(":return") || trimmed.starts_with(":rtype")) {
+                continue;
+            }
+
+            // Multi-line expressions: `methods = { ... }`, `items = [ ... ]`, `tuple = ( ... )`, or multi-line calls `fn( ... )`
+            let is_dict_assign = trimmed.ends_with('{')
+                && trimmed[..trimmed.len() - 1].trim().ends_with('=');
+            let has_open_delimiter =
+                trimmed.ends_with('(') || trimmed.ends_with('[') || is_dict_assign;
+            if has_open_delimiter {
+                let close_char = if trimmed.ends_with('{') { '}' } else if trimmed.ends_with('[') { ']' } else { ')' };
+                let mut accum_str = trimmed.to_string();
+                while idx < raw_lines.len() {
+                    let n_raw = raw_lines[idx];
+                    idx += 1;
+                    let n_stripped = Self::strip_trailing_comment(n_raw).trim();
+                    if n_stripped.is_empty() {
+                        continue;
+                    }
+                    accum_str.push(' ');
+                    accum_str.push_str(n_stripped);
+                    if n_stripped.contains(close_char) {
+                        break;
+                    }
+                }
+                let current_indent = " ".repeat(Self::indent_level(line));
+                out_lines.push(format!("{}{}", current_indent, accum_str));
                 continue;
             }
 
@@ -534,21 +872,17 @@ impl OmniParser {
                 line_str = line_str[..line_str.len() - 1].trim().to_string();
             }
 
-            // Scoped indentation: if inside an explicit brace block, format via brace_depth.
-            // If at brace_depth == 0 (e.g. standard Python functions), preserve exact original indentation!
-            let current_indent = if brace_depth > 0 {
-                "    ".repeat(brace_depth)
-            } else {
-                let count = Self::indent_level(line);
-                " ".repeat(count)
-            };
+            // Scoped indentation: preserve the maximum of brace-derived and source indentation
+            let count = Self::indent_level(line);
+            let current_indent = " ".repeat(count.max(brace_depth * 4));
 
             // 7. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
-            // Ensure we do NOT match inside string literals like print("what if now")
+            // Ensure we do NOT match inside string literals like print("what if now") or list comprehensions `[x for x in y if ...]`
             if !line_str.starts_with("if ")
                 && !line_str.starts_with("if(")
                 && !line_str.contains('"')
                 && !line_str.contains('\'')
+                && !(line_str.contains('[') && line_str.contains(" for "))
             {
                 if let Some(caps) = postfix_if_re.captures(&line_str) {
                     let stmt = caps[1].trim();
@@ -556,6 +890,26 @@ impl OmniParser {
                     out_lines.push(format!("{}if {}:", current_indent, cond));
                     out_lines.push(format!("{}    {}", current_indent, stmt));
                     continue;
+                }
+            }
+
+            // 8. Python single-line suites: `else: exit()`, `except: exit()`, `except: pass`
+            if let Some(pos) = line_str.find(':') {
+                let head = line_str[..=pos].trim();
+                let tail = line_str[pos + 1..].trim();
+                if !tail.is_empty() {
+                    let is_suite_head = head == "else:"
+                        || head == "finally:"
+                        || head == "try:"
+                        || head.starts_with("elif ")
+                        || head.starts_with("except:")
+                        || head.starts_with("except ")
+                        || (head.starts_with("if ") && !head[3..].contains('"') && !head[3..].contains('\''));
+                    if is_suite_head {
+                        out_lines.push(format!("{}{}", current_indent, head));
+                        out_lines.push(format!("{}    {}", current_indent, tail));
+                        continue;
+                    }
                 }
             }
 
@@ -785,8 +1139,8 @@ impl OmniParser {
                     if let Some(caps) = self.fn_re.captures(next_trimmed) {
                         let method_name = caps[1].to_string();
                         let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                        let params: Vec<ParamDef> = raw_params
-                            .split(',')
+                        let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                            .iter()
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty())
                             .map(|p| Self::parse_param(p))
@@ -926,296 +1280,435 @@ impl OmniParser {
                 continue;
             }
 
-            // Class definitions: `class DataPipeline:`, `public class User {`, `class Foo(Bar):`
-            let is_class = trimmed.starts_with("class ")
-                || trimmed.starts_with("public class ")
-                || trimmed.starts_with("private class ")
-                || trimmed.starts_with("protected class ")
-                || trimmed.starts_with("public final class ")
-                || trimmed.starts_with("final class ");
-            if is_class {
-                let class_line = if let Some(pos) = trimmed.find("class ") {
-                    trimmed[pos + 6..].trim().trim_end_matches(':').trim()
-                } else {
-                    trimmed.trim_end_matches(':').trim()
-                };
-                let (class_name, bases) = if let Some(open) = class_line.find('(') {
-                    let name = class_line[..open].trim().to_string();
-                    let end = class_line.rfind(')').unwrap_or(class_line.len());
-                    let base_str = &class_line[open + 1..end];
-                    let base_list: Vec<String> = base_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    (name, base_list)
-                } else if class_line.contains(" extends ") || class_line.contains(" implements ") {
-                    let parts: Vec<&str> = class_line.split_whitespace().collect();
-                    let name = parts.get(0).unwrap_or(&"").trim_end_matches('{').to_string();
-                    let mut base_list = Vec::new();
-                    let mut is_base = false;
-                    for part in &parts[1..] {
-                        if *part == "extends" || *part == "implements" {
-                            is_base = true;
+            // Class / Interface / Struct / Template definitions
+            let is_decl_start = Self::parse_class_header(trimmed).is_some()
+                || trimmed.starts_with("template");
+
+            if is_decl_start {
+                let mut full_header = trimmed.to_string();
+                let mut accum_idx = idx;
+
+                while accum_idx + 1 < raw_lines.len() {
+                    let next = raw_lines[accum_idx + 1].trim();
+                    if next.is_empty()
+                        || next.starts_with("//")
+                        || next.starts_with('#')
+                        || next.starts_with("/*")
+                        || next.starts_with('*')
+                    {
+                        accum_idx += 1;
+                        continue;
+                    }
+
+                    let has_class_name = Self::parse_class_header(&full_header).is_some();
+                    let next_first = next.split_whitespace().next().unwrap_or("");
+                    let is_continuation = ["extends", "implements", "where", "throws", "with"].contains(&next_first)
+                        || next.starts_with(':')
+                        || next.starts_with('{')
+                        || next.starts_with(',')
+                        || !has_class_name;
+
+                    if !is_continuation {
+                        break;
+                    }
+
+                    accum_idx += 1;
+                    full_header.push(' ');
+                    full_header.push_str(next);
+                    if next.contains('{') || next.ends_with(':') || next.ends_with(';') {
+                        break;
+                    }
+                }
+
+                if let Some((_kind, class_name, bases)) = Self::parse_class_header(&full_header) {
+                    idx = accum_idx + 1;
+                    let parent_indent = Self::indent_level(line);
+                    let mut class_methods = Vec::new();
+                    let mut class_fields = Vec::new();
+                    let mut method_decorators = Vec::new();
+
+                    while idx < raw_lines.len() {
+                        let next_line = raw_lines[idx];
+                        let next_trimmed = next_line.trim();
+
+                        if next_trimmed.is_empty()
+                            || next_trimmed.starts_with('#')
+                            || next_trimmed.starts_with("//")
+                            || next_trimmed.starts_with("/*")
+                            || next_trimmed.starts_with('*')
+                        {
+                            idx += 1;
                             continue;
                         }
-                        let cleaned = part.trim_matches(|c| c == ',' || c == '{');
-                        if is_base && !cleaned.is_empty() {
-                            base_list.push(cleaned.to_string());
-                        }
-                    }
-                    (name, base_list)
-                } else {
-                    let name = class_line
-                        .split(|c: char| c.is_whitespace() || c == '{')
-                        .next()
-                        .unwrap_or(class_line)
-                        .trim()
-                        .to_string();
-                    (name, Vec::new())
-                };
 
-                let parent_indent = Self::indent_level(line);
-                idx += 1;
-
-                let mut class_methods = Vec::new();
-                let mut class_fields = Vec::new();
-
-                while idx < raw_lines.len() {
-                    let next_line = raw_lines[idx];
-                    let next_trimmed = next_line.trim();
-
-                    if next_trimmed.is_empty() || next_trimmed.starts_with('#') || next_trimmed.starts_with("//") {
-                        idx += 1;
-                        continue;
-                    }
-
-                    if next_trimmed == "}" {
-                        idx += 1;
-                        break;
-                    }
-
-                    let cur_indent = Self::indent_level(next_line);
-                    if cur_indent <= parent_indent {
-                        break;
-                    }
-
-                    // Check for constructor: `public User(...)`, `User(...)`
-                    let clean_ctor = next_trimmed
-                        .trim_start_matches("public ")
-                        .trim_start_matches("private ")
-                        .trim_start_matches("protected ")
-                        .trim();
-                    let is_constructor = clean_ctor.starts_with(&class_name)
-                        && clean_ctor[class_name.len()..].trim_start().starts_with('(');
-
-                    if is_constructor {
-                        let method_name = "__init__".to_string();
-                        let open_idx = clean_ctor.find('(').unwrap();
-                        let close_idx = clean_ctor.rfind(')').unwrap_or(clean_ctor.len());
-                        let raw_params = &clean_ctor[open_idx + 1..close_idx];
-                        let mut params: Vec<ParamDef> = raw_params
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .map(|p| Self::parse_param(p))
-                            .collect();
-                        // Prepend receiver parameter `this`
-                        if params.is_empty() || (params[0].name != "self" && params[0].name != "this") {
-                            params.insert(0, ParamDef {
-                                name: "this".to_string(),
-                                type_hint: None,
-                            });
-                        }
-                        let method_indent = cur_indent;
-                        idx += 1;
-
-                        let mut method_lines = Vec::new();
-                        while idx < raw_lines.len() {
-                            let m_line = raw_lines[idx];
-                            let m_trimmed = m_line.trim();
-                            if m_trimmed.is_empty() {
+                        // Skip docstrings in class bodies
+                        if next_trimmed.starts_with("\"\"\"") || next_trimmed.starts_with("'''") {
+                            let quote = if next_trimmed.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+                            if next_trimmed.len() > 3 && next_trimmed[3..].contains(quote) {
                                 idx += 1;
                                 continue;
                             }
-                            if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                            idx += 1;
+                            while idx < raw_lines.len() {
+                                let l = raw_lines[idx].trim();
+                                if l.contains(quote) {
+                                    idx += 1;
+                                    break;
+                                }
                                 idx += 1;
-                                break;
                             }
-                            let m_indent = Self::indent_level(m_line);
-                            if m_indent > method_indent {
-                                method_lines.push((m_indent, m_trimmed.to_string()));
-                                idx += 1;
-                            } else {
-                                break;
-                            }
+                            continue;
                         }
 
-                        let body = self.parse_block(&method_lines, &method_name, &mem_norm);
-                        let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
-                        let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
-
-                        class_methods.push(FunctionDef {
-                            name: method_name,
-                            is_method: true,
-                            annotations: Vec::new(),
-                            params,
-                            return_type: None,
-                            body,
-                            memory_ops,
-                        });
-                        continue;
-                    }
-
-                    if let Some(caps) = self.fn_re.captures(next_trimmed) {
-                        let method_name = caps[1].to_string();
-                        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                        let mut params: Vec<ParamDef> = raw_params
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .map(|p| Self::parse_param(p))
-                            .collect();
-                        let is_static = next_trimmed.contains("static ");
-                        if !is_static && (params.is_empty() || (params[0].name != "self" && params[0].name != "this")) {
-                            params.insert(0, ParamDef {
-                                name: "this".to_string(),
-                                type_hint: None,
-                            });
-                        }
-                        let method_indent = cur_indent;
-                        idx += 1;
-
-                        let mut method_lines = Vec::new();
-                        while idx < raw_lines.len() {
-                            let m_line = raw_lines[idx];
-                            let m_trimmed = m_line.trim();
-                            if m_trimmed.is_empty() {
-                                idx += 1;
-                                continue;
-                            }
-                            if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
-                                idx += 1;
-                                break;
-                            }
-                            let m_indent = Self::indent_level(m_line);
-                            if m_indent > method_indent {
-                                method_lines.push((m_indent, m_trimmed.to_string()));
-                                idx += 1;
-                            } else {
-                                break;
-                            }
+                        if next_trimmed == "}" {
+                            idx += 1;
+                            break;
                         }
 
-                        let body = self.parse_block(&method_lines, &method_name, &mem_norm);
-                        let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
-                        let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
-
-                        // If static method is `main`, also expose it at top-level module functions
-                        if method_name == "main" {
-                            functions.push(FunctionDef {
-                                name: "main".to_string(),
-                                is_method: false,
-                                annotations: Vec::new(),
-                                params: Vec::new(),
-                                return_type: None,
-                                body: body.clone(),
-                                memory_ops: memory_ops.clone(),
-                            });
+                        let cur_indent = Self::indent_level(next_line);
+                        if cur_indent <= parent_indent {
+                            break;
                         }
 
-                        class_methods.push(FunctionDef {
-                            name: method_name,
-                            is_method: !is_static,
-                            annotations: Vec::new(),
-                            params,
-                            return_type: None,
-                            body,
-                            memory_ops,
-                        });
-                        continue;
-                    }
+                        // Decorators: @classmethod, @staticmethod, etc.
+                        if next_trimmed.starts_with('@') || (next_trimmed.starts_with("#[") && next_trimmed.ends_with(']')) {
+                            method_decorators.push(next_trimmed.to_string());
+                            idx += 1;
+                            continue;
+                        }
 
-                    // Field definitions
-                    if !next_trimmed.contains('(') && !next_trimmed.contains(')') && !next_trimmed.starts_with("return") {
-                        let clean_line = next_trimmed.trim_end_matches(';').trim();
-                        if clean_line.contains('=') && !clean_line.starts_with("if") {
-                            let parts: Vec<&str> = clean_line.splitn(2, '=').collect();
-                            let decl = parts[0].trim();
-                            let default_val = parts[1].trim().to_string();
-                            let f_tokens: Vec<&str> = decl.split_whitespace().collect();
-                            let f_name = f_tokens.last().unwrap_or(&decl).to_string();
-                            class_fields.push(FieldDef {
-                                name: f_name,
-                                type_hint: None,
-                                default_val: Some(default_val),
-                            });
-                        } else {
-                            let clean_decl = clean_line
-                                .trim_start_matches("public ")
-                                .trim_start_matches("private ")
-                                .trim_start_matches("protected ")
-                                .trim_start_matches("static ")
-                                .trim_start_matches("final ")
-                                .trim();
-                            let tokens: Vec<&str> = clean_decl.split_whitespace().collect();
-                            if tokens.len() >= 2 {
-                                let type_str = tokens[0].to_string();
-                                let f_name = tokens[tokens.len() - 1].to_string();
-                                class_fields.push(FieldDef {
-                                    name: f_name,
-                                    type_hint: Some(type_str),
-                                    default_val: None,
+                        // Inner struct/class definition (e.g. `sealed struct Node<T> { ... }`)
+                        let inner_clean = next_trimmed.trim_start_matches("template");
+                        let inner_first = inner_clean.split_whitespace().next().unwrap_or("");
+                        if ["struct", "sealed", "class", "interface"].contains(&inner_first) {
+                            if let Some((_ikind, iname, ibases)) = Self::parse_class_header(next_trimmed) {
+                                let mut inner_methods = Vec::new();
+                                let mut inner_fields = Vec::new();
+                                let inner_indent = cur_indent;
+                                idx += 1;
+
+                                while idx < raw_lines.len() {
+                                    let i_line = raw_lines[idx];
+                                    let i_trimmed = i_line.trim();
+                                    if i_trimmed.is_empty()
+                                        || i_trimmed.starts_with('#')
+                                        || i_trimmed.starts_with("//")
+                                        || i_trimmed.starts_with("/*")
+                                        || i_trimmed.starts_with('*')
+                                    {
+                                        idx += 1;
+                                        continue;
+                                    }
+                                    let i_indent = Self::indent_level(i_line);
+                                    if i_indent <= inner_indent {
+                                        if i_trimmed == "}" {
+                                            idx += 1;
+                                        }
+                                        break;
+                                    }
+
+                                    let clean_ctor = i_trimmed.trim_start_matches("public ").trim();
+                                    let is_inner_ctor = (clean_ctor.starts_with("constructor") && clean_ctor.contains('('))
+                                        || (clean_ctor.starts_with(&iname) && clean_ctor[iname.len()..].trim_start().starts_with('('));
+                                    if is_inner_ctor {
+                                        if let Some(open) = clean_ctor.find('(') {
+                                            let close = clean_ctor.rfind(')').unwrap_or(clean_ctor.len());
+                                            let raw_p = &clean_ctor[open + 1..close];
+                                            let mut params: Vec<ParamDef> = Self::split_respecting_quotes(raw_p, ',')
+                                                .iter()
+                                                .map(|s| s.trim())
+                                                .filter(|s| !s.is_empty())
+                                                .map(|p| Self::parse_param(p))
+                                                .collect();
+                                            if params.is_empty() || (params[0].name != "self" && params[0].name != "this") {
+                                                params.insert(0, ParamDef {
+                                                    name: "this".to_string(),
+                                                    type_hint: None,
+                                                    default_val: None,
+                                                });
+                                            }
+                                            let m_indent = Self::indent_level(i_line);
+                                            idx += 1;
+                                            let mut m_lines = Vec::new();
+                                            while idx < raw_lines.len() {
+                                                let ml = raw_lines[idx];
+                                                let mt = ml.trim();
+                                                if mt.is_empty() {
+                                                    idx += 1;
+                                                    continue;
+                                                }
+                                                if mt == "}" && Self::indent_level(ml) == m_indent {
+                                                    idx += 1;
+                                                    break;
+                                                }
+                                                if Self::indent_level(ml) > m_indent {
+                                                    m_lines.push((Self::indent_level(ml), mt.to_string()));
+                                                    idx += 1;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            let body = self.parse_block(&m_lines, "__init__", &mem_norm);
+                                            let joined = m_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                                            inner_methods.push(FunctionDef {
+                                                name: "__init__".to_string(),
+                                                is_method: true,
+                                                annotations: Vec::new(),
+                                                params,
+                                                return_type: None,
+                                                body,
+                                                memory_ops: mem_norm.normalize_block(&joined, "__init__"),
+                                            });
+                                            continue;
+                                        }
+                                    } else if !i_trimmed.contains('(') && !i_trimmed.contains(')') && !i_trimmed.starts_with("return") {
+                                        let clean_f = i_trimmed.trim_end_matches(';').trim();
+                                        let tokens: Vec<&str> = clean_f.split_whitespace().collect();
+                                        if tokens.len() >= 2 {
+                                            inner_fields.push(FieldDef {
+                                                name: tokens[tokens.len() - 1].to_string(),
+                                                type_hint: Some(tokens[0].to_string()),
+                                                default_val: None,
+                                            });
+                                        } else if tokens.len() == 1 {
+                                            inner_fields.push(FieldDef {
+                                                name: tokens[0].to_string(),
+                                                type_hint: None,
+                                                default_val: None,
+                                            });
+                                        }
+                                    }
+                                    idx += 1;
+                                }
+
+                                classes.push(ClassDef {
+                                    name: iname,
+                                    decorators: Vec::new(),
+                                    base_classes: ibases,
+                                    fields: inner_fields,
+                                    methods: inner_methods,
                                 });
-                            } else if tokens.len() == 1 {
-                                class_fields.push(FieldDef {
-                                    name: tokens[0].to_string(),
+                                continue;
+                            }
+                        }
+
+                        // Check for constructor: `constructor(...)`, `public User(...)`, `User(...)`
+                        let clean_ctor = next_trimmed
+                            .trim_start_matches("public ")
+                            .trim_start_matches("private ")
+                            .trim_start_matches("protected ")
+                            .trim();
+                        let is_constructor = (clean_ctor.starts_with("constructor") && clean_ctor[11..].trim_start().starts_with('('))
+                            || (clean_ctor.starts_with(&class_name)
+                                && clean_ctor[class_name.len()..].trim_start().starts_with('('));
+
+                        if is_constructor {
+                            let method_name = "__init__".to_string();
+                            let open_idx = clean_ctor.find('(').unwrap();
+                            let close_idx = clean_ctor.rfind(')').unwrap_or(clean_ctor.len());
+                            let raw_params = &clean_ctor[open_idx + 1..close_idx];
+                            let mut params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                                .iter()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|p| Self::parse_param(p))
+                                .collect();
+                            // Prepend receiver parameter `this`
+                            if params.is_empty() || (params[0].name != "self" && params[0].name != "this") {
+                                params.insert(0, ParamDef {
+                                    name: "this".to_string(),
                                     type_hint: None,
                                     default_val: None,
                                 });
                             }
+                            let method_indent = cur_indent;
+                            idx += 1;
+
+                            let mut method_lines = Vec::new();
+                            while idx < raw_lines.len() {
+                                let m_line = raw_lines[idx];
+                                let m_trimmed = m_line.trim();
+                                if m_trimmed.is_empty() {
+                                    idx += 1;
+                                    continue;
+                                }
+                                if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                                    idx += 1;
+                                    break;
+                                }
+                                let m_indent = Self::indent_level(m_line);
+                                if m_indent > method_indent {
+                                    method_lines.push((m_indent, m_trimmed.to_string()));
+                                    idx += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let body = self.parse_block(&method_lines, &method_name, &mem_norm);
+                            let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                            let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
+
+                            class_methods.push(FunctionDef {
+                                name: method_name,
+                                is_method: true,
+                                annotations: Vec::new(),
+                                params,
+                                return_type: None,
+                                body,
+                                memory_ops,
+                            });
+                            continue;
                         }
-                    }
 
-                    idx += 1;
-                }
+                        if let Some(caps) = self.fn_re.captures(next_trimmed) {
+                            let method_name = caps[1].to_string();
+                            let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                            let mut params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                                .iter()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|p| Self::parse_param(p))
+                                .collect();
+                            let is_static = next_trimmed.contains("static ")
+                                || method_decorators.iter().any(|d| d.contains("staticmethod") || d.contains("classmethod"));
+                            let ann: Vec<AnnotationDef> = method_decorators.drain(..).filter_map(|d| Self::parse_annotation_line(&d)).collect();
+                            if !is_static && (params.is_empty() || (params[0].name != "self" && params[0].name != "this")) {
+                                params.insert(0, ParamDef {
+                                    name: "this".to_string(),
+                                    type_hint: None,
+                                    default_val: None,
+                                });
+                            }
 
-                // Auto-discover dynamically assigned instance fields in methods (e.g. self.val = ... or this.val = ...)
-                for m in &class_methods {
-                    for stmt in &m.body {
-                        if let Statement::Assign { target, .. } = stmt {
-                            let fld_opt = target.strip_prefix("self.").or_else(|| target.strip_prefix("this."));
-                            if let Some(fld) = fld_opt {
-                                let fld_name = fld.trim().to_string();
-                                if !class_fields.iter().any(|f| f.name == fld_name) {
+                            let method_indent = cur_indent;
+                            idx += 1;
+
+                            let mut method_lines = Vec::new();
+                            while idx < raw_lines.len() {
+                                let m_line = raw_lines[idx];
+                                let m_trimmed = m_line.trim();
+                                if m_trimmed.is_empty() {
+                                    idx += 1;
+                                    continue;
+                                }
+                                if m_trimmed == "}" && Self::indent_level(m_line) == method_indent {
+                                    idx += 1;
+                                    break;
+                                }
+                                let m_indent = Self::indent_level(m_line);
+                                if m_indent > method_indent {
+                                    method_lines.push((m_indent, m_trimmed.to_string()));
+                                    idx += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let body = self.parse_block(&method_lines, &method_name, &mem_norm);
+                            let raw_joined = method_lines.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                            let memory_ops = mem_norm.normalize_block(&raw_joined, &method_name);
+
+                            if method_name == "main" {
+                                functions.push(FunctionDef {
+                                    name: "main".to_string(),
+                                    is_method: false,
+                                    annotations: Vec::new(),
+                                    params: Vec::new(),
+                                    return_type: None,
+                                    body: body.clone(),
+                                    memory_ops: memory_ops.clone(),
+                                });
+                            }
+
+                            class_methods.push(FunctionDef {
+                                name: method_name,
+                                is_method: !is_static,
+                                annotations: ann,
+                                params,
+                                return_type: None,
+                                body,
+                                memory_ops,
+                            });
+                            continue;
+                        }
+
+                        method_decorators.clear();
+
+                        // Field definitions
+                        if !next_trimmed.contains('(')
+                            && !next_trimmed.contains(')')
+                            && !next_trimmed.starts_with("return")
+                            && !next_trimmed.starts_with("\"\"\"")
+                            && !next_trimmed.starts_with("'''")
+                            && !next_trimmed.starts_with(">>>")
+                            && !next_trimmed.starts_with(':')
+                        {
+                            let clean_line = next_trimmed.trim_end_matches(';').trim();
+                            if clean_line.contains('=') && !clean_line.starts_with("if") {
+                                let parts: Vec<&str> = clean_line.splitn(2, '=').collect();
+                                let decl = parts[0].trim();
+                                let default_val = parts[1].trim().to_string();
+                                let f_tokens: Vec<&str> = decl.split_whitespace().collect();
+                                let f_name = f_tokens.last().unwrap_or(&decl).to_string();
+                                class_fields.push(FieldDef {
+                                    name: f_name,
+                                    type_hint: None,
+                                    default_val: Some(default_val),
+                                });
+                            } else {
+                                let clean_decl = clean_line
+                                    .trim_start_matches("public ")
+                                    .trim_start_matches("private ")
+                                    .trim_start_matches("protected ")
+                                    .trim_start_matches("static ")
+                                    .trim_start_matches("final ")
+                                    .trim();
+                                let tokens: Vec<&str> = clean_decl.split_whitespace().collect();
+                                if tokens.len() >= 2 {
+                                    let type_str = tokens[0].to_string();
+                                    let f_name = tokens[tokens.len() - 1].to_string();
                                     class_fields.push(FieldDef {
-                                        name: fld_name,
-                                        type_hint: Some("i64".to_string()),
+                                        name: f_name,
+                                        type_hint: Some(type_str),
+                                        default_val: None,
+                                    });
+                                } else if tokens.len() == 1 {
+                                    class_fields.push(FieldDef {
+                                        name: tokens[0].to_string(),
+                                        type_hint: None,
                                         default_val: None,
                                     });
                                 }
                             }
                         }
-                    }
-                }
 
-                classes.push(ClassDef {
-                    name: class_name,
-                    decorators: current_decorators.clone(),
-                    base_classes: bases,
-                    fields: class_fields,
-                    methods: class_methods,
-                });
-                current_decorators.clear();
-                continue;
+                        idx += 1;
+                    }
+
+                    // Auto-discover dynamically assigned instance fields in methods (recursively traversing blocks)
+                    for m in &class_methods {
+                        Self::discover_fields_recursive(&m.body, &mut class_fields);
+                    }
+
+                    classes.push(ClassDef {
+                        name: class_name,
+                        decorators: current_decorators.clone(),
+                        base_classes: bases,
+                        fields: class_fields,
+                        methods: class_methods,
+                    });
+                    current_decorators.clear();
+                    continue;
+                }
             }
 
             // Top-level functions: `def foo():`, `fn foo() -> i32:`, `int foo() {`
             if let Some(caps) = self.fn_re.captures(trimmed) {
                 let fn_name = caps[1].to_string();
                 let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                let params: Vec<ParamDef> = raw_params
-                    .split(',')
+                let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                    .iter()
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .map(|p| Self::parse_param(p))
@@ -1324,6 +1817,48 @@ impl OmniParser {
             functions,
             top_level_statements: top_level,
             base_dir: base_dir.map(|p| p.to_path_buf()),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn discover_fields_recursive(stmts: &[Statement], class_fields: &mut Vec<FieldDef>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assign { target, .. } => {
+                    let fld_opt = target.strip_prefix("self.").or_else(|| target.strip_prefix("this."));
+                    if let Some(fld) = fld_opt {
+                        let fld_name = fld.trim().to_string();
+                        if !class_fields.iter().any(|f| f.name == fld_name) {
+                            class_fields.push(FieldDef {
+                                name: fld_name,
+                                type_hint: Some("i64".to_string()),
+                                default_val: None,
+                            });
+                        }
+                    }
+                }
+                Statement::If { then_branch, else_branch, .. } => {
+                    Self::discover_fields_recursive(then_branch, class_fields);
+                    if let Some(eb) = else_branch {
+                        Self::discover_fields_recursive(eb, class_fields);
+                    }
+                }
+                Statement::WhileLoop { body, .. }
+                | Statement::ForLoop { body, .. }
+                | Statement::WithContext { body, .. } => {
+                    Self::discover_fields_recursive(body, class_fields);
+                }
+                Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    Self::discover_fields_recursive(try_block, class_fields);
+                    for c in catch_clauses {
+                        Self::discover_fields_recursive(&c.body, class_fields);
+                    }
+                    if let Some(fb) = finally_block {
+                        Self::discover_fields_recursive(fb, class_fields);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1338,10 +1873,50 @@ impl OmniParser {
         let mut i = 0;
 
         while i < lines.len() {
-            let (indent, ref text) = lines[i];
+            let (indent, ref raw_text) = lines[i];
+            let stripped_comment = Self::strip_trailing_comment(raw_text).to_string();
+            let text = &stripped_comment;
             let trimmed_text = text.trim();
             if trimmed_text.is_empty() || trimmed_text.starts_with("//") || trimmed_text.starts_with('#') || trimmed_text == "}" {
                 i += 1;
+                continue;
+            }
+
+            // Skip docstrings and docstring tags
+            if trimmed_text.starts_with("\"\"\"") || trimmed_text.starts_with("'''") {
+                let quote = if trimmed_text.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+                if trimmed_text.len() > 3 && trimmed_text[3..].contains(quote) {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                while i < lines.len() {
+                    let (_, ref l_raw) = lines[i];
+                    let l = l_raw.trim();
+                    if l.contains(quote) {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            if trimmed_text.starts_with(':') && (trimmed_text.starts_with(":param") || trimmed_text.starts_with(":type") || trimmed_text.starts_with(":return") || trimmed_text.starts_with(":rtype")) {
+                i += 1;
+                continue;
+            }
+
+            // Local function imports: `import foo`, `from foo import bar`, `use std::...`
+            if trimmed_text.starts_with("import ") || trimmed_text.starts_with("from ") || trimmed_text.starts_with("use ") {
+                i += 1;
+                continue;
+            }
+
+            // Nested function definition inside a block: consume its indented body
+            if self.fn_re.is_match(trimmed_text) {
+                let (_nested_body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                i = next_i;
                 continue;
             }
 
@@ -1424,6 +1999,81 @@ impl OmniParser {
                 continue;
             }
 
+            // Polyglot Try / Except / Catch / Finally
+            if trimmed_text == "try:" || trimmed_text == "try" || trimmed_text == "try {" {
+                let (try_block, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                let mut catch_clauses = Vec::new();
+                let mut finally_block = None;
+
+                while next_i < lines.len() {
+                    let (clause_indent, ref clause_raw) = lines[next_i];
+                    if clause_indent != indent {
+                        break;
+                    }
+                    let clause_trimmed = Self::strip_trailing_comment(clause_raw).trim().to_string();
+                    if clause_trimmed.starts_with("except") || clause_trimmed.starts_with("catch") {
+                        let (exc_part, inline_after) = clause_trimmed.split_once(':').unwrap_or((&clause_trimmed, ""));
+                        let header = exc_part
+                            .trim_start_matches("except")
+                            .trim_start_matches("catch")
+                            .trim_end_matches('{')
+                            .trim();
+
+                        let (exc_type, var_name) = if header.is_empty() {
+                            (None, None)
+                        } else if let Some((t, v)) = header.split_once(" as ") {
+                            (Some(t.trim().to_string()), Some(v.trim().to_string()))
+                        } else {
+                            (Some(header.trim().trim_matches(|c| c == '(' || c == ')').to_string()), None)
+                        };
+
+                        // Check if single-line except like `except: exit()` or `except: pass`
+                        let after = inline_after.trim();
+                        if !after.is_empty() && after != "{" {
+                            if after != "pass" {
+                                let inline_lines = vec![(indent + 4, after.to_string())];
+                                let body = self.parse_block(&inline_lines, fn_name, mem_norm);
+                                catch_clauses.push(CatchClause {
+                                    exception_type: exc_type,
+                                    var_name,
+                                    body,
+                                });
+                            } else {
+                                catch_clauses.push(CatchClause {
+                                    exception_type: exc_type,
+                                    var_name,
+                                    body: Vec::new(),
+                                });
+                            }
+                            next_i += 1;
+                            continue;
+                        }
+
+                        let (catch_body, after_catch_i) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                        catch_clauses.push(CatchClause {
+                            exception_type: exc_type,
+                            var_name,
+                            body: catch_body,
+                        });
+                        next_i = after_catch_i;
+                    } else if clause_trimmed.starts_with("finally") {
+                        let (fin_body, after_fin_i) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                        finally_block = Some(fin_body);
+                        next_i = after_fin_i;
+                    } else {
+                        break;
+                    }
+                }
+
+                stmts.push(Statement::TryCatch {
+                    try_block,
+                    catch_clauses,
+                    finally_block,
+                });
+                i = next_i;
+                continue;
+            }
+
             // 1. If statement with optional elif/else
             if let Some(caps) = self.if_re.captures(text) {
                 let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
@@ -1431,22 +2081,35 @@ impl OmniParser {
                 let (then_branch, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 let mut else_branch = None;
 
-                // Check for `elif` or `else` at the same indentation level
-                if next_i < lines.len() && lines[next_i].0 == indent {
+                // Check for `elif` chain and terminal `else` at the same indentation level
+                let mut current_else = &mut else_branch;
+                while next_i < lines.len() && lines[next_i].0 == indent {
                     let next_text = lines[next_i].1.trim();
                     if let Some(elif_caps) = self.elif_re.captures(next_text) {
                         let elif_cond = elif_caps.get(1).or_else(|| elif_caps.get(2)).unwrap().as_str().trim().to_string();
                         let (elif_then, after_elif) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
-                        else_branch = Some(vec![Statement::If {
+                        *current_else = Some(vec![Statement::If {
                             condition: elif_cond,
                             then_branch: elif_then,
                             else_branch: None,
                         }]);
                         next_i = after_elif;
+                        if let Some(ref mut vec) = current_else {
+                            if let Some(Statement::If { ref mut else_branch, .. }) = vec.first_mut() {
+                                current_else = else_branch;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     } else if self.else_re.is_match(next_text) {
                         let (else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
-                        else_branch = Some(else_body);
+                        *current_else = Some(else_body);
                         next_i = after_else;
+                        break;
+                    } else {
+                        break;
                     }
                 }
 
@@ -1459,16 +2122,20 @@ impl OmniParser {
                 continue;
             }
 
-            // 2. While loop
+            // 2. While loop (with optional Python `while ... else:`)
             if let Some(caps) = self.while_re.captures(text) {
                 let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
-                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                let (body, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                if next_i < lines.len() && lines[next_i].0 == indent && self.else_re.is_match(lines[next_i].1.trim()) {
+                    let (_else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                    next_i = after_else;
+                }
                 stmts.push(Statement::WhileLoop { condition, body });
                 i = next_i;
                 continue;
             }
 
-            // 3. For loop
+            // 3. For loop (with optional Python `for ... else:`)
             let for_match = if let Some(caps) = self.c_for_re.captures(text) {
                 Some((caps[1].to_string(), caps[2].trim().to_string()))
             } else if let Some(caps) = self.paren_for_re.captures(text) {
@@ -1482,7 +2149,11 @@ impl OmniParser {
             };
 
             if let Some((var, count)) = for_match {
-                let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                let (body, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                if next_i < lines.len() && lines[next_i].0 == indent && self.else_re.is_match(lines[next_i].1.trim()) {
+                    let (_else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                    next_i = after_else;
+                }
                 stmts.push(Statement::ForLoop { var, count, body });
                 i = next_i;
                 continue;
@@ -1495,6 +2166,15 @@ impl OmniParser {
                 });
                 i += 1;
                 continue;
+            }
+            if trimmed_text.starts_with("cout") && trimmed_text.contains("<<") {
+                let parts: Vec<&str> = trimmed_text.split("<<").collect();
+                if parts.len() >= 2 {
+                    let expr_part = parts[1].trim().trim_end_matches(';').trim().to_string();
+                    stmts.push(Statement::Print { expr: expr_part });
+                    i += 1;
+                    continue;
+                }
             }
 
             // 5. Return
@@ -1664,6 +2344,84 @@ impl OmniParser {
                     is_scoped_decl: true,
                 });
                 i += 1;
+                continue;
+            }
+
+            // Polyglot Tuple Literal Assignment: `DEFAULT_IP_PORT = ("127.0.0.1", 9999)`
+            // Desugar into Statement::ListInit
+            if let Some(caps) = self.assign_re.captures(text) {
+                let target = caps[2].trim().to_string();
+                let clean_expr = caps[3].trim().trim_end_matches(';').trim();
+                let is_scoped = caps.get(1).is_some();
+
+                if clean_expr.starts_with('(') && clean_expr.ends_with(')') && clean_expr.contains(',') && !clean_expr.starts_with("(i32)") && !clean_expr.starts_with("(i64)") {
+                    let inner = &clean_expr[1..clean_expr.len() - 1];
+                    let elements = Self::split_respecting_quotes(inner, ',')
+                        .into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    stmts.push(Statement::ListInit {
+                        target,
+                        elements,
+                        is_scoped_decl: is_scoped,
+                    });
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Polyglot Tuple Unpack: `public_key, private_key = rsa.newkeys(1024)`, `client, addr = server.accept()`
+            if text.contains('=') && !text.contains("==") && !text.contains("!=") && !text.contains("<=") && !text.contains(">=") && !text.starts_with("if ") {
+                let assign_op = if text.contains(":=") { ":=" } else { "=" };
+                if let Some((lhs, rhs)) = text.split_once(assign_op) {
+                    let mut lhs_clean = lhs.trim().trim_start_matches("let ").trim_start_matches("var ").trim();
+                    if lhs_clean.starts_with('(') && lhs_clean.ends_with(')') {
+                        lhs_clean = lhs_clean[1..lhs_clean.len() - 1].trim();
+                    }
+                    if lhs_clean.contains(',') && !lhs_clean.contains('(') && !lhs_clean.contains('[') {
+                        let targets: Vec<String> = lhs_clean
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if targets.len() >= 2 {
+                            let clean_rhs = rhs.trim().trim_end_matches(';').trim().to_string();
+                            stmts.push(Statement::TupleUnpack {
+                                targets,
+                                expr: clean_rhs,
+                                is_scoped_decl: assign_op == ":=" || lhs.starts_with("let ") || lhs.starts_with("var "),
+                            });
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Compound Assignment Desugaring: `x += y`, `x -= y`, `x *= y` -> `x = x + (y)`
+            let mut handled_compound = false;
+            for (comp_op, bin_op) in &[("+=", "+"), ("-=", "-"), ("*=", "*"), ("//=", "//"), ("/=", "/"), ("%=", "%"), ("<<=", "<<"), (">>=", ">>"), ("|=", "|"), ("&=", "&"), ("^=", "^")] {
+                if let Some((lhs, rhs)) = text.split_once(comp_op) {
+                    let lhs_trim = lhs.trim();
+                    let rhs_trim = rhs.trim().trim_end_matches(';').trim();
+                    if !lhs_trim.is_empty()
+                        && lhs_trim.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        && !rhs_trim.is_empty()
+                    {
+                        stmts.push(Statement::Assign {
+                            target: lhs_trim.to_string(),
+                            expr: format!("{} {} ({})", lhs_trim, bin_op, rhs_trim),
+                            idiom: IdiomFamily::Standard,
+                            is_scoped_decl: false,
+                        });
+                        i += 1;
+                        handled_compound = true;
+                        break;
+                    }
+                }
+            }
+            if handled_compound {
                 continue;
             }
 

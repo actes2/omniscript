@@ -422,6 +422,16 @@ fn compile_source(
     let mut module = parser.parse_module_with_dir(module_name, &source_content, Some(base_dir));
     let parse_time = t_parse_start.elapsed();
 
+    if !module.diagnostics.is_empty() {
+        for diag in &module.diagnostics {
+            eprintln!("{}", diag.render());
+        }
+        if module.diagnostics.iter().any(|d| d.severity == omni_parser::DiagnosticSeverity::Error) {
+            eprintln!("omnic: aborting due to parsing/syntax errors");
+            std::process::exit(1);
+        }
+    }
+
     // 2. Preamble Assembly & Symbol Carving
     let t_drill_start = std::time::Instant::now();
     let carver = SymbolCarver::new();
@@ -648,6 +658,25 @@ fn compile_source(
                         all_sources_to_merge.push(orig.clone());
                     }
                 }
+                for trace in &walk.call_traces {
+                    if !target_symbols.contains(&trace.symbol) {
+                        target_symbols.push(trace.symbol.clone());
+                    }
+                    for hop in &trace.hop_chain {
+                        for word in hop.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                            if !word.is_empty() && !target_symbols.contains(&word.to_string()) {
+                                target_symbols.push(word.to_string());
+                            }
+                        }
+                    }
+                }
+                // Sort sources so non-parallel submodules (e.g. prime.py, key.py) are ingested before parallel.py
+                all_sources_to_merge.sort_by(|a, b| {
+                    let a_par = a.to_string_lossy().contains("parallel");
+                    let b_par = b.to_string_lossy().contains("parallel");
+                    a_par.cmp(&b_par)
+                });
+                let mut sub_mods = Vec::new();
                 for vf in &all_sources_to_merge {
                     let ext = vf.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if ext == "class" {
@@ -659,32 +688,71 @@ fn compile_source(
                                     format!("return {}", decompiled_expr.trim())
                                 };
                                 let func_src = format!("fn {}({}) {{\n  {}\n}}\n", m_name, params.join(", "), body);
-                                let sub_mod = parser.parse_module(&mod_name, &func_src);
-                                for f in sub_mod.functions {
-                                    if !module.functions.iter().any(|existing| existing.name == f.name) {
-                                        module.functions.push(f);
-                                    }
-                                }
+                                let sm = parser.parse_module(&mod_name, &func_src);
+                                sub_mods.push(sm);
                             }
                         }
                     } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
                         if let Ok(src) = fs::read_to_string(vf) {
-                            let sub_mod = parser.parse_module(&mod_name, &src);
-                            for f in sub_mod.functions {
-                                if !module.functions.iter().any(|existing| existing.name == f.name) {
-                                    module.functions.push(f);
+                            let sm = parser.parse_module(&mod_name, &src);
+                            sub_mods.push(sm);
+                        }
+                    }
+                }
+
+                // Transitive reachability analysis across all crawled package submodules
+                let mut reach_set: std::collections::HashSet<String> = target_symbols.iter().cloned().collect();
+                for word in source_content.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { reach_set.insert(word.to_string()); }
+                }
+
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for sm in &sub_mods {
+                        for s in &sm.structs_and_classes {
+                            if reach_set.contains(&s.name) {
+                                for base in &s.base_classes {
+                                    if reach_set.insert(base.clone()) {
+                                        changed = true;
+                                    }
+                                }
+                                for m in &s.methods {
+                                    let before = reach_set.len();
+                                    omni_parser::harvest_called_symbols(&m.body, &mut reach_set);
+                                    if reach_set.len() > before {
+                                        changed = true;
+                                    }
                                 }
                             }
-                            for s in sub_mod.structs_and_classes {
-                                if !module.structs_and_classes.iter().any(|existing| existing.name == s.name) {
-                                    module.structs_and_classes.push(s);
+                        }
+                        for f in &sm.functions {
+                            if reach_set.contains(&f.name) {
+                                let before = reach_set.len();
+                                omni_parser::harvest_called_symbols(&f.body, &mut reach_set);
+                                if reach_set.len() > before {
+                                    changed = true;
                                 }
                             }
-                            for e in sub_mod.enums {
-                                if !module.enums.iter().any(|existing| existing.name == e.name) {
-                                    module.enums.push(e);
-                                }
-                            }
+                        }
+                    }
+                }
+
+                // Ingest all reachable classes, functions, and enums into module
+                for sm in sub_mods {
+                    for f in sm.functions {
+                        if reach_set.contains(&f.name) && !module.functions.iter().any(|existing| existing.name == f.name) {
+                            module.functions.push(f);
+                        }
+                    }
+                    for s in sm.structs_and_classes {
+                        if reach_set.contains(&s.name) && !module.structs_and_classes.iter().any(|existing| existing.name == s.name) {
+                            module.structs_and_classes.push(s);
+                        }
+                    }
+                    for e in sm.enums {
+                        if reach_set.contains(&e.name) && !module.enums.iter().any(|existing| existing.name == e.name) {
+                            module.enums.push(e);
                         }
                     }
                 }

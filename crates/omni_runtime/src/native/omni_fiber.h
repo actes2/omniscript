@@ -29,6 +29,8 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
 void __omni_fiber_yield(void);
 void __omni_fiber_destroy(OmniFiber* fiber);
 void __omni_go_spawn(void (*entry)(void*), void* arg);
+void __omni_thread_spawn(void (*entry)(void*), void* arg);
+void __omni_thread_join_all(void);
 void* __omni_fiber_run_on_main_stack(void* (*fn)(void*), void* arg);
 
 #endif // OMNI_FIBER_H

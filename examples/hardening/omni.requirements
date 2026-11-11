@@ -1,0 +1,2 @@
+# Hardening suite polyglot package dependencies
+'python' rsa == 4.9.1

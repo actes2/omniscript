@@ -149,6 +149,7 @@ impl SsaContextEnvelope {
         }
         out.push_str("  <platform_abi>\n");
         out.push_str("    Full LLVM IR instruction set is active. You may emit standard 'declare' prototypes for external platform C ABI calls if not present in runtime declarations.\n");
+        out.push_str("    Core runtime intrinsics: @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), @__omni_str_concat(i8*, i8*), @__omni_int_to_str(i64).\n");
         out.push_str("  </platform_abi>\n");
 
         let (clean_intent, embedded_diag) =
@@ -303,9 +304,16 @@ impl InferenceEngine for MockSynthesisEngine {
 /// Canonical OmniScript runtime symbols defined in `omni_runtime`.
 const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_print_str",
+    "__omni_print_str_inline",
+    "__omni_print_str_raw",
     "__omni_print_int",
+    "__omni_input",
+    "exit",
+    "strcmp",
     "__omni_sleep_s",
     "__omni_sleep_ms",
+    "__omni_random_int",
+    "__omni_random_range",
     "__omni_arena_create",
     "__omni_arena_alloc",
     "__omni_arena_mark",
@@ -331,6 +339,7 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_slice_set",
     "__omni_slice_len",
     "__omni_slice_pop",
+    "__omni_slice_print",
     "__omni_slice_destroy",
     "__omni_map_create",
     "__omni_map_set",
@@ -350,6 +359,8 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_c_to_int",
     "__omni_c_return_str",
     "__omni_c_get_returned_str",
+    "__omni_c_return_ptr",
+    "__omni_c_get_returned_ptr",
     "__omni_str_token",
     "__omni_str_token_arena",
     "__omni_os_socket_listen",
@@ -358,6 +369,15 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_os_socket_read_arena",
     "__omni_os_socket_write_http",
     "__omni_os_socket_close",
+    "__omni_os_socket_create",
+    "__omni_os_socket_bind",
+    "__omni_os_socket_listen_fd",
+    "__omni_os_socket_accept_tuple",
+    "__omni_os_socket_connect",
+    "__omni_os_socket_getpeername",
+    "__omni_os_socket_send",
+    "__omni_os_socket_recv",
+    "__omni_os_pipe_pair",
 ];
 
 /// Language-agnostic fuzzy stem resolver: maps any model-invented `@__omni_<prefix>_<stem>`
@@ -412,6 +432,8 @@ pub fn rectify_omni_call_line(line: &str) -> String {
                     Some("__omni_sleep_s")
                 } else if lower.contains("print_int") {
                     Some("__omni_print_int")
+                } else if lower.contains("slice_print") || lower.contains("list_print") {
+                    Some("__omni_slice_print")
                 } else if lower.contains("print") || lower.contains("puts") || lower.contains("println") || lower.contains("log") {
                     Some("__omni_print_str")
                 } else if lower.contains("slice_append") || lower.contains("list_append") || lower.contains("vec_push") || lower.contains("array_push") {
@@ -444,6 +466,10 @@ pub fn rectify_omni_call_line(line: &str) -> String {
                     Some("__omni_c_to_float")
                 } else if lower.contains("to_int") || lower.contains("parse_int") {
                     Some("__omni_c_to_int")
+                } else if lower.contains("random_range") || lower.contains("getint32") {
+                    Some("__omni_random_range")
+                } else if lower.contains("random") || lower.contains("nextint") {
+                    Some("__omni_random_int")
                 } else {
                     None
                 };
@@ -665,11 +691,17 @@ impl<'a> VerifiedSynthesisEngine<'a> {
     fn generate_harness_header(envelope: &SsaContextEnvelope) -> (String, String) {
         let mut params = Vec::new();
         let mut preamble = String::new();
+        let mut seen_regs = std::collections::HashSet::new();
 
         for sym in &envelope.active_symbols {
             if sym.llvm_name.starts_with('%') {
                 let reg_name = &sym.llvm_name;
-                if sym.llvm_name.contains("_ptr")
+                if !seen_regs.insert(reg_name.clone()) {
+                    continue;
+                }
+                if sym.llvm_name.contains("_alloca") {
+                    preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
+                } else if sym.llvm_name.contains("_ptr")
                     || sym.llvm_name.starts_with("%col_ref_")
                     || sym.llvm_name.starts_with("%str_var_")
                 {

@@ -8,6 +8,7 @@
 #elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 #define OMNI_HAS_MMAP 1
 #endif
 
@@ -17,7 +18,7 @@ static OmniFiber* g_dead_fibers = NULL;
 static int g_initialized = 0;
 
 #if defined(__x86_64__) && !defined(_WIN32)
-__attribute__((naked)) static void swap_g_context(void** from_rsp, void* to_rsp) {
+__attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__((unused)), void* to_rsp __attribute__((unused))) {
     __asm__ volatile (
         "pushq %rbp\n\t"
         "pushq %rbx\n\t"
@@ -37,7 +38,7 @@ __attribute__((naked)) static void swap_g_context(void** from_rsp, void* to_rsp)
     );
 }
 #elif defined(__aarch64__)
-__attribute__((naked)) static void swap_g_context(void** from_rsp, void* to_rsp) {
+__attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__((unused)), void* to_rsp __attribute__((unused))) {
     __asm__ volatile (
         "stp x19, x20, [sp, #-16]!\n\t"
         "stp x21, x22, [sp, #-16]!\n\t"
@@ -279,3 +280,51 @@ void __omni_go_spawn(void (*entry)(void*), void* arg) {
     // Upon return to main stack, reclaim any dead fiber stacks
     cleanup_dead_fibers();
 }
+
+#if !defined(_WIN32)
+typedef struct OmniThreadCtx {
+    void (*entry)(void*);
+    void* arg;
+} OmniThreadCtx;
+
+static pthread_t g_spawned_threads[64];
+static size_t g_spawned_thread_count = 0;
+
+static void* omni_pthread_runner(void* raw_ctx) {
+    OmniThreadCtx* ctx = (OmniThreadCtx*)raw_ctx;
+    void (*entry)(void*) = ctx->entry;
+    void* arg = ctx->arg;
+    free(ctx);
+    if (entry) {
+        entry(arg);
+    }
+    return NULL;
+}
+
+void __omni_thread_spawn(void (*entry)(void*), void* arg) {
+    OmniThreadCtx* ctx = (OmniThreadCtx*)malloc(sizeof(OmniThreadCtx));
+    if (!ctx) return;
+    ctx->entry = entry;
+    ctx->arg = arg;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, omni_pthread_runner, ctx) == 0) {
+        if (g_spawned_thread_count < 64) {
+            g_spawned_threads[g_spawned_thread_count++] = tid;
+        }
+    } else {
+        free(ctx);
+    }
+}
+
+void __omni_thread_join_all(void) {
+    for (size_t i = 0; i < g_spawned_thread_count; ++i) {
+        pthread_join(g_spawned_threads[i], NULL);
+    }
+    g_spawned_thread_count = 0;
+}
+#else
+void __omni_thread_spawn(void (*entry)(void*), void* arg) {
+    __omni_go_spawn(entry, arg);
+}
+void __omni_thread_join_all(void) {}
+#endif

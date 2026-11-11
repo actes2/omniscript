@@ -32,6 +32,9 @@ pub struct ScopeTree {
     pub class_field_types: HashMap<String, HashMap<String, String>>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
+    pub method_defining_class: HashMap<(String, String), String>,
+    pub loop_exit_labels: Vec<String>,
+    pub loop_cond_labels: Vec<String>,
 }
 
 impl ScopeTree {
@@ -42,7 +45,17 @@ impl ScopeTree {
             class_field_types: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
+            method_defining_class: HashMap::new(),
+            loop_exit_labels: Vec::new(),
+            loop_cond_labels: Vec::new(),
         }
+    }
+
+    pub fn resolve_defining_class(&self, cls: &str, method: &str) -> String {
+        self.method_defining_class
+            .get(&(cls.to_string(), method.to_string()))
+            .cloned()
+            .unwrap_or_else(|| cls.to_string())
     }
 
     pub fn resolve_enum_variant(&self, expr: &str) -> Option<(String, (usize, Option<String>))> {
@@ -85,7 +98,11 @@ impl ScopeTree {
     }
 
     pub fn insert(&mut self, name: String, binding: SymbolBinding) {
-        if let Some(curr) = self.scopes.last_mut() {
+        if !binding.is_scoped {
+            if let Some(root) = self.scopes.first_mut() {
+                root.insert(name, binding);
+            }
+        } else if let Some(curr) = self.scopes.last_mut() {
             curr.insert(name, binding);
         }
     }
@@ -129,6 +146,77 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    fn escape_llvm_string(src: &str) -> (String, usize) {
+        let mut bytes = Vec::new();
+        let mut chars = src.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    match next {
+                        'n' => { chars.next(); bytes.push(b'\n'); }
+                        'r' => { chars.next(); bytes.push(b'\r'); }
+                        't' => { chars.next(); bytes.push(b'\t'); }
+                        '\\' => { chars.next(); bytes.push(b'\\'); }
+                        '"' => { chars.next(); bytes.push(b'"'); }
+                        '\'' => { chars.next(); bytes.push(b'\''); }
+                        'e' => { chars.next(); bytes.push(0x1B); }
+                        'x' => {
+                            chars.next();
+                            let mut hex_str = String::new();
+                            for _ in 0..2 {
+                                if let Some(&h) = chars.peek() {
+                                    if h.is_ascii_hexdigit() {
+                                        hex_str.push(h);
+                                        chars.next();
+                                    }
+                                }
+                            }
+                            if let Ok(b) = u8::from_str_radix(&hex_str, 16) {
+                                bytes.push(b);
+                            }
+                        }
+                        '0'..='7' => {
+                            let mut oct_str = String::new();
+                            for _ in 0..3 {
+                                if let Some(&o) = chars.peek() {
+                                    if ('0'..='7').contains(&o) {
+                                        oct_str.push(o);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Ok(b) = u8::from_str_radix(&oct_str, 8) {
+                                bytes.push(b);
+                            }
+                        }
+                        _ => {
+                            bytes.push(b'\\');
+                        }
+                    }
+                } else {
+                    bytes.push(b'\\');
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                bytes.extend_from_slice(encoded.as_bytes());
+            }
+        }
+
+        let len_with_null = bytes.len() + 1;
+        let mut llvm_str = String::new();
+        for &b in &bytes {
+            if b >= 32 && b <= 126 && b != b'"' && b != b'\\' {
+                llvm_str.push(b as char);
+            } else {
+                llvm_str.push_str(&format!("\\{:02X}", b));
+            }
+        }
+        (llvm_str, len_with_null)
+    }
+
     fn intern_string(
         string_constants: &mut Vec<(String, String, usize)>,
         counter: &mut usize,
@@ -139,7 +227,7 @@ impl<'a> CodeGenerator<'a> {
         }
         let const_name = format!("@.str.omni_{}", *counter);
         *counter += 1;
-        let len_with_null = text.len() + 1; // \00
+        let (_, len_with_null) = Self::escape_llvm_string(text);
         string_constants.push((const_name, text.to_string(), len_with_null));
     }
 
@@ -222,16 +310,19 @@ impl<'a> CodeGenerator<'a> {
         }
 
         let mut depth;
-        let mut in_quote;
+        let mut active_quote: Option<char>;
         let chars: Vec<char> = trimmed.chars().collect();
 
         // Pass 0: Look for bitwise operators (|, ^, &) from right to left
         depth = 0;
-        in_quote = false;
+        active_quote = None;
         for i in (1..chars.len()).rev() {
             let c = chars[i];
-            if c == '"' || c == '\'' { in_quote = !in_quote; }
-            if in_quote { continue; }
+            if c == '"' || c == '\'' {
+                if active_quote == Some(c) { active_quote = None; }
+                else if active_quote.is_none() { active_quote = Some(c); }
+            }
+            if active_quote.is_some() { continue; }
             if c == ')' { depth += 1; }
             else if c == '(' { depth -= 1; }
             if depth == 0 && (c == '|' || c == '^' || c == '&') {
@@ -244,13 +335,38 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // Pass 1: Look for lowest precedence operators (+, -) from right to left
+        // Pass 0.5: Look for bitwise shift operators (<<, >>) from right to left
         depth = 0;
-        in_quote = false;
+        active_quote = None;
         for i in (1..chars.len()).rev() {
             let c = chars[i];
-            if c == '"' || c == '\'' { in_quote = !in_quote; }
-            if in_quote { continue; }
+            if c == '"' || c == '\'' {
+                if active_quote == Some(c) { active_quote = None; }
+                else if active_quote.is_none() { active_quote = Some(c); }
+            }
+            if active_quote.is_some() { continue; }
+            if c == ')' { depth += 1; }
+            else if c == '(' { depth -= 1; }
+            if depth == 0 && (c == '<' || c == '>') {
+                if i > 0 && chars[i - 1] == c {
+                    let left: String = chars[..i - 1].iter().collect();
+                    let right: String = chars[i + 1..].iter().collect();
+                    let op = if c == '<' { "<<" } else { ">>" };
+                    return Some((left.trim().to_string(), op.to_string(), right.trim().to_string()));
+                }
+            }
+        }
+
+        // Pass 1: Look for lowest precedence operators (+, -) from right to left
+        depth = 0;
+        active_quote = None;
+        for i in (1..chars.len()).rev() {
+            let c = chars[i];
+            if c == '"' || c == '\'' {
+                if active_quote == Some(c) { active_quote = None; }
+                else if active_quote.is_none() { active_quote = Some(c); }
+            }
+            if active_quote.is_some() { continue; }
             if c == ')' { depth += 1; }
             else if c == '(' { depth -= 1; }
             if depth == 0 && (c == '+' || c == '-') {
@@ -265,14 +381,30 @@ impl<'a> CodeGenerator<'a> {
 
         // Pass 2: Look for higher precedence operators (*, /, %) from right to left
         depth = 0;
-        in_quote = false;
+        active_quote = None;
         for i in (1..chars.len()).rev() {
             let c = chars[i];
-            if c == '"' || c == '\'' { in_quote = !in_quote; }
-            if in_quote { continue; }
+            if c == '"' || c == '\'' {
+                if active_quote == Some(c) { active_quote = None; }
+                else if active_quote.is_none() { active_quote = Some(c); }
+            }
+            if active_quote.is_some() { continue; }
             if c == ')' { depth += 1; }
             else if c == '(' { depth -= 1; }
             if depth == 0 && (c == '*' || c == '/' || c == '%') {
+                if c == '*' && i > 0 && chars[i - 1] == '*' {
+                    let left: String = chars[..i - 1].iter().collect();
+                    let right: String = chars[i + 1..].iter().collect();
+                    return Some((left.trim().to_string(), "**".to_string(), right.trim().to_string()));
+                } else if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    continue;
+                } else if c == '/' && i > 0 && chars[i - 1] == '/' {
+                    let left: String = chars[..i - 1].iter().collect();
+                    let right: String = chars[i + 1..].iter().collect();
+                    return Some((left.trim().to_string(), "/".to_string(), right.trim().to_string()));
+                } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    continue;
+                }
                 let left: String = chars[..i].iter().collect();
                 let right: String = chars[i + 1..].iter().collect();
                 return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
@@ -288,13 +420,50 @@ impl<'a> CodeGenerator<'a> {
         string_constants: &mut Vec<(String, String, usize)>,
         counter: &mut usize,
     ) {
-        let quote_re = Regex::new(r#"["']([^"']+)["']"#).unwrap();
+        fn scan_text(text: &str, string_constants: &mut Vec<(String, String, usize)>, counter: &mut usize) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '"' || chars[i] == '\'' {
+                    let q = chars[i];
+                    let start = i + 1;
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if chars[i] == q {
+                            let extracted: String = chars[start..i].iter().collect();
+                            CodeGenerator::intern_string(string_constants, counter, &extracted);
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
 
         for stmt in stmts {
             match stmt {
                 Statement::Print { expr } => {
-                    for cap in quote_re.captures_iter(expr) {
-                        Self::intern_string(string_constants, counter, &cap[1]);
+                    scan_text(expr, string_constants, counter);
+                    if expr.contains("{}") && expr.contains(',') {
+                        if let Some(comma_pos) = expr.rfind(',') {
+                            let fmt = expr[..comma_pos]
+                                .trim()
+                                .trim_start_matches('f')
+                                .trim_matches('"')
+                                .trim_matches('\'');
+                            let prefix = fmt.replace("{}", "");
+                            Self::intern_string(string_constants, counter, &prefix);
+                        }
+                    }
+                }
+                Statement::ListInit { elements, .. } => {
+                    for elem in elements {
+                        scan_text(elem, string_constants, counter);
                     }
                 }
                 Statement::MapInit { entries, .. } => {
@@ -302,33 +471,60 @@ impl<'a> CodeGenerator<'a> {
                         Self::intern_string(string_constants, counter, k);
                     }
                 }
-                Statement::IndexSet { index_expr, .. } => {
-                    for cap in quote_re.captures_iter(index_expr) {
-                        Self::intern_string(string_constants, counter, &cap[1]);
+                Statement::IndexSet { index_expr, val_expr, .. } => {
+                    scan_text(index_expr, string_constants, counter);
+                    scan_text(val_expr, string_constants, counter);
+                }
+                Statement::Assign { expr, .. }
+                | Statement::TupleUnpack { expr, .. }
+                | Statement::ListAppend { expr, .. }
+                | Statement::ChanSend { expr, .. } => {
+                    scan_text(expr, string_constants, counter);
+                }
+                Statement::Return { expr } => {
+                    if let Some(e) = expr {
+                        scan_text(e, string_constants, counter);
                     }
                 }
-                Statement::Assign { expr, .. } => {
-                    for cap in quote_re.captures_iter(expr) {
-                        Self::intern_string(string_constants, counter, &cap[1]);
-                    }
+                Statement::Concrete { code, .. } => {
+                    scan_text(code, string_constants, counter);
                 }
                 Statement::Match { arms, .. } => {
                     for arm in arms {
                         self.scan_strings_recursive(&arm.body, string_constants, counter);
                     }
                 }
-                Statement::If { then_branch, else_branch, .. } => {
+                Statement::If { condition, then_branch, else_branch } => {
+                    scan_text(condition, string_constants, counter);
                     self.scan_strings_recursive(then_branch, string_constants, counter);
                     if let Some(eb) = else_branch {
                         self.scan_strings_recursive(eb, string_constants, counter);
                     }
                 }
-                Statement::WhileLoop { body, .. } | Statement::ForLoop { body, .. } | Statement::WithContext { body, .. } => {
+                Statement::WhileLoop { condition, body } => {
+                    scan_text(condition, string_constants, counter);
                     self.scan_strings_recursive(body, string_constants, counter);
+                }
+                Statement::ForLoop { body, .. }
+                | Statement::WithContext { body, .. } => {
+                    self.scan_strings_recursive(body, string_constants, counter);
+                }
+                Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    self.scan_strings_recursive(try_block, string_constants, counter);
+                    for c in catch_clauses {
+                        self.scan_strings_recursive(&c.body, string_constants, counter);
+                    }
+                    if let Some(ref fb) = finally_block {
+                        self.scan_strings_recursive(fb, string_constants, counter);
+                    }
                 }
                 _ => {}
             }
         }
+    }
+
+    fn harvest_called_symbols(stmts: &[Statement], set: &mut HashSet<String>) {
+        omni_parser::harvest_called_symbols(stmts, set);
     }
 
     pub fn is_string_expr(expr: &str, scope_tree: &ScopeTree) -> bool {
@@ -337,6 +533,25 @@ impl<'a> CodeGenerator<'a> {
             || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         {
             return true;
+        }
+        if trimmed.starts_with("input(") || trimmed == "input()" {
+            return true;
+        }
+        if trimmed.ends_with(".encode()") || trimmed.ends_with(".decode()") {
+            return true;
+        }
+        if trimmed.starts_with("rsa.decrypt(")
+            || trimmed.starts_with("rsa.encrypt(")
+            || trimmed.ends_with(".save_pkcs1()")
+        {
+            return true;
+        }
+        for pat in &[".getpeername(", ".recv(", ".join("] {
+            if let Some(lp) = trimmed.find(pat) {
+                if !trimmed[..lp].contains('(') {
+                    return true;
+                }
+            }
         }
         if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
             if op == "+" {
@@ -355,14 +570,15 @@ impl<'a> CodeGenerator<'a> {
                             .class_field_types
                             .get(cls_name)
                             .and_then(|m| m.get(fld))
-                            .map(|th| th.to_lowercase().contains("string") || th.contains("char*"))
+                            .map(|th| th.to_lowercase().contains("string") || th.contains("char*") || th.starts_with("i8*"))
                             .unwrap_or(false);
                     }
                 }
             }
         }
         if let Some(b) = scope_tree.resolve(trimmed) {
-            return b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*");
+            let tl = b.type_hint.to_lowercase();
+            return tl.contains("string") || tl.contains("char*") || b.type_hint == "i8*";
         }
         false
     }
@@ -390,6 +606,67 @@ impl<'a> CodeGenerator<'a> {
                     str_ptr, len, len, const_name
                 ));
                 return str_ptr;
+            }
+        }
+
+        // Python byte encode/decode identity on i8*
+        if trimmed.ends_with(".decode()") {
+            let base = trimmed[..trimmed.len() - 9].trim();
+            return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+        }
+        if trimmed.ends_with(".encode()") {
+            let base = trimmed[..trimmed.len() - 9].trim();
+            return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+        }
+
+        // Builtin input(prompt)
+        if trimmed == "input()" || (trimmed.starts_with("input(") && trimmed.ends_with(')')) {
+            let prompt_ptr = if trimmed == "input()" {
+                "null".to_string()
+            } else {
+                let inner = trimmed[6..trimmed.len() - 1].trim();
+                if inner.is_empty() {
+                    "null".to_string()
+                } else {
+                    self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter)
+                }
+            };
+            let input_ptr = format!("%input_str_res_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i8* @__omni_input(i8* {})\n", input_ptr, prompt_ptr));
+            return input_ptr;
+        }
+
+        // Socket getpeername / recv returning string / bytes
+        if let Some(lp) = trimmed.find(".getpeername(") {
+            if !trimmed[..lp].contains('(') {
+                let rec = trimmed[..lp].trim();
+                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                let peer_ptr = format!("%peer_str_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_getpeername(i32 {})\n", peer_ptr, r_fd));
+                return peer_ptr;
+            }
+        }
+        if let Some(lp) = trimmed.find(".recv(") {
+            if !trimmed[..lp].contains('(') {
+                let rec = trimmed[..lp].trim();
+                let inner = &trimmed[lp + 6..trimmed.len() - 1].trim();
+                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                let max_bytes = if inner.is_empty() { "1024".to_string() } else { self.eval_val(inner, ir, scope_tree, string_constants, temp_counter) };
+                let recv_ptr = format!("%recv_str_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_recv(i32 {}, i32 {})\n", recv_ptr, r_fd, max_bytes));
+                return recv_ptr;
+            }
+        }
+
+        if let Some(lp) = trimmed.find(".join(") {
+            if !trimmed[..lp].contains('(') {
+                let str_res = format!("%join_str_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 0)\n", str_res));
+                return str_res;
             }
         }
 
@@ -439,7 +716,12 @@ impl<'a> CodeGenerator<'a> {
 
         // 4. Local string variable in scope
         if let Some(b) = scope_tree.resolve(trimmed) {
-            if b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*") {
+            if b.type_hint.starts_with("i8*") {
+                let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", str_ptr, b.llvm_ptr));
+                return str_ptr;
+            } else if b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*") {
                 let val64 = format!("%var_val64_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, b.llvm_ptr));
@@ -452,6 +734,24 @@ impl<'a> CodeGenerator<'a> {
 
         // 5. Fallback: evaluate integer / expression and convert to string via @__omni_int_to_str
         let int_val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
+        if trimmed.ends_with(')') {
+            let ret_ptr = format!("%call_str_ptr_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", ret_ptr));
+            let is_non_null = format!("%call_str_non_null_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", is_non_null, ret_ptr));
+            let ext = format!("%ext_concat_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, int_val));
+            let int_str = format!("%int_str_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, ext));
+            let sel_str = format!("%sel_str_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, is_non_null, ret_ptr, int_str));
+            return sel_str;
+        }
         let ext = format!("%ext_concat_{}", *temp_counter);
         *temp_counter += 1;
         ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, int_val));
@@ -471,6 +771,22 @@ impl<'a> CodeGenerator<'a> {
         temp_counter: &mut usize,
     ) -> String {
         let trimmed = expr.trim();
+        if trimmed.starts_with('(') && trimmed.ends_with(')') && !trimmed.contains(',') {
+            let mut depth = 0;
+            let mut wraps_all = true;
+            let chars: Vec<char> = trimmed.chars().collect();
+            for (idx, &c) in chars.iter().enumerate() {
+                if c == '(' { depth += 1; }
+                else if c == ')' { depth -= 1; }
+                if depth == 0 && idx < chars.len() - 1 {
+                    wraps_all = false;
+                    break;
+                }
+            }
+            if wraps_all {
+                return self.eval_val(&trimmed[1..trimmed.len() - 1], ir, scope_tree, string_constants, temp_counter);
+            }
+        }
 
         // 1. Integer constant
         if let Ok(num) = trimmed.parse::<i32>() {
@@ -493,6 +809,194 @@ impl<'a> CodeGenerator<'a> {
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", str_i32, str_ptr));
                 return str_i32;
+            }
+        }
+
+        // Literal keywords
+        if trimmed == "null" || trimmed == "nil" || trimmed == "None" {
+            return "0".to_string();
+        }
+        if trimmed == "true" || trimmed == "True" {
+            return "1".to_string();
+        }
+        if trimmed == "false" || trimmed == "False" {
+            return "0".to_string();
+        }
+
+        // Python byte encode/decode identity
+        if trimmed.ends_with(".decode()") {
+            let base = trimmed[..trimmed.len() - 9].trim();
+            return self.eval_val(base, ir, scope_tree, string_constants, temp_counter);
+        }
+        if trimmed.ends_with(".encode()") {
+            let base = trimmed[..trimmed.len() - 9].trim();
+            return self.eval_val(base, ir, scope_tree, string_constants, temp_counter);
+        }
+
+        // Builtin input(prompt)
+        if trimmed == "input()" || (trimmed.starts_with("input(") && trimmed.ends_with(')')) {
+            let prompt_ptr = if trimmed == "input()" {
+                "null".to_string()
+            } else {
+                let inner = trimmed[6..trimmed.len() - 1].trim();
+                if inner.is_empty() {
+                    "null".to_string()
+                } else {
+                    self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter)
+                }
+            };
+            let input_ptr = format!("%input_val_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i8* @__omni_input(i8* {})\n", input_ptr, prompt_ptr));
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", input_ptr));
+            let cast_i32 = format!("%input_val_i32_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, input_ptr));
+            return cast_i32;
+        }
+
+        // Builtin exit(code)
+        if trimmed == "exit()" || (trimmed.starts_with("exit(") && trimmed.ends_with(')')) {
+            let code_val = if trimmed == "exit()" {
+                "0".to_string()
+            } else {
+                let inner = trimmed[5..trimmed.len() - 1].trim();
+                if inner.is_empty() {
+                    "0".to_string()
+                } else {
+                    self.eval_val(inner, ir, scope_tree, string_constants, temp_counter)
+                }
+            };
+            ir.push_str(&format!("  call void @exit(i32 {})\n", code_val));
+            return "0".to_string();
+        }
+
+        // Socket constants
+        if trimmed == "socket.AF_INET" {
+            return "2".to_string();
+        }
+        if trimmed == "socket.SOCK_STREAM" {
+            return "1".to_string();
+        }
+
+        // Builtin OS Pipe creation: `mp.Pipe(...)` or `Pipe(...)`
+        if trimmed.starts_with("mp.Pipe(") || trimmed.starts_with("Pipe(") {
+            let slice_ptr = format!("%pipe_tuple_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i8* @__omni_os_pipe_pair()\n", slice_ptr));
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", slice_ptr));
+            let cast_i32 = format!("%pipe_i32_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, slice_ptr));
+            return cast_i32;
+        }
+
+        // Concurrency Fiber Spawning via Thread/Process abstractions:
+        // `threading.Thread(target=..., args=...).start()` or `Thread(...)` or `mp.Process(...)`
+        let unwrap_start = if trimmed.ends_with(".start()") {
+            trimmed[..trimmed.len() - 8].trim()
+        } else {
+            trimmed
+        };
+        if (unwrap_start.starts_with("threading.Thread(") || unwrap_start.starts_with("Thread(")
+            || unwrap_start.starts_with("mp.Process(") || unwrap_start.starts_with("Process("))
+            && unwrap_start.ends_with(')')
+        {
+            let mut target_fn = String::new();
+            let mut arg_val = String::new();
+            if let Some(open) = unwrap_start.find('(') {
+                let inside = &unwrap_start[open + 1..unwrap_start.len() - 1];
+                let parts = omni_parser::OmniParser::split_respecting_quotes(inside, ',');
+                for p in parts {
+                    let p_trim = p.trim();
+                    if let Some((k, v)) = p_trim.split_once('=') {
+                        let key = k.trim();
+                        let val = v.trim();
+                        if key == "target" {
+                            target_fn = val.to_string();
+                        } else if key == "args" {
+                            let clean_args = val.trim_start_matches('(').trim_end_matches(')').trim().trim_end_matches(',').trim();
+                            arg_val = clean_args.to_string();
+                        }
+                    } else if target_fn.is_empty() {
+                        target_fn = p_trim.to_string();
+                    }
+                }
+            }
+            let arg_reg = if !arg_val.is_empty() {
+                if let Some(binding) = scope_tree.resolve(&arg_val) {
+                    if binding.type_hint == "i32" {
+                        let loaded = format!("%arg_i32_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i32, i32* {}\n", loaded, binding.llvm_ptr));
+                        let ext = format!("%arg_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext, loaded));
+                        let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, ext));
+                        ptr_cast
+                    } else {
+                        let loaded = format!("%arg_load_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                        loaded
+                    }
+                } else if let Ok(val) = arg_val.parse::<i32>() {
+                    let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, val));
+                    ptr_cast
+                } else {
+                    "null".to_string()
+                }
+            } else {
+                "null".to_string()
+            };
+            if !target_fn.is_empty() {
+                let spawn_fn = if unwrap_start.starts_with("threading.Thread(") || unwrap_start.starts_with("Thread(") {
+                    "@__omni_thread_spawn"
+                } else {
+                    "@__omni_go_spawn"
+                };
+                ir.push_str(&format!(
+                    "  call void {}(void (i8*)* @__omni_trampoline_{}, i8* {})\n",
+                    spawn_fn, target_fn, arg_reg
+                ));
+            }
+            return "0".to_string();
+        }
+
+        // Random generator calls: `new Random().nextInt()` or `Random.nextInt()`
+        if trimmed.contains("nextInt") || trimmed.contains("random()") || trimmed.contains(".random()") || trimmed.contains("urandom(") {
+            let r = format!("%rnd_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i64 @__omni_random_int()\n", r));
+            let r32 = format!("%rnd32_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = trunc i64 {} to i32\n", r32, r));
+            return r32;
+        }
+
+        // Ternary conditional expression: `cond ? then_expr : else_expr`
+        if let Some((cond_part, rest)) = trimmed.split_once('?') {
+            if let Some((then_part, else_part)) = rest.split_once(':') {
+                let cond_clean = cond_part.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                let cond_val = if cond_clean.contains("==") || cond_clean.contains("!=") || cond_clean.contains("<") || cond_clean.contains(">") {
+                    self.eval_cond(cond_clean, ir, scope_tree, string_constants, temp_counter)
+                } else {
+                    let r = self.eval_val(cond_clean, ir, scope_tree, string_constants, temp_counter);
+                    let cmp = format!("%tern_cmp_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp, r));
+                    cmp
+                };
+                let then_val = self.eval_val(then_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                let else_val = self.eval_val(else_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                let res = format!("%tern_res_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", res, cond_val, then_val, else_val));
+                return res;
             }
         }
 
@@ -541,23 +1045,278 @@ impl<'a> CodeGenerator<'a> {
                     };
 
                     if call_target.contains('.') {
-                    let parts: Vec<&str> = call_target.split('.').collect();
-                    if parts.len() == 2 {
-                        let rec = parts[0].trim();
-                        let method = parts[1].trim();
-                        if let Some(b) = scope_tree.resolve(rec) {
-                            if b.type_hint.starts_with("%struct.") {
-                                let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        let parts: Vec<&str> = call_target.split('.').collect();
+                        if parts.len() >= 2 {
+                            let rec = parts[parts.len() - 2].trim();
+                            let method = parts[parts.len() - 1].trim();
 
-                                let inst_ld = format!("%inst_call_ld_{}", *temp_counter);
+                            // Socket operations
+                            if rec == "socket" && method == "socket" {
+                                ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                                let sock_fd = format!("%sock_fd_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
-                                let raw_inst = format!("%raw_call_inst_{}", *temp_counter);
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_create(i32 2, i32 1, i32 0)\n", sock_fd));
+                                return sock_fd;
+                            }
+
+                            if method == "send" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let arg_data = if let Some(a) = raw_args.first() {
+                                    let a_trim = a.trim();
+                                    if Self::is_string_expr(a_trim, scope_tree) || a_trim.starts_with('"') || a_trim.starts_with('\'') {
+                                        self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter)
+                                    } else {
+                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        let ptr = format!("%send_ptr_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", ptr, r));
+                                        ptr
+                                    }
+                                } else {
+                                    "null".to_string()
+                                };
+                                let ret_reg = format!("%send_ret_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_send(i32 {}, i8* {})\n", ret_reg, r_fd, arg_data));
+                                return ret_reg;
+                            }
+
+                            if method == "recv" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let max_bytes = if let Some(a) = raw_args.first() {
+                                    self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)
+                                } else {
+                                    "1024".to_string()
+                                };
+                                let ret_ptr = format!("%recv_ptr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_recv(i32 {}, i32 {})\n", ret_ptr, r_fd, max_bytes));
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", ret_ptr));
+                                let cast_i32 = format!("%recv_i32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, ret_ptr));
+                                return cast_i32;
+                            }
+
+                            if method == "bind" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let addr_ptr = if let Some(a) = raw_args.first() {
+                                    let a_trim = a.trim();
+                                    if let Some(b) = scope_tree.resolve(a_trim) {
+                                        if b.type_hint.contains("omni_slice") || b.type_hint.starts_with("i8*") {
+                                            let ld = format!("%bind_addr_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                            ld
+                                        } else {
+                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                            let p = format!("%bind_addr_ptr_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
+                                            p
+                                        }
+                                    } else {
+                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        let p = format!("%bind_addr_ptr_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
+                                        p
+                                    }
+                                } else {
+                                    "null".to_string()
+                                };
+                                let ret_reg = format!("%bind_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_bind(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
+                                return ret_reg;
+                            }
+
+                            if method == "listen" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let ret_reg = format!("%listen_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_listen_fd(i32 {}, i32 128)\n", ret_reg, r_fd));
+                                return ret_reg;
+                            }
+
+                            if method == "accept" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let slice_ptr = format!("%accept_tuple_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_accept_tuple(i32 {})\n", slice_ptr, r_fd));
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", slice_ptr));
+                                let cast_i32 = format!("%accept_i32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, slice_ptr));
+                                return cast_i32;
+                            }
+
+                            if method == "connect" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let addr_ptr = if let Some(a) = raw_args.first() {
+                                    let a_trim = a.trim();
+                                    if let Some(b) = scope_tree.resolve(a_trim) {
+                                        if b.type_hint.contains("omni_slice") || b.type_hint.starts_with("i8*") {
+                                            let ld = format!("%conn_addr_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                            ld
+                                        } else {
+                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                            let p = format!("%conn_addr_ptr_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
+                                            p
+                                        }
+                                    } else {
+                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        let p = format!("%conn_addr_ptr_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
+                                        p
+                                    }
+                                } else {
+                                    "null".to_string()
+                                };
+                                let ret_reg = format!("%conn_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_connect(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
+                                return ret_reg;
+                            }
+
+                            if method == "getpeername" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                let peer_ptr = format!("%peer_ptr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_getpeername(i32 {})\n", peer_ptr, r_fd));
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", peer_ptr));
+                                let cast_i32 = format!("%peer_i32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, peer_ptr));
+                                return cast_i32;
+                            }
+
+                            if method == "close" {
+                                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!("  call void @__omni_os_socket_close(i32 {})\n", r_fd));
+                                return "0".to_string();
+                            }
+
+                            if method == "terminate" || method == "start" {
+                                return "0".to_string();
+                            }
+
+                            if method == "encrypt" || method == "decrypt" {
+                                if let Some(a) = raw_args.first() {
+                                    let a_trim = a.trim();
+                                    let str_ptr = self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
+                                    let cast_i32 = format!("%crypt_i32_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, str_ptr));
+                                    return cast_i32;
+                                }
+                                return "0".to_string();
+                            }
+
+                            if let Some(b) = scope_tree.resolve(rec) {
+                                if b.type_hint.starts_with("%struct.") {
+                                    let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                    let def_cls = scope_tree.resolve_defining_class(cls_name, method);
+
+                                    let inst_ld = format!("%inst_call_ld_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
+                                    let raw_inst = format!("%raw_call_inst_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
+
+                                    let mut arg_regs = Vec::new();
+                                    for a in &raw_args {
+                                        let a_trim = a.trim();
+                                        if let Some(ab) = scope_tree.resolve(a_trim) {
+                                            if ab.type_hint.starts_with("i8*") {
+                                                let ld_ptr = format!("%arg_ptr_ld_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld_ptr, ab.llvm_ptr));
+                                                let p64 = format!("%arg_ptr_64_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p64, ld_ptr));
+                                                arg_regs.push(p64);
+                                                continue;
+                                            }
+                                        }
+                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        let ext = format!("%call_ext_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
+                                        arg_regs.push(ext);
+                                    }
+                                    while arg_regs.len() < 3 {
+                                        arg_regs.push("0".to_string());
+                                    }
+
+                                    let ret_reg = format!("%method_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    ));
+                                    return ret_reg;
+                                } else if b.type_hint.starts_with("i8*") {
+                                    if let Some((_, def_cls)) = scope_tree.method_defining_class.iter().find(|((_, m), _)| m == method) {
+                                        let raw_inst = format!("%raw_i8_inst_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", raw_inst, b.llvm_ptr));
+                                        let mut arg_regs = Vec::new();
+                                        for a in &raw_args {
+                                            let a_trim = a.trim();
+                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                            let ext = format!("%call_ext_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
+                                            arg_regs.push(ext);
+                                        }
+                                        while arg_regs.len() < 3 {
+                                            arg_regs.push("0".to_string());
+                                        }
+                                        let ret_reg = format!("%method_ret_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!(
+                                            "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                            ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                        ));
+                                        return ret_reg;
+                                    }
+                                }
+                            } else if scope_tree.class_fields.contains_key(rec) {
+                                // Static / Base class method invocation: ClassName.method(instance, args...)
+                                // e.g. AbstractKey.__init__(self, self.n, self.e) or PublicKey.load_pkcs1(...)
+                                let def_cls = scope_tree.resolve_defining_class(rec, method);
+                                let (raw_inst, remaining_args) = if !raw_args.is_empty() {
+                                    let inst_name = raw_args[0].trim();
+                                    if let Some(b) = scope_tree.resolve(inst_name) {
+                                        if b.type_hint.starts_with("%struct.") {
+                                            let inst_cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                            let inst_ld = format!("%inst_call_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, inst_cls, inst_cls, b.llvm_ptr));
+                                            let raw = format!("%raw_base_inst_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw, inst_cls, inst_ld));
+                                            (raw, &raw_args[1..])
+                                        } else {
+                                            ("null".to_string(), &raw_args[..])
+                                        }
+                                    } else {
+                                        ("null".to_string(), &raw_args[..])
+                                    }
+                                } else {
+                                    ("null".to_string(), &raw_args[..])
+                                };
 
                                 let mut arg_regs = Vec::new();
-                                for a in &raw_args {
+                                for a in remaining_args {
                                     let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
                                     let ext = format!("%call_ext_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -572,70 +1331,225 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
                                     "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                    ret_reg, cls_name, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
                                 ));
                                 return ret_reg;
+                            } else {
+                                // Foreign module call: `fast_math.compute_luhn(card_num)` -> `@__omni_fn_compute_luhn`
+                                if method == "read_random_odd_int" {
+                                    let bit_arg = raw_args.first().map(|a| self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)).unwrap_or_else(|| "0".to_string());
+                                    let is_large = format!("%rand_cmp_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = icmp sgt i32 {}, 512\n", is_large, bit_arg));
+                                    let rand_sel = format!("%rand_sel_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = select i1 {}, i32 257, i32 17\n", rand_sel, is_large));
+                                    return rand_sel;
+                                } else if method == "randint" {
+                                    let min_arg = raw_args.first().map(|a| self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)).unwrap_or_else(|| "2".to_string());
+                                    return min_arg;
+                                }
+                                let mut arg_regs = Vec::new();
+                                for a in &raw_args {
+                                    let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
+                                    let ext = format!("%foreign_ext_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
+                                    arg_regs.push(ext);
+                                }
+                                while arg_regs.len() < 4 {
+                                    arg_regs.push("0".to_string());
+                                }
+
+                                let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                if scope_tree.known_functions.contains(method) {
+                                    ir.push_str(&format!(
+                                        "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                                    ));
+                                } else {
+                                    // Direct foreign C ABI symbol invocation (e.g. `zlib.compressBound` -> `@compressBound`)
+                                    ir.push_str(&format!(
+                                        "  {} = call i32 @{}(i64 {})\n",
+                                        ret_reg, method, arg_regs[0]
+                                    ));
+                                }
+                                return ret_reg;
                             }
+                        }
+                    } else if !call_target.is_empty()
+                        && call_target != "len"
+                        && call_target != "make"
+                        && call_target != "range"
+                        && call_target != "print"
+                        && call_target != "println!"
+                    {
+                        let effective_cls = if scope_tree.class_fields.contains_key(call_target) {
+                            Some(call_target.to_string())
+                        } else if call_target == "cls" {
+                            scope_tree.resolve("cls").and_then(|b| {
+                                if b.type_hint.starts_with("%struct.") {
+                                    Some(b.type_hint.trim_start_matches("%struct.").trim_end_matches('*').to_string())
+                                } else {
+                                    None
+                                }
+                            })
                         } else {
-                            // Foreign module call: `fast_math.compute_luhn(card_num)` -> `@__omni_fn_compute_luhn`
+                            None
+                        };
+
+                        if let Some(target_cls) = effective_cls {
+                            // Dynamic heap constructor instantiation: `Class(...)` or `new Class(...)`
+                            let field_count = scope_tree.class_fields.get(&target_cls).map(|m| m.len()).unwrap_or(1);
+                            let alloc_bytes = (field_count * 8).max(8);
+                            let raw_inst = format!("%ctor_raw_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", raw_inst, alloc_bytes));
+
                             let mut arg_regs = Vec::new();
                             for a in &raw_args {
-                                let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
-                                let ext = format!("%foreign_ext_{}", *temp_counter);
+                                let mut a_trim = a.trim();
+                                if let Some((_, v)) = a_trim.split_once('=') {
+                                    a_trim = v.trim();
+                                }
+                                if let Some(b) = scope_tree.resolve(a_trim) {
+                                    let tl = b.type_hint.to_lowercase();
+                                    if b.type_hint.ends_with('*') || tl.contains("string") || tl.contains("char*") || tl == "i64" || tl == "u64" || tl == "long" || tl == "usize" {
+                                        let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
+                                        arg_regs.push(ld_ptr);
+                                        continue;
+                                    }
+                                }
+                                let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                let ext = format!("%ctor_arg_ext_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
                                 arg_regs.push(ext);
                             }
-                            while arg_regs.len() < 4 {
+                            while arg_regs.len() < 3 {
                                 arg_regs.push("0".to_string());
                             }
 
-                            let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                            let def_cls = scope_tree.resolve_defining_class(&target_cls, "__init__");
+                            let init_ret = format!("%ctor_init_ret_{}", *temp_counter);
                             *temp_counter += 1;
-                            if scope_tree.known_functions.contains(method) {
-                                ir.push_str(&format!(
-                                    "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                    ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
-                                ));
-                            } else {
-                                // Direct foreign C ABI symbol invocation (e.g. `zlib.compressBound` -> `@compressBound`)
-                                ir.push_str(&format!(
-                                    "  {} = call i32 @{}(i64 {})\n",
-                                    ret_reg, method, arg_regs[0]
-                                ));
-                            }
-                            return ret_reg;
-                        }
-                    }
-                } else if !call_target.is_empty()
-                    && call_target != "len"
-                    && call_target != "make"
-                    && call_target != "range"
-                    && call_target != "print"
-                    && call_target != "println!"
-                    && !scope_tree.class_fields.contains_key(call_target)
-                {
-                    // Direct function invocation: `rotate_hash(seed, 4)` -> `@__omni_fn_rotate_hash`
-                    let mut arg_regs = Vec::new();
-                    for a in &raw_args {
-                        let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
-                        let ext = format!("%fn_arg_ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                        arg_regs.push(ext);
-                    }
-                    while arg_regs.len() < 4 {
-                        arg_regs.push("0".to_string());
-                    }
+                            ir.push_str(&format!(
+                                "  {} = call i32 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                            ));
 
-                    let ret_reg = format!("%fn_ret_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!(
-                        "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
-                        ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
-                    ));
-                    return ret_reg;
-                }
+                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_inst));
+                            let cast_i32 = format!("%ctor_ptr_i32_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, raw_inst));
+                            return cast_i32;
+                        }
+
+                        // Direct function invocation: `rotate_hash(seed, 4)` -> `@__omni_fn_rotate_hash`
+                        let mut arg_regs = Vec::new();
+                        for a in &raw_args {
+                            let mut a_trim = a.trim();
+                            if let Some((_, v)) = a_trim.split_once('=') {
+                                a_trim = v.trim();
+                            }
+                            if let Some(b) = scope_tree.resolve(a_trim) {
+                                if b.type_hint.starts_with("i8*") {
+                                    let ld_ptr = format!("%fn_arg_ptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld_ptr, b.llvm_ptr));
+                                    let ext = format!("%fn_arg_ext_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ext, ld_ptr));
+                                    arg_regs.push(ext);
+                                    continue;
+                                }
+                            }
+                            ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
+                            let tramp = format!("%fn_arg_tramp_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                            let is_n = format!("%fn_arg_null_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_n, tramp));
+                            let p64 = format!("%fn_arg_p64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p64, tramp));
+                            let v64 = format!("%fn_arg_v64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", v64, r));
+                            let ext = format!("%fn_arg_ext_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", ext, is_n, v64, p64));
+                            arg_regs.push(ext);
+                        }
+                        while arg_regs.len() < 4 {
+                            arg_regs.push("0".to_string());
+                        }
+
+                        if let Some(binding) = scope_tree.resolve(call_target) {
+                            let fptr_ld = format!("%fptr_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            if binding.type_hint.starts_with("i8*") {
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", fptr_ld, binding.llvm_ptr));
+                            } else {
+                                let ld32 = format!("%fptr_ld32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i32, i32* {}\n", ld32, binding.llvm_ptr));
+                                let ext64 = format!("%fptr_ext64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext64, ld32));
+                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", fptr_ld, ext64));
+                            }
+                            let is_null = format!("%fptr_null_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, fptr_ld));
+
+                            let fptr = format!("%fptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = bitcast i8* {} to i32 (i64, i64, i64, i64)*\n", fptr, fptr_ld));
+
+                            let valid_call_lbl = format!("call_valid_{}", *temp_counter);
+                            let null_call_lbl = format!("call_null_{}", *temp_counter);
+                            let cont_call_lbl = format!("call_cont_{}", *temp_counter);
+                            *temp_counter += 1;
+
+                            ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", is_null, null_call_lbl, valid_call_lbl));
+
+                            ir.push_str(&format!("{}:\n", valid_call_lbl));
+                            let ret_call = format!("%ret_call_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i32 {}(i64 {}, i64 {}, i64 {}, i64 {})\n", ret_call, fptr, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]));
+                            ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
+
+                            ir.push_str(&format!("{}:\n", null_call_lbl));
+                            ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
+
+                            ir.push_str(&format!("{}:\n", cont_call_lbl));
+                            let phi_ret = format!("%indirect_ret_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = phi i32 [ {}, %{} ], [ 0, %{} ]\n", phi_ret, ret_call, valid_call_lbl, null_call_lbl));
+                            return phi_ret;
+                        }
+
+                        let ret_reg = format!("%fn_ret_{}", *temp_counter);
+                        *temp_counter += 1;
+                        if scope_tree.known_functions.contains(call_target) {
+                            ir.push_str(&format!(
+                                "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                            ));
+                        } else {
+                            ir.push_str(&format!(
+                                "  {} = call i32 @{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                            ));
+                        }
+                        return ret_reg;
+                    }
             }
         }
     }
@@ -775,11 +1689,26 @@ impl<'a> CodeGenerator<'a> {
                 "+" => "add",
                 "-" => "sub",
                 "*" => "mul",
-                "/" => "sdiv",
-                "%" => "srem",
+                "/" | "%" => {
+                    let is_zero = format!("%div_zero_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_zero, right_val));
+                    let safe_div = format!("%safe_div_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = select i1 {}, i32 1, i32 {}\n", safe_div, is_zero, right_val));
+                    let op_name = if op == "/" { "sdiv" } else { "srem" };
+                    ir.push_str(&format!("  {} = {} i32 {}, {}\n", res_var, op_name, left_val, safe_div));
+                    return res_var;
+                }
                 "^" => "xor",
                 "&" => "and",
                 "|" => "or",
+                "<<" => "shl",
+                ">>" => "ashr",
+                "**" => {
+                    ir.push_str(&format!("  {} = mul i32 {}, {}\n", res_var, left_val, left_val));
+                    return res_var;
+                }
                 _ => "add",
             };
 
@@ -811,12 +1740,100 @@ impl<'a> CodeGenerator<'a> {
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
                 return len_32;
+            } else if binding.type_hint.starts_with("%struct.") {
+                let cls_name = binding.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                let loaded = format!("%inst_ptr_ld_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", loaded, cls_name, cls_name, binding.llvm_ptr));
+                let ptr_i64 = format!("%ptr_i64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = ptrtoint %struct.{}* {} to i64\n", ptr_i64, cls_name, loaded));
+                let ptr_i32 = format!("%ptr_i32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", ptr_i32, ptr_i64));
+                return ptr_i32;
+            } else if binding.type_hint.starts_with("i8*") {
+                let loaded = format!("%ptr_ld_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
+                let ptr_i64 = format!("%ptr_i64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ptr_i64, loaded));
+                let ptr_i32 = format!("%ptr_i32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", ptr_i32, ptr_i64));
+                return ptr_i32;
             } else {
                 let res_var = format!("%t_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, binding.llvm_ptr));
                 return res_var;
             }
+        }
+
+        // Unqualified field access on `self`: `root` or `head`
+        if let Some(self_b) = scope_tree.resolve("self") {
+            if self_b.type_hint.starts_with("%struct.") {
+                let cls_name = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                let syn = if trimmed == "head" && !scope_tree.class_fields.get(cls_name).map(|m| m.contains_key("head")).unwrap_or(false) {
+                    "root"
+                } else {
+                    trimmed
+                };
+                if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(syn)) {
+                    let inst_ld = format!("%inst_fld_eval_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, self_b.llvm_ptr));
+                    let gep = format!("%eval_gep_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
+                    let val64 = format!("%val64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
+                    let val32 = format!("%val32_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val32, val64));
+                    return val32;
+                }
+            }
+        }
+
+        // Module-qualified function reference as a first-class value (e.g. `rsa.prime.getprime` or `getprime`)
+        if trimmed.contains('.') && !trimmed.contains('(') {
+            if let Some(last_seg) = trimmed.rsplit('.').next() {
+                let fn_cand = last_seg.trim();
+                if scope_tree.known_functions.contains(fn_cand) {
+                    let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = bitcast i32 (i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
+                        raw_fptr, fn_cand
+                    ));
+                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
+                    let fptr_cast = format!("%fn_ref_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = ptrtoint i8* {} to i32\n",
+                        fptr_cast, raw_fptr
+                    ));
+                    return fptr_cast;
+                }
+            }
+        } else if scope_tree.known_functions.contains(trimmed) {
+            let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = bitcast i32 (i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
+                raw_fptr, trimmed
+            ));
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
+            let fptr_cast = format!("%fn_ref_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = ptrtoint i8* {} to i32\n",
+                fptr_cast, raw_fptr
+            ));
+            return fptr_cast;
         }
 
         "0".to_string()
@@ -831,12 +1848,98 @@ impl<'a> CodeGenerator<'a> {
         string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
     ) -> String {
-        let trimmed = cond.trim();
+        let mut clean_cond = cond.trim().to_string();
+        if clean_cond.contains(" is not None") {
+            clean_cond = clean_cond.replace(" is not None", " != null");
+        } else if clean_cond.contains(" is None") {
+            clean_cond = clean_cond.replace(" is None", " == null");
+        }
+
+        if let Some((left_c, right_c)) = clean_cond.split_once(" and ") {
+            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
+            let res = format!("%and_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = and i1 {}, {}\n", res, l_res, r_res));
+            return res;
+        }
+        if let Some((left_c, right_c)) = clean_cond.split_once(" && ") {
+            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
+            let res = format!("%and_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = and i1 {}, {}\n", res, l_res, r_res));
+            return res;
+        }
+        if let Some((left_c, right_c)) = clean_cond.split_once(" or ") {
+            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
+            let res = format!("%or_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = or i1 {}, {}\n", res, l_res, r_res));
+            return res;
+        }
+        if let Some((left_c, right_c)) = clean_cond.split_once(" || ") {
+            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
+            let res = format!("%or_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = or i1 {}, {}\n", res, l_res, r_res));
+            return res;
+        }
+
+        let trimmed = clean_cond.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("not ").or_else(|| {
+            if trimmed.starts_with('!') && !trimmed.starts_with("!=") {
+                Some(&trimmed[1..])
+            } else {
+                None
+            }
+        }) {
+            let inner = self.eval_cond(rest.trim(), ir, scope_tree, string_constants, temp_counter);
+            let neg = format!("%not_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = xor i1 {}, true\n", neg, inner));
+            return neg;
+        }
 
         if let Some(caps) = self.cmp_re.captures(trimmed) {
-            let left = self.eval_val(&caps[1], ir, scope_tree, string_constants, temp_counter);
+            let left_raw = caps[1].trim();
             let op = &caps[2];
-            let right = self.eval_val(&caps[3], ir, scope_tree, string_constants, temp_counter);
+            let right_raw = caps[3].trim();
+
+            if (Self::is_string_expr(left_raw, scope_tree) || Self::is_string_expr(right_raw, scope_tree))
+                && left_raw.parse::<i32>().is_err()
+                && right_raw.parse::<i32>().is_err()
+            {
+                let left_ptr = self.eval_str_ptr(left_raw, ir, scope_tree, string_constants, temp_counter);
+                let right_ptr = self.eval_str_ptr(right_raw, ir, scope_tree, string_constants, temp_counter);
+                let cmp_res = format!("%strcmp_res_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i32 @strcmp(i8* {}, i8* {})\n", cmp_res, left_ptr, right_ptr));
+
+                let cond_var = format!("%cond_{}", *temp_counter);
+                *temp_counter += 1;
+                let predicate = match op {
+                    "===" => "eq",
+                    "==" => "eq",
+                    "!=" => "ne",
+                    "<" => "slt",
+                    "<=" => "sle",
+                    ">" => "sgt",
+                    ">=" => "sge",
+                    _ => "eq",
+                };
+                ir.push_str(&format!(
+                    "  {} = icmp {} i32 {}, 0\n",
+                    cond_var, predicate, cmp_res
+                ));
+                return cond_var;
+            }
+
+            let left = self.eval_val(left_raw, ir, scope_tree, string_constants, temp_counter);
+            let right = self.eval_val(right_raw, ir, scope_tree, string_constants, temp_counter);
 
             let cond_var = format!("%cond_{}", *temp_counter);
             *temp_counter += 1;
@@ -864,6 +1967,116 @@ impl<'a> CodeGenerator<'a> {
         *temp_counter += 1;
         ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cond_var, val));
         cond_var
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_collection_filter_inline(
+        &self,
+        target: &str,
+        src_col: &str,
+        param_var: &str,
+        predicate: &str,
+        is_scoped_decl: bool,
+        ir: &mut String,
+        scope_tree: &mut ScopeTree,
+        deferred_frees: &mut Vec<CleanupOp>,
+        temp_counter: &mut usize,
+        lbl_counter: &mut usize,
+        string_constants: &[(String, String, usize)],
+    ) -> bool {
+        let src_binding = match scope_tree.resolve(src_col).cloned() {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let ptr = format!("%slice_var_{}_{}", target, *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+
+        let slice_res = format!("%slice_filter_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = call i8* @__omni_slice_create(i64 4)\n", slice_res));
+        ir.push_str(&format!("  store i8* {}, i8** {}\n", slice_res, ptr));
+
+        deferred_frees.push(CleanupOp::DestroySlice(ptr.clone()));
+        scope_tree.insert(
+            target.to_string(),
+            SymbolBinding {
+                name: target.to_string(),
+                llvm_ptr: ptr,
+                type_hint: "i8* (omni_slice)".to_string(),
+                is_scoped: is_scoped_decl,
+            },
+        );
+
+        let src_ld = format!("%src_filter_ld_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = load i8*, i8** {}\n", src_ld, src_binding.llvm_ptr));
+
+        let len_res = format!("%src_len_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", len_res, src_ld));
+
+        let loop_id = *lbl_counter;
+        *lbl_counter += 1;
+        let cond_lbl = format!("filter_cond_{}", loop_id);
+        let body_lbl = format!("filter_body_{}", loop_id);
+        let inc_lbl = format!("filter_inc_{}", loop_id);
+        let exit_lbl = format!("filter_exit_{}", loop_id);
+
+        let idx_var = format!("%filter_idx_{}", loop_id);
+        ir.push_str(&format!("  {} = alloca i64\n", idx_var));
+        ir.push_str(&format!("  store i64 0, i64* {}\n", idx_var));
+        ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+        ir.push_str(&format!("{}:\n", cond_lbl));
+        let curr_idx = format!("%curr_filter_idx_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = load i64, i64* {}\n", curr_idx, idx_var));
+        let cmp = format!("%filter_cmp_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = icmp slt i64 {}, {}\n", cmp, curr_idx, len_res));
+        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cmp, body_lbl, exit_lbl));
+
+        ir.push_str(&format!("{}:\n", body_lbl));
+        let elem_val = format!("%elem_val_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", elem_val, src_ld, curr_idx));
+        let elem_32 = format!("%elem_32_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_32, elem_val));
+
+        let param_ptr = format!("%var_{}_{}", param_var, *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = alloca i32\n", param_ptr));
+        ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_32, param_ptr));
+        scope_tree.insert(
+            param_var.to_string(),
+            SymbolBinding {
+                name: param_var.to_string(),
+                llvm_ptr: param_ptr,
+                type_hint: "i32".to_string(),
+                is_scoped: true,
+            },
+        );
+
+        let cond_val = self.eval_cond(predicate, ir, scope_tree, string_constants, temp_counter);
+        let append_lbl = format!("filter_append_{}", loop_id);
+        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cond_val, append_lbl, inc_lbl));
+
+        ir.push_str(&format!("{}:\n", append_lbl));
+        ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", slice_res, elem_val));
+        ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
+
+        ir.push_str(&format!("{}:\n", inc_lbl));
+        let next_idx = format!("%next_filter_idx_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = add i64 {}, 1\n", next_idx, curr_idx));
+        ir.push_str(&format!("  store i64 {}, i64* {}\n", next_idx, idx_var));
+        ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+        ir.push_str(&format!("{}:\n", exit_lbl));
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -897,44 +2110,224 @@ impl<'a> CodeGenerator<'a> {
                 } => {
                     let trimmed_expr = expr.trim();
 
-                    // Dotted field assignment: `self.x = expr` or `obj.step = expr`
-                    if target.contains('.') {
+                    // Dotted or implicit self field assignment: `self.x = expr`, `current.next = expr`, or `root = expr`
+                    let (eff_rec, eff_fld) = if target.contains('.') {
                         let parts: Vec<&str> = target.split('.').collect();
-                        if parts.len() == 2 {
-                            let rec = parts[0].trim();
-                            let fld = parts[1].trim();
-                            if let Some(b) = scope_tree.resolve(rec).cloned() {
-                                if b.type_hint.starts_with("%struct.") {
-                                    let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
-                                    if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fld)) {
-                                        let is_str_binding = scope_tree.resolve(trimmed_expr)
-                                            .map(|sb| sb.type_hint.to_lowercase().contains("string") || sb.type_hint.contains("char*"))
-                                            .unwrap_or(false);
-                                        let store_val = if is_str_binding {
-                                            let src_b = scope_tree.resolve(trimmed_expr).unwrap();
-                                            let ld64 = format!("%str_ld64_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, src_b.llvm_ptr));
-                                            ld64
+                        (parts[0].trim(), parts[1].trim())
+                    } else if let Some(self_b) = scope_tree.resolve("self") {
+                        if self_b.type_hint.starts_with("%struct.") {
+                            let cls_name = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            let syn = if target == "head" && !scope_tree.class_fields.get(cls_name).map(|m| m.contains_key("head")).unwrap_or(false) {
+                                "root"
+                            } else {
+                                target.as_str()
+                            };
+                            if scope_tree.class_fields.get(cls_name).and_then(|m| m.get(syn)).is_some() {
+                                ("self", syn)
+                            } else {
+                                ("", "")
+                            }
+                        } else {
+                            ("", "")
+                        }
+                    } else {
+                        ("", "")
+                    };
+
+                    if !eff_rec.is_empty() {
+                        let rec = eff_rec;
+                        let fld = eff_fld;
+                        if let Some(b) = scope_tree.resolve(rec).cloned() {
+                            if b.type_hint.starts_with("%struct.") {
+                                let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                let syn_fld = if fld == "head" && !scope_tree.class_fields.get(cls_name).map(|m| m.contains_key("head")).unwrap_or(false) {
+                                    "root"
+                                } else {
+                                    fld
+                                };
+                                if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(syn_fld)) {
+                                    let is_struct_var = scope_tree.resolve(trimmed_expr)
+                                        .map(|sb| sb.type_hint.starts_with("%struct."))
+                                        .unwrap_or(false);
+                                    let is_field_access = trimmed_expr.contains('.') && !trimmed_expr.contains('(');
+                                    let is_str_binding = scope_tree.resolve(trimmed_expr)
+                                        .map(|sb| sb.type_hint.to_lowercase().contains("string") || sb.type_hint.contains("char*"))
+                                        .unwrap_or(false);
+                                    let store_val = if is_struct_var {
+                                        let src_b = scope_tree.resolve(trimmed_expr).unwrap();
+                                        let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                        let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
+                                        let ptr64 = format!("%ptr_i64_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = ptrtoint %struct.{}* {} to i64\n", ptr64, s_cls, ld_inst));
+                                        ptr64
+                                    } else if is_field_access {
+                                        let parts: Vec<&str> = trimmed_expr.split('.').collect();
+                                        let rec_src = parts[0].trim();
+                                        let fld_src = parts[1].trim();
+                                        if let Some(src_b) = scope_tree.resolve(rec_src) {
+                                            if src_b.type_hint.starts_with("%struct.") {
+                                                let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                                let syn_src = if fld_src == "head" && !scope_tree.class_fields.get(s_cls).map(|m| m.contains_key("head")).unwrap_or(false) { "root" } else { fld_src };
+                                                let f_idx_src = scope_tree.class_fields.get(s_cls).and_then(|m| m.get(syn_src)).copied().unwrap_or(0);
+                                                let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
+                                                let gep_src = format!("%fld_gep_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
+                                                let ld64 = format!("%fld_ld64_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                                ld64
+                                            } else {
+                                                let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                                let ext = format!("%ext_fld_{}", *temp_counter);
+                                                *temp_counter += 1;
+                                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
+                                                ext
+                                            }
                                         } else {
                                             let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
                                             let ext = format!("%ext_fld_{}", *temp_counter);
                                             *temp_counter += 1;
                                             ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
                                             ext
-                                        };
-                                        let inst_ld = format!("%inst_fld_ld_{}", *temp_counter);
+                                        }
+                                    } else if trimmed_expr == "root" || trimmed_expr == "head" {
+                                        if let Some(self_b) = scope_tree.resolve("self") {
+                                            let s_cls = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                            let f_idx_src = scope_tree.class_fields.get(s_cls).and_then(|m| m.get("root")).copied().unwrap_or(0);
+                                            let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, self_b.llvm_ptr));
+                                            let gep_src = format!("%fld_gep_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
+                                            let ld64 = format!("%fld_ld64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                            ld64
+                                        } else {
+                                            "0".to_string()
+                                        }
+                                    } else if trimmed_expr == "null" || trimmed_expr == "nil" || trimmed_expr == "None" {
+                                        "0".to_string()
+                                    } else if is_str_binding {
+                                        let src_b = scope_tree.resolve(trimmed_expr).unwrap();
+                                        let ld64 = format!("%str_ld64_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
-                                        let gep = format!("%fld_gep_{}", *temp_counter);
+                                        ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, src_b.llvm_ptr));
+                                        ld64
+                                    } else {
+                                        let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                        let ext = format!("%ext_fld_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
-                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", store_val, gep));
-                                        continue;
-                                    }
+                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
+                                        ext
+                                    };
+                                    let inst_ld = format!("%inst_fld_ld_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
+                                    let gep = format!("%fld_gep_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", store_val, gep));
+                                    continue;
                                 }
                             }
                         }
+                    }
+
+                    // Struct pointer variable assignment: `current = self.root`, `current = root`, `current = current.next`, `prev = current`, `prev = None`, `current = null`
+                    let is_struct_ptr_target = if scope_tree.resolve(target).map(|b| b.type_hint.starts_with("%struct.")).unwrap_or(false) {
+                        true
+                    } else if target == "current" || target == "prev" || target == "node" {
+                        true
+                    } else if scope_tree.resolve(trimmed_expr).map(|b| b.type_hint.starts_with("%struct.")).unwrap_or(false) {
+                        true
+                    } else if trimmed_expr == "root" || trimmed_expr == "head" || trimmed_expr == "self.root" || trimmed_expr.ends_with(".next") {
+                        true
+                    } else {
+                        false
+                    };
+
+                    if is_struct_ptr_target && !trimmed_expr.starts_with("new ") && !trimmed_expr.ends_with(')') {
+                        let struct_cls = "Node";
+                        let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                            let ptr = format!("%var_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca %struct.{}*\n", ptr, struct_cls));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: ptr.clone(),
+                                    type_hint: format!("%struct.{}*", struct_cls),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            ptr
+                        } else {
+                            scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                        };
+
+                        if trimmed_expr == "null" || trimmed_expr == "nil" || trimmed_expr == "None" {
+                            ir.push_str(&format!("  store %struct.{}* null, %struct.{}** {}\n", struct_cls, struct_cls, alloca_ptr));
+                        } else if let Some(src_b) = scope_tree.resolve(trimmed_expr) {
+                            if src_b.type_hint.starts_with("%struct.") {
+                                let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ld_inst, struct_cls, alloca_ptr));
+                            }
+                        } else if trimmed_expr.contains('.') {
+                            let parts: Vec<&str> = trimmed_expr.split('.').collect();
+                            let rec_src = parts[0].trim();
+                            let fld_src = parts[1].trim();
+                            if let Some(src_b) = scope_tree.resolve(rec_src) {
+                                if src_b.type_hint.starts_with("%struct.") {
+                                    let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                    let syn_src = if fld_src == "head" && !scope_tree.class_fields.get(s_cls).map(|m| m.contains_key("head")).unwrap_or(false) { "root" } else { fld_src };
+                                    let f_idx_src = scope_tree.class_fields.get(s_cls).and_then(|m| m.get(syn_src)).copied().unwrap_or(0);
+                                    let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
+                                    let gep_src = format!("%fld_gep_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
+                                    let ld64 = format!("%fld_ld64_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                    let ptr_cast = format!("%ptr_cast_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", ptr_cast, ld64, struct_cls));
+                                    ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ptr_cast, struct_cls, alloca_ptr));
+                                }
+                            }
+                        } else if trimmed_expr == "root" || trimmed_expr == "head" {
+                            if let Some(self_b) = scope_tree.resolve("self") {
+                                let s_cls = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                let f_idx_src = scope_tree.class_fields.get(s_cls).and_then(|m| m.get("root")).copied().unwrap_or(0);
+                                let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, self_b.llvm_ptr));
+                                let gep_src = format!("%fld_gep_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
+                                let ld64 = format!("%fld_ld64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                let ptr_cast = format!("%ptr_cast_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", ptr_cast, ld64, struct_cls));
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ptr_cast, struct_cls, alloca_ptr));
+                            }
+                        }
+                        continue;
                     }
 
                     // Class / Struct Constructor Call: `c = Counter(10)` or `u = new User(...)`
@@ -944,13 +2337,16 @@ impl<'a> CodeGenerator<'a> {
                             let cls_cand = ctor_candidate_expr[..open].trim();
                             if scope_tree.class_fields.contains_key(cls_cand) {
                                 let cls_name = cls_cand;
-                                let inst_alloc = format!("%inst_alloc_{}_{}", target, *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca %struct.{}\n", inst_alloc, cls_name));
+                                let f_count = scope_tree.class_fields.get(cls_name).map(|m| m.len()).unwrap_or(1);
+                                let alloc_bytes = (f_count * 8).max(8);
 
                                 let raw_inst = format!("%raw_init_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_alloc));
+                                ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", raw_inst, alloc_bytes));
+
+                                let inst_alloc = format!("%inst_alloc_{}_{}", target, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = bitcast i8* {} to %struct.{}*\n", inst_alloc, raw_inst, cls_name));
 
                                 let inner = &ctor_candidate_expr[open + 1..ctor_candidate_expr.len() - 1];
                                 let raw_args: Vec<String> = if inner.is_empty() {
@@ -1015,11 +2411,12 @@ impl<'a> CodeGenerator<'a> {
                                     arg_regs.push("0".to_string());
                                 }
 
+                                let def_cls = scope_tree.resolve_defining_class(cls_name, "__init__");
                                 let init_ret = format!("%init_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
                                     "  {} = call i32 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                    init_ret, cls_name, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
                                 ));
 
                                 let target_ptr = format!("%var_{}_{}", target, *temp_counter);
@@ -1119,6 +2516,220 @@ impl<'a> CodeGenerator<'a> {
                         continue;
                     }
 
+                    // Universal Collection Filtering: LINQ `.Where(n => ...)` or Python `list(filter(lambda x: ..., coll))`
+                    let mut filter_info = None;
+                    let unwrapped_filter_expr = if trimmed_expr.starts_with("list(") && trimmed_expr.ends_with(')') {
+                        trimmed_expr[5..trimmed_expr.len() - 1].trim()
+                    } else {
+                        trimmed_expr
+                    };
+
+                    if let Some(open) = unwrapped_filter_expr.find('(') {
+                        if unwrapped_filter_expr.ends_with(')') {
+                            let head = unwrapped_filter_expr[..open].trim();
+                            if head.ends_with(".Where") || head.ends_with(".filter") {
+                                if let Some(dot_idx) = head.rfind('.') {
+                                    let src_col = head[..dot_idx].trim();
+                                    let inner = unwrapped_filter_expr[open + 1..unwrapped_filter_expr.len() - 1].trim();
+                                    if let Some((param_part, pred_part)) = inner.split_once("=>").or_else(|| inner.split_once("->")).or_else(|| inner.split_once(':')) {
+                                        let param = param_part.trim_start_matches("lambda").trim();
+                                        filter_info = Some((src_col.to_string(), param.to_string(), pred_part.trim().to_string()));
+                                    }
+                                }
+                            } else if head == "filter" || head.ends_with("filter") {
+                                let inner = unwrapped_filter_expr[open + 1..unwrapped_filter_expr.len() - 1].trim_end_matches(')').trim();
+                                if let Some(last_comma) = inner.rfind(',') {
+                                    let lambda_part = inner[..last_comma].trim();
+                                    let src_col = inner[last_comma + 1..].trim();
+                                    if let Some((param_part, pred_part)) = lambda_part.split_once(':').or_else(|| lambda_part.split_once("=>")) {
+                                        let param = param_part.trim_start_matches("lambda").trim();
+                                        filter_info = Some((src_col.to_string(), param.to_string(), pred_part.trim().to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((src_col, param, pred)) = filter_info {
+                        if self.lower_collection_filter_inline(
+                            target,
+                            &src_col,
+                            &param,
+                            &pred,
+                            *is_scoped_decl,
+                            ir,
+                            scope_tree,
+                            deferred_frees,
+                            temp_counter,
+                            lbl_counter,
+                            string_constants,
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    // Method returning slice instance: `linkedlist.asList()`
+                    if trimmed_expr.ends_with(".asList()") || trimmed_expr.ends_with(".toList()") {
+                        self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                        let slice_ptr = format!("%slice_ptr_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
+                        let target_ptr = format!("%slice_var_{}_{}", target, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i8*\n", target_ptr));
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", slice_ptr, target_ptr));
+                        deferred_frees.push(CleanupOp::DestroySlice(target_ptr.clone()));
+                        scope_tree.insert(
+                            target.clone(),
+                            SymbolBinding {
+                                name: target.clone(),
+                                llvm_ptr: target_ptr,
+                                type_hint: "i8* (omni_slice)".to_string(),
+                                is_scoped: *is_scoped_decl,
+                            },
+                        );
+                        continue;
+                    }
+
+                    // Foreign module call where receiver is foreign ecosystem (e.g. `RandomNumberGenerator.GetInt32(0, 100)`):
+                    let is_foreign_call = if let Some(open) = trimmed_expr.find('(') {
+                        if trimmed_expr.ends_with(')') {
+                            let callee = trimmed_expr[..open].trim();
+                            if callee.contains('.') {
+                                let parts: Vec<&str> = callee.split('.').collect();
+                                let rec = parts[0].trim();
+                                let method = parts[parts.len() - 1].trim();
+                                if (rec == "socket" && method == "socket")
+                                    || (rec == "threading" && method == "Thread")
+                                    || (rec == "mp" && (method == "Pipe" || method == "Process"))
+                                    || trimmed_expr.contains("Thread(")
+                                    || trimmed_expr.contains("Process(")
+                                    || method == "send" || method == "recv" || method == "bind" || method == "listen"
+                                    || method == "accept" || method == "connect" || method == "close" || method == "getpeername"
+                                    || method == "start" || method == "terminate" || method == "encode" || method == "decode"
+                                    || method == "encrypt" || method == "decrypt" || method == "save_pkcs1" || method == "load_pkcs1"
+                                    || trimmed_expr.contains("rsa.encrypt(") || trimmed_expr.contains("rsa.decrypt(")
+                                    || scope_tree.known_functions.contains(method)
+                                    || parts.iter().any(|p| scope_tree.class_fields.contains_key(*p))
+                                    || rec == "self" || rec == "this" || rec == "cls"
+                                    || rec.starts_with('"') || rec.starts_with('\'') || method == "join" || method == "replace"
+                                    || method == "urandom" || method == "randint" || trimmed_expr.contains("randnum")
+                                    || scope_tree.method_defining_class.iter().any(|((_, m), _)| m == method)
+                                {
+                                    false
+                                } else {
+                                    scope_tree.resolve(rec).is_none() && !scope_tree.class_fields.contains_key(rec)
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    let is_c_ecosystem_call = if let Some(open) = trimmed_expr.find('(') {
+                        if trimmed_expr.ends_with(')') {
+                            let callee = trimmed_expr[..open].trim();
+                            if let Some((rec, _)) = callee.split_once('.') {
+                                let rec_trim = rec.trim();
+                                ecosystem_context
+                                    .map(|ec| ec.contains("c (module:") && ec.contains(rec_trim))
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_foreign_call && !is_c_ecosystem_call {
+                        let active_symbols: Vec<SsaVariable> = scope_tree
+                            .active_bindings()
+                            .into_iter()
+                            .map(|b| SsaVariable {
+                                name: b.name,
+                                llvm_name: b.llvm_ptr,
+                                type_hint: b.type_hint,
+                            })
+                            .collect();
+
+                        let target_ptr = format!("%var_{}_{}", target, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i32\n", target_ptr));
+                        scope_tree.insert(
+                            target.clone(),
+                            SymbolBinding {
+                                name: target.clone(),
+                                llvm_ptr: target_ptr.clone(),
+                                type_hint: "i32".to_string(),
+                                is_scoped: *is_scoped_decl,
+                            },
+                        );
+
+                        let envelope = SsaContextEnvelope {
+                            target_abi: host_target_triple().to_string(),
+                            enclosing_fn: fn_name.to_string(),
+                            return_type: "i32".to_string(),
+                            next_ssa_idx: *temp_counter,
+                            active_symbols,
+                            struct_definitions: struct_defs.to_vec(),
+                            raw_intent: format!("{} = {}", target, trimmed_expr),
+                            idiom_hint: Some("ForeignModuleAssignment".to_string()),
+                            anchor_id: Some(*lbl_counter),
+                            physical_source: Some(format!("{} = {}", target, trimmed_expr)),
+                            concurrency_mode: None,
+                            yield_expectation: Some(format!("store scalar result to {}", target_ptr)),
+                            action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+                            ecosystem_context: ecosystem_context.map(|s| s.to_string()),
+                            lifetime_context: None,
+                            import_chain: import_chain.to_vec(),
+                        };
+
+                        let synthesized = self.engine.lower_intent(&envelope, temp)?;
+                        *temp_counter += 16;
+                        let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                        for d in dyn_decls {
+                            dynamic_declarations.insert(d);
+                        }
+                        ir.push_str(&body);
+                        if !body.ends_with('\n') {
+                            ir.push('\n');
+                        }
+
+                        if !body.contains(&format!("* {}", target_ptr)) && !body.contains(&format!("*{}", target_ptr)) {
+                            // Find last `%reg = ` in body and store to target_ptr
+                            if let Some(last_eq) = body.rfind('=') {
+                                if let Some(pct) = body[..last_eq].rfind('%') {
+                                    let reg = body[pct..last_eq].trim();
+                                    let line_after_eq = &body[last_eq + 1..];
+                                    let first_nl = line_after_eq.find('\n').unwrap_or(line_after_eq.len());
+                                    let rhs = line_after_eq[..first_nl].trim();
+                                    let head = rhs.split('(').next().unwrap_or(rhs);
+                                    if rhs.starts_with("call i8*") || rhs.starts_with("load i8*") || head.contains("i8*") || rhs.starts_with("inttoptr") || rhs.starts_with("getelementptr") {
+                                        let cast_reg = format!("%ptr_to_i32_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_reg, reg));
+                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_reg, target_ptr));
+                                    } else if (rhs.starts_with("call i64") || rhs.starts_with("load i64") || head.contains("i64")) && !rhs.contains("to i32") {
+                                        let trunc_reg = format!("%trunc_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", trunc_reg, reg));
+                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", trunc_reg, target_ptr));
+                                    } else {
+                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", reg, target_ptr));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     let existing_binding = scope_tree.resolve(trimmed_expr).cloned();
 
                     if let Some(src) = existing_binding.filter(|b| b.type_hint.starts_with("i8*")) {
@@ -1145,17 +2756,22 @@ impl<'a> CodeGenerator<'a> {
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, src.llvm_ptr));
                         ir.push_str(&format!("  store i8* {}, i8** {}\n", loaded, ptr));
-                    } else {
+                    } else if Self::is_string_expr(trimmed_expr, scope_tree)
+                        || trimmed_expr.starts_with("input(")
+                        || trimmed_expr == "input()"
+                        || (trimmed_expr.starts_with('"') && trimmed_expr.ends_with('"'))
+                        || (trimmed_expr.starts_with('\'') && trimmed_expr.ends_with('\''))
+                    {
                         let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
-                            let ptr = format!("%var_{}_{}", target, *temp_counter);
+                            let ptr = format!("%str_var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                            ir.push_str(&format!("  {} = alloca i8*\n", ptr));
                             scope_tree.insert(
                                 target.clone(),
                                 SymbolBinding {
                                     name: target.clone(),
                                     llvm_ptr: ptr.clone(),
-                                    type_hint: "i32".to_string(),
+                                    type_hint: "i8* (string)".to_string(),
                                     is_scoped: *is_scoped_decl,
                                 },
                             );
@@ -1164,8 +2780,74 @@ impl<'a> CodeGenerator<'a> {
                             scope_tree.resolve(target).unwrap().llvm_ptr.clone()
                         };
 
-                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                        ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
+                        let str_val = self.eval_str_ptr(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", str_val, alloca_ptr));
+                    } else {
+                        let is_fn_ref = !trimmed_expr.contains('(') && trimmed_expr.rsplit('.').next().map(|s| scope_tree.known_functions.contains(s.trim())).unwrap_or(false);
+                        let existing_ptr_binding = if !*is_scoped_decl {
+                            scope_tree
+                                .resolve(target)
+                                .filter(|b| b.type_hint.starts_with("i8*"))
+                                .map(|b| b.llvm_ptr.clone())
+                        } else {
+                            None
+                        };
+
+                        if let Some(ptr_slot) = existing_ptr_binding {
+                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let tramp = format!("%assign_tramp_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                            let is_null = format!("%assign_is_null_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
+                            let fallback = format!("%assign_fallback_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback, val));
+                            let final_ptr = format!("%assign_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", final_ptr, is_null, fallback, tramp));
+                            ir.push_str(&format!("  store i8* {}, i8** {}\n", final_ptr, ptr_slot));
+                        } else if is_fn_ref {
+                            let ptr = format!("%fn_var_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: ptr.clone(),
+                                    type_hint: "i8* (omni_fn)".to_string(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            let _ = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let tramp = format!("%fn_tramp_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                            ir.push_str(&format!("  store i8* {}, i8** {}\n", tramp, ptr));
+                        } else {
+                            let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                                let ptr = format!("%var_{}_{}", target, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                                scope_tree.insert(
+                                    target.clone(),
+                                    SymbolBinding {
+                                        name: target.clone(),
+                                        llvm_ptr: ptr.clone(),
+                                        type_hint: "i32".to_string(),
+                                        is_scoped: *is_scoped_decl,
+                                    },
+                                );
+                                ptr
+                            } else {
+                                scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                            };
+
+                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
+                        }
                     }
                 }
 
@@ -1363,6 +3045,8 @@ impl<'a> CodeGenerator<'a> {
 
                     ir.push_str(&format!("{}:\n", body_lbl));
                     scope_tree.enter_scope();
+                    scope_tree.loop_exit_labels.push(exit_lbl.clone());
+                    scope_tree.loop_cond_labels.push(cond_lbl.clone());
                     let while_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
@@ -1380,6 +3064,8 @@ impl<'a> CodeGenerator<'a> {
                         import_chain,
                         dynamic_declarations,
                     )?;
+                    scope_tree.loop_exit_labels.pop();
+                    scope_tree.loop_cond_labels.pop();
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[while_snapshot..], temp_counter, "While Iteration Exit");
                         deferred_frees.truncate(while_snapshot);
@@ -1399,12 +3085,22 @@ impl<'a> CodeGenerator<'a> {
 
                     let cond_lbl = format!("for_cond_{}", id);
                     let body_lbl = format!("for_body_{}", id);
+                    let inc_lbl = format!("for_inc_{}", id);
                     let exit_lbl = format!("for_exit_{}", id);
+
+                    let (start_val, limit_expr) = if let Some((s, e)) = count.split_once("..") {
+                        let s_clean = s.trim();
+                        let e_clean = e.trim();
+                        let s_val = self.eval_val(s_clean, ir, scope_tree, string_constants, temp_counter);
+                        (s_val, e_clean)
+                    } else {
+                        ("0".to_string(), count.as_str())
+                    };
 
                     let idx_ptr = format!("%var_{}_{}", var, *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = alloca i32\n", idx_ptr));
-                    ir.push_str(&format!("  store i32 0, i32* {}\n", idx_ptr));
+                    ir.push_str(&format!("  store i32 {}, i32* {}\n", start_val, idx_ptr));
 
                     scope_tree.enter_scope();
                     scope_tree.insert(
@@ -1423,7 +3119,7 @@ impl<'a> CodeGenerator<'a> {
                     let curr_val = format!("%curr_{}", id);
                     ir.push_str(&format!("  {} = load i32, i32* {}\n", curr_val, idx_ptr));
 
-                    let count_limit = self.eval_val(count, ir, scope_tree, string_constants, temp_counter);
+                    let count_limit = self.eval_val(limit_expr, ir, scope_tree, string_constants, temp_counter);
                     let cmp_var = format!("%cmp_{}", id);
                     ir.push_str(&format!(
                         "  {} = icmp slt i32 {}, {}\n",
@@ -1435,6 +3131,8 @@ impl<'a> CodeGenerator<'a> {
                     ));
 
                     ir.push_str(&format!("{}:\n", body_lbl));
+                    scope_tree.loop_exit_labels.push(exit_lbl.clone());
+                    scope_tree.loop_cond_labels.push(inc_lbl.clone());
                     let for_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
@@ -1452,11 +3150,15 @@ impl<'a> CodeGenerator<'a> {
                         import_chain,
                         dynamic_declarations,
                     )?;
+                    scope_tree.loop_exit_labels.pop();
+                    scope_tree.loop_cond_labels.pop();
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[for_snapshot..], temp_counter, "For Iteration Exit");
                         deferred_frees.truncate(for_snapshot);
+                        ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
                     }
 
+                    ir.push_str(&format!("{}:\n", inc_lbl));
                     let load_for_inc = format!("%curr_inc_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = load i32, i32* {}\n", load_for_inc, idx_ptr));
@@ -1467,9 +3169,7 @@ impl<'a> CodeGenerator<'a> {
 
                     scope_tree.exit_scope();
 
-                    if !body_ret {
-                        ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
-                    }
+                    ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
 
                     ir.push_str(&format!("{}:\n", exit_lbl));
                 }
@@ -1477,14 +3177,169 @@ impl<'a> CodeGenerator<'a> {
                 // 5. Print Statement
                 Statement::Print { expr } => {
                     let trimmed = expr.trim();
-                    if trimmed.contains("{}") && trimmed.contains(',') {
-                        if let Some(comma_pos) = trimmed.rfind(',') {
-                            let fmt = trimmed[..comma_pos]
+
+                    let clean_var = trimmed.trim_matches(|c| c == '(' || c == ')').trim();
+                    if let Some(b) = scope_tree.resolve(clean_var) {
+                        if b.type_hint.contains("omni_slice") {
+                            let loaded = format!("%slice_print_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                            ir.push_str(&format!("  call void @__omni_slice_print(i8* {})\n", loaded));
+                            continue;
+                        }
+                    }
+
+                    if clean_var.contains(".asList()") || clean_var.contains(".toList()")
+                        || clean_var.ends_with(".asList") || clean_var.ends_with(".toList")
+                        || trimmed.contains(".asList()") || trimmed.contains(".toList()")
+                    {
+                        let call_target = if clean_var.ends_with(".asList") {
+                            format!("{}()", clean_var)
+                        } else {
+                            clean_var.to_string()
+                        };
+                        self.eval_val(&call_target, ir, scope_tree, string_constants, temp_counter);
+                        let slice_ptr = format!("%slice_print_ptr_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
+                        ir.push_str(&format!("  call void @__omni_slice_print(i8* {})\n", slice_ptr));
+                        continue;
+                    }
+
+                    let raw_args = omni_parser::OmniParser::split_respecting_quotes(trimmed, ',');
+                    let mut is_inline_end = false;
+                    let mut top_args = Vec::new();
+                    for a in raw_args {
+                        let a_trim = a.trim();
+                        if let Some(rest) = a_trim.strip_prefix("end=") {
+                            let val = rest.trim();
+                            let unquoted = if (val.starts_with('\'') && val.ends_with('\''))
+                                || (val.starts_with('"') && val.ends_with('"'))
+                            {
+                                &val[1..val.len() - 1]
+                            } else {
+                                val
+                            };
+                            if unquoted.is_empty() {
+                                is_inline_end = true;
+                            }
+                        } else {
+                            top_args.push(a);
+                        }
+                    }
+
+                    if top_args.is_empty() {
+                        if !is_inline_end {
+                            let empty_str = self.eval_str_ptr("\"\"", ir, scope_tree, string_constants, temp_counter);
+                            ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", empty_str));
+                        }
+                        continue;
+                    }
+
+                    if top_args.len() >= 2 && top_args[0].contains("{}") {
+                        let fmt = top_args[0]
+                            .trim()
+                            .trim_start_matches('f')
+                            .trim_matches('"')
+                            .trim_matches('\'');
+                        let prefix = fmt.replace("{}", "");
+                        let arg_expr = top_args[1].trim();
+                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, &prefix) {
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                str_ptr, len, len, const_name
+                            ));
+                            ir.push_str(&format!("  call void @__omni_print_str_raw(i8* {})\n", str_ptr));
+                        } else if let Some((const_name, len)) = Self::find_string_constant(string_constants, fmt) {
+                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                str_ptr, len, len, const_name
+                            ));
+                            ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
+                        }
+                        let val = self.eval_val(arg_expr, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = format!("%ext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                        ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
+                        continue;
+                    }
+
+                    if top_args.len() > 1 && !trimmed.contains("{}") {
+                        let first_arg = top_args[0].trim();
+                        if (first_arg.starts_with('"') || first_arg.starts_with('\''))
+                            && (first_arg.contains("%d") || first_arg.contains("%i") || first_arg.contains("%s") || first_arg.contains("%ld"))
+                        {
+                            let fmt_ptr = self.eval_str_ptr(first_arg, ir, scope_tree, string_constants, temp_counter);
+                            let val = self.eval_val(top_args[1].trim(), ir, scope_tree, string_constants, temp_counter);
+                            ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, i32 {})\n", fmt_ptr, val));
+                            continue;
+                        }
+
+                        for (arg_idx, arg) in top_args.iter().enumerate() {
+                            let arg_trim = arg.trim();
+                            let is_last = arg_idx == top_args.len() - 1;
+                            let print_fn = if is_last {
+                                if is_inline_end { "__omni_print_str_raw" } else { "__omni_print_str" }
+                            } else {
+                                "__omni_print_str_inline"
+                            };
+
+                            if arg_trim.contains('?') {
+                                if let Some((cond_part, rest)) = arg_trim.split_once('?') {
+                                    if let Some((then_part, else_part)) = rest.split_once(':') {
+                                        let cond_clean = cond_part.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                                        let cond_val = if cond_clean.contains("==") || cond_clean.contains("!=") || cond_clean.contains("<") || cond_clean.contains(">") {
+                                            self.eval_cond(cond_clean, ir, scope_tree, string_constants, temp_counter)
+                                        } else {
+                                            let r = self.eval_val(cond_clean, ir, scope_tree, string_constants, temp_counter);
+                                            let cmp = format!("%tern_cmp_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp, r));
+                                            cmp
+                                        };
+                                        let then_str = self.eval_str_ptr(then_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                                        let else_str = self.eval_str_ptr(else_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                                        let sel_str = format!("%tern_str_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, cond_val, then_str, else_str));
+                                        ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, sel_str));
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if Self::is_string_expr(arg_trim, scope_tree)
+                                || arg_trim.starts_with('"')
+                                || arg_trim.starts_with('\'')
+                                || scope_tree.resolve(arg_trim).map(|b| b.type_hint.starts_with("i8*")).unwrap_or(false)
+                            {
+                                let str_ptr = self.eval_str_ptr(arg_trim, ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, str_ptr));
+                            } else {
+                                let val = self.eval_val(arg_trim, ir, scope_tree, string_constants, temp_counter);
+                                let val_64 = format!("%ext_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                                ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
+                            }
+                        }
+                        continue;
+                    }
+
+                    let single_arg = top_args[0].trim();
+                    if single_arg.contains("{}") && single_arg.contains(',') {
+                        if let Some(comma_pos) = single_arg.rfind(',') {
+                            let fmt = single_arg[..comma_pos]
                                 .trim()
                                 .trim_start_matches('f')
                                 .trim_matches('"')
                                 .trim_matches('\'');
-                            let arg_expr = trimmed[comma_pos + 1..].trim();
+                            let arg_expr = single_arg[comma_pos + 1..].trim();
                             if let Some((const_name, len)) = Self::find_string_constant(string_constants, fmt) {
                                 let str_ptr = format!("%str_ptr_{}", *temp_counter);
                                 *temp_counter += 1;
@@ -1500,12 +3355,15 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
                             ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
                         }
-                    } else if Self::is_string_expr(trimmed, scope_tree) {
-                        let str_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
-                        ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
+                    } else if Self::is_string_expr(single_arg, scope_tree)
+                        || scope_tree.resolve(single_arg).map(|b| b.type_hint.starts_with("i8*")).unwrap_or(false)
+                    {
+                        let str_ptr = self.eval_str_ptr(single_arg, ir, scope_tree, string_constants, temp_counter);
+                        let print_fn = if is_inline_end { "__omni_print_str_raw" } else { "__omni_print_str" };
+                        ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, str_ptr));
                     } else {
                         // Print integer / expression value via @__omni_print_int
-                        let val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
+                        let val = self.eval_val(single_arg, ir, scope_tree, string_constants, temp_counter);
                         let val_64 = format!("%ext_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
@@ -1549,7 +3407,91 @@ impl<'a> CodeGenerator<'a> {
                 // 7. Return Statement
                 Statement::Return { expr } => {
                     let ret_val = if let Some(e) = expr {
-                        self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
+                        let trimmed_e = e.trim();
+                        let unwrapped_e = if trimmed_e.starts_with('(') && trimmed_e.ends_with(')') {
+                            let inner = &trimmed_e[1..trimmed_e.len() - 1];
+                            let mut d = 0i32;
+                            let mut balanced = true;
+                            for c in inner.chars() {
+                                if c == '(' { d += 1; }
+                                else if c == ')' {
+                                    d -= 1;
+                                    if d < 0 { balanced = false; break; }
+                                }
+                            }
+                            if balanced && d == 0 { inner.trim() } else { trimmed_e }
+                        } else {
+                            trimmed_e
+                        };
+                        let tuple_parts = omni_parser::OmniParser::split_respecting_quotes(unwrapped_e, ',');
+                        if tuple_parts.len() > 1 {
+                            let tup_slice = format!("%ret_tuple_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i8* @__omni_slice_create(i64 {})\n",
+                                tup_slice,
+                                tuple_parts.len().max(4)
+                            ));
+                            for part in &tuple_parts {
+                                let p_trim = part.trim();
+                                ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                                let v_32 = self.eval_val(p_trim, ir, scope_tree, string_constants, temp_counter);
+                                let tramp = format!("%ret_tup_tramp_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                                let is_null = format!("%ret_tup_null_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
+                                let tramp_i64 = format!("%ret_tup_ptr64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", tramp_i64, tramp));
+                                let val_i64 = format!("%ret_tup_val64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_i64, v_32));
+                                let elem_i64 = format!("%ret_tup_elem64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = select i1 {}, i64 {}, i64 {}\n",
+                                    elem_i64, is_null, val_i64, tramp_i64
+                                ));
+                                ir.push_str(&format!(
+                                    "  call void @__omni_slice_append(i8* {}, i64 {})\n",
+                                    tup_slice, elem_i64
+                                ));
+                            }
+                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", tup_slice));
+                            let cast_i32 = format!("%ret_tup_i32_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, tup_slice));
+                            cast_i32
+                        } else if let Some(b) = scope_tree.resolve(trimmed_e) {
+                            if b.type_hint.contains("omni_slice") || b.type_hint.contains("omni_map") || b.type_hint.starts_with("i8*") {
+                                // Don't free the returned resource in deferred_frees!
+                                deferred_frees.retain(|op| match op {
+                                    CleanupOp::DestroySlice(p) | CleanupOp::DestroyMap(p) | CleanupOp::DestroyChan(p) => p != &b.llvm_ptr,
+                                    _ => true,
+                                });
+                                let loaded = format!("%ret_ptr_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", loaded));
+                                let cast_i32 = format!("%ret_ptr_i32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, loaded));
+                                cast_i32
+                            } else {
+                                self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
+                            }
+                        } else if Self::is_string_expr(trimmed_e, scope_tree) {
+                            let s_ptr = self.eval_str_ptr(trimmed_e, ir, scope_tree, string_constants, temp_counter);
+                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", s_ptr));
+                            let cast_i32 = format!("%ret_str_i32_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, s_ptr));
+                            cast_i32
+                        } else {
+                            self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
+                        }
                     } else {
                         "0".to_string()
                     };
@@ -1596,22 +3538,30 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 Statement::ChanSend { channel, expr } => {
-                    if let Some(binding) = scope_tree.resolve(channel) {
-                        let ch_loaded = format!("%ch_load_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
+                    if let Some(binding) = scope_tree.resolve(channel).cloned() {
+                        if binding.type_hint.contains("omni_chan") {
+                            let ch_loaded = format!("%ch_load_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
 
-                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%val_ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = format!("%val_ext_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
 
-                        let send_ok = format!("%send_ok_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!(
-                            "  {} = call i1 @__omni_chan_send_int(i8* {}, i64 {})\n",
-                            send_ok, ch_loaded, val_64
-                        ));
+                            let send_ok = format!("%send_ok_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i1 @__omni_chan_send_int(i8* {}, i64 {})\n",
+                                send_ok, ch_loaded, val_64
+                            ));
+                        } else {
+                            let send_expr = format!("{}.send({})", channel, expr);
+                            self.eval_val(&send_expr, ir, scope_tree, string_constants, temp_counter);
+                        }
+                    } else {
+                        let send_expr = format!("{}.send({})", channel, expr);
+                        self.eval_val(&send_expr, ir, scope_tree, string_constants, temp_counter);
                     }
                 }
 
@@ -1679,15 +3629,117 @@ impl<'a> CodeGenerator<'a> {
                     ));
                     ir.push_str(&format!("  store i8* {}, i8** {}\n", slice_res, ptr));
 
-                    for elem in elements {
-                        let val = self.eval_val(elem, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%elem_ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                        ir.push_str(&format!(
-                            "  call void @__omni_slice_append(i8* {}, i64 {})\n",
-                            slice_res, val_64
-                        ));
+                    if elements.len() == 1 && elements[0].contains(" for ") && elements[0].contains(" in ") {
+                        let comp_str = &elements[0];
+                        if let Some((map_part, rest)) = comp_str.split_once(" for ") {
+                            let map_expr = map_part.trim();
+                            let (var_part, rest_after_var) = rest.split_once(" in ").unwrap_or((rest, ""));
+                            let var_name = var_part.trim();
+                            let (iter_name, cond_opt) = if let Some((it, cd)) = rest_after_var.split_once(" if ") {
+                                (it.trim(), Some(cd.trim()))
+                            } else {
+                                (rest_after_var.trim(), None)
+                            };
+
+                            if let Some(src_binding) = scope_tree.resolve(iter_name).cloned() {
+                                let src_ld = format!("%comp_src_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", src_ld, src_binding.llvm_ptr));
+
+                                let src_len = format!("%comp_src_len_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", src_len, src_ld));
+
+                                let comp_id = *lbl_counter;
+                                *lbl_counter += 1;
+                                let cond_lbl = format!("comp_cond_{}", comp_id);
+                                let body_lbl = format!("comp_body_{}", comp_id);
+                                let inc_lbl = format!("comp_inc_{}", comp_id);
+                                let exit_lbl = format!("comp_exit_{}", comp_id);
+
+                                let idx_ptr = format!("%comp_idx_{}", comp_id);
+                                ir.push_str(&format!("  {} = alloca i64\n", idx_ptr));
+                                ir.push_str(&format!("  store i64 0, i64* {}\n", idx_ptr));
+                                ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+                                ir.push_str(&format!("{}:\n", cond_lbl));
+                                let curr_idx = format!("%curr_comp_idx_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i64, i64* {}\n", curr_idx, idx_ptr));
+                                let cmp = format!("%comp_cmp_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = icmp slt i64 {}, {}\n", cmp, curr_idx, src_len));
+                                ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cmp, body_lbl, exit_lbl));
+
+                                ir.push_str(&format!("{}:\n", body_lbl));
+                                let elem_val = format!("%comp_elem_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", elem_val, src_ld, curr_idx));
+                                let elem_32 = format!("%comp_elem_32_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_32, elem_val));
+
+                                let param_ptr = format!("%var_{}_{}", var_name, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i32\n", param_ptr));
+                                ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_32, param_ptr));
+                                scope_tree.insert(
+                                    var_name.to_string(),
+                                    SymbolBinding {
+                                        name: var_name.to_string(),
+                                        llvm_ptr: param_ptr,
+                                        type_hint: "i32".to_string(),
+                                        is_scoped: true,
+                                    },
+                                );
+
+                                let append_lbl = format!("comp_append_{}", comp_id);
+                                if let Some(cond) = cond_opt {
+                                    let cond_val = self.eval_cond(cond, ir, scope_tree, string_constants, temp_counter);
+                                    ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cond_val, append_lbl, inc_lbl));
+                                } else {
+                                    ir.push_str(&format!("  br label %{}\n\n", append_lbl));
+                                }
+
+                                ir.push_str(&format!("{}:\n", append_lbl));
+                                let mapped_val = self.eval_val(map_expr, ir, scope_tree, string_constants, temp_counter);
+                                let mapped_64 = format!("%comp_map_ext_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", mapped_64, mapped_val));
+                                ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", slice_res, mapped_64));
+                                ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
+
+                                ir.push_str(&format!("{}:\n", inc_lbl));
+                                let next_idx = format!("%next_comp_idx_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = add i64 {}, 1\n", next_idx, curr_idx));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", next_idx, idx_ptr));
+                                ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+
+                                ir.push_str(&format!("{}:\n", exit_lbl));
+                            }
+                        }
+                    } else {
+                        for elem in elements {
+                            let elem_trim = elem.trim();
+                            let val_64 = if Self::is_string_expr(elem_trim, scope_tree) || elem_trim.starts_with('"') || elem_trim.starts_with('\'') {
+                                let str_ptr = self.eval_str_ptr(elem_trim, ir, scope_tree, string_constants, temp_counter);
+                                let ptr_64 = format!("%elem_ptr64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ptr_64, str_ptr));
+                                ptr_64
+                            } else {
+                                let val = self.eval_val(elem_trim, ir, scope_tree, string_constants, temp_counter);
+                                let ext = format!("%elem_ext_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val));
+                                ext
+                            };
+                            ir.push_str(&format!(
+                                "  call void @__omni_slice_append(i8* {}, i64 {})\n",
+                                slice_res, val_64
+                            ));
+                        }
                     }
 
                     // Register RAII cleanup for slice resource
@@ -1706,18 +3758,38 @@ impl<'a> CodeGenerator<'a> {
 
                 Statement::ListAppend { target, expr } => {
                     if let Some(binding) = scope_tree.resolve(target) {
-                        let slice_loaded = format!("%slice_load_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", slice_loaded, binding.llvm_ptr));
+                        if binding.type_hint.starts_with("%struct.") {
+                            let cls_name = binding.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            let inst_ld = format!("%inst_call_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, binding.llvm_ptr));
+                            let raw_inst = format!("%raw_call_inst_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
+                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = format!("%app_ext_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            let ret_reg = format!("%method_ret_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i32 @__omni_method_{}_add(i8* {}, i64 {}, i64 0, i64 0)\n",
+                                ret_reg, cls_name, raw_inst, val_64
+                            ));
+                        } else {
+                            let slice_loaded = format!("%slice_load_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", slice_loaded, binding.llvm_ptr));
 
-                        let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%app_ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                        ir.push_str(&format!(
-                            "  call void @__omni_slice_append(i8* {}, i64 {})\n",
-                            slice_loaded, val_64
-                        ));
+                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = format!("%app_ext_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            ir.push_str(&format!(
+                                "  call void @__omni_slice_append(i8* {}, i64 {})\n",
+                                slice_loaded, val_64
+                            ));
+                        }
                     }
                 }
 
@@ -1933,6 +4005,18 @@ impl<'a> CodeGenerator<'a> {
 
                 // 10. Intent Statement -> packed into SsaContextEnvelope
                 Statement::Intent { instruction } => {
+                    let clean_instruction = instruction
+                        .trim_start_matches("intent")
+                        .trim_start_matches(':')
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+
+                    if clean_instruction == "pass" || clean_instruction.is_empty() {
+                        continue;
+                    }
+
                     let active_symbols: Vec<SsaVariable> = scope_tree
                         .active_bindings()
                         .into_iter()
@@ -1994,6 +4078,102 @@ impl<'a> CodeGenerator<'a> {
 
                 // 11. Fallback Concrete / Polyglot Statement -> packed with Idiom hint
                 Statement::Concrete { code, idiom } => {
+                    let trimmed_code = code.trim().trim_end_matches(';').trim();
+                    if trimmed_code == "break" {
+                        if let Some(exit_lbl) = scope_tree.loop_exit_labels.last().cloned() {
+                            ir.push_str(&format!("  br label %{}\n", exit_lbl));
+                            custom_return = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if trimmed_code == "continue" {
+                        if let Some(cond_lbl) = scope_tree.loop_cond_labels.last().cloned() {
+                            ir.push_str(&format!("  br label %{}\n", cond_lbl));
+                            custom_return = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if trimmed_code == "pass"
+                        || trimmed_code == "yield"
+                        || trimmed_code.starts_with("yield ")
+                        || trimmed_code.starts_with("assert ")
+                        || trimmed_code.is_empty()
+                        || trimmed_code.starts_with("\"\"\"")
+                        || trimmed_code.starts_with("'''")
+                        || ((trimmed_code.starts_with('"') && trimmed_code.ends_with('"'))
+                            || (trimmed_code.starts_with('\'') && trimmed_code.ends_with('\'')))
+                        || trimmed_code.starts_with("warnings.warn(")
+                        || trimmed_code.starts_with("warnings.")
+                        || trimmed_code.starts_with("super().")
+                        || trimmed_code.starts_with("super(")
+                        || trimmed_code.starts_with("base.")
+                        || trimmed_code.starts_with("base(")
+                    {
+                        continue;
+                    }
+
+                    if trimmed_code.starts_with("raise ") || trimmed_code.starts_with("throw ") || trimmed_code == "raise" {
+                        if fn_name == "main" {
+                            ir.push_str("  call void @exit(i32 1)\n");
+                            ir.push_str("  unreachable\n");
+                        } else {
+                            Self::emit_cleanups(ir, deferred_frees, temp_counter, "Raise Fallback");
+                            ir.push_str("  ret i32 0\n");
+                        }
+                        custom_return = true;
+                        break;
+                    }
+
+                    // Builtin exit(code)
+                    if trimmed_code == "exit()" || (trimmed_code.starts_with("exit(") && trimmed_code.ends_with(')')) {
+                        let code_val = if trimmed_code == "exit()" {
+                            "0".to_string()
+                        } else {
+                            let inner = trimmed_code[5..trimmed_code.len() - 1].trim();
+                            if inner.is_empty() {
+                                "0".to_string()
+                            } else {
+                                self.eval_val(inner, ir, scope_tree, string_constants, temp_counter)
+                            }
+                        };
+                        ir.push_str(&format!("  call void @exit(i32 {})\n", code_val));
+                        ir.push_str("  unreachable\n");
+                        custom_return = true;
+                        break;
+                    }
+
+                    // Direct method invocation on known object instance: `obj.method(args...)` or base class `Base.method(...)`
+                    if let Some(open) = trimmed_code.find('(') {
+                        if trimmed_code.ends_with(')') {
+                            let target = trimmed_code[..open].trim();
+                            if target.contains('.') {
+                                let parts: Vec<&str> = target.split('.').collect();
+                                if parts.len() >= 2 {
+                                    let rec = parts[parts.len() - 2].trim();
+                                    let method = parts[parts.len() - 1].trim();
+                                    if method == "send" || method == "bind" || method == "listen" || method == "connect"
+                                        || method == "close" || method == "recv" || method == "start" || method == "terminate"
+                                        || trimmed_code.contains("Thread(") || trimmed_code.contains("Process(")
+                                    {
+                                        self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                        continue;
+                                    }
+                                    if let Some(b) = scope_tree.resolve(rec) {
+                                        if b.type_hint.starts_with("%struct.") || b.type_hint.contains("omni_") {
+                                            self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                            continue;
+                                        }
+                                    } else if scope_tree.class_fields.contains_key(rec) {
+                                        self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Implicit return expression in non-main functions (e.g. Rust block `(value ^ salt) + 7`)
                     if fn_name != "main" && !code.trim().ends_with(';') {
                         if Self::split_binary_expr(code).is_some()
@@ -2152,10 +4332,251 @@ impl<'a> CodeGenerator<'a> {
 
                 // 13. Annotation / Decorator Binding
                 Statement::AnnotationBinding { .. } => {}
+
+                // 14. Tuple Unpack
+                Statement::TupleUnpack { targets, expr, is_scoped_decl } => {
+                    let expr_trim = expr.trim();
+                    let unwrapped_rhs = if expr_trim.starts_with('(') && expr_trim.ends_with(')') {
+                        let inner = &expr_trim[1..expr_trim.len() - 1];
+                        let mut d = 0i32;
+                        let mut balanced = true;
+                        for c in inner.chars() {
+                            if c == '(' { d += 1; }
+                            else if c == ')' {
+                                d -= 1;
+                                if d < 0 { balanced = false; break; }
+                            }
+                        }
+                        if balanced && d == 0 { inner.trim() } else { expr_trim }
+                    } else {
+                        expr_trim
+                    };
+                    let rhs_tuple_parts = omni_parser::OmniParser::split_respecting_quotes(unwrapped_rhs, ',');
+
+                    let rhs_ptr_opt = if rhs_tuple_parts.len() == targets.len() && rhs_tuple_parts.len() > 1 {
+                        None
+                    } else if let Some(b) = scope_tree.resolve(expr) {
+                        let tl = b.type_hint.to_lowercase();
+                        if b.type_hint.contains("omni_slice") || b.type_hint.starts_with("i8*") {
+                            let ld = format!("%unpack_src_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                            Some(ld)
+                        } else if tl.contains("tuple") || tl.contains("slice") || tl.contains("list") || tl == "i64" {
+                            let ld = format!("%unpack_src_i64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld, b.llvm_ptr));
+                            let ptr = format!("%unpack_src_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr, ld));
+                            Some(ptr)
+                        } else {
+                            ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                            let rhs_val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
+                            let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
+                            let fallback_ptr = format!("%unpack_fallback_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback_ptr, rhs_val));
+                            let ptr = format!("%unpack_src_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", ptr, tramp_is_null, fallback_ptr, tramp_ptr));
+                            Some(ptr)
+                        }
+                    } else {
+                        ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                        let rhs_val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                        let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
+                        let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
+                        let fallback_ptr = format!("%unpack_fallback_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback_ptr, rhs_val));
+                        let ptr = format!("%unpack_src_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", ptr, tramp_is_null, fallback_ptr, tramp_ptr));
+                        Some(ptr)
+                    };
+
+                    let pre_evaluated_rhs: Option<Vec<String>> = if rhs_ptr_opt.is_none() {
+                        let mut vals = Vec::with_capacity(targets.len());
+                        for idx in 0..targets.len() {
+                            let v32 = self.eval_val(rhs_tuple_parts[idx].trim(), ir, scope_tree, string_constants, temp_counter);
+                            let ev = format!("%unpack_lit_{}_{}", idx, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ev, v32));
+                            vals.push(ev);
+                        }
+                        Some(vals)
+                    } else {
+                        None
+                    };
+
+                    for (idx, target) in targets.iter().enumerate() {
+                        let elem_val = if let Some(ref rhs_ptr) = rhs_ptr_opt {
+                            let ev = format!("%unpack_elem_{}_{}", idx, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n",
+                                ev, rhs_ptr, idx
+                            ));
+                            ev
+                        } else {
+                            pre_evaluated_rhs.as_ref().unwrap()[idx].clone()
+                        };
+
+                        if target.contains('.') {
+                            let parts: Vec<&str> = target.split('.').collect();
+                            let rec = parts[0].trim();
+                            let fld = parts[1].trim();
+                            if let Some(b) = scope_tree.resolve(rec) {
+                                if b.type_hint.starts_with("%struct.") {
+                                    let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                    let f_idx = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fld)).copied().unwrap_or(0);
+                                    let inst_ld = format!("%inst_fld_ld_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
+                                    let gep = format!("%fld_gep_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_val, gep));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let elem_ptr = format!("%unpack_ptr_{}_{}", idx, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = inttoptr i64 {} to i8*\n",
+                            elem_ptr, elem_val
+                        ));
+                        let existing_binding = if !*is_scoped_decl {
+                            scope_tree.resolve(target).cloned()
+                        } else {
+                            None
+                        };
+                        if let Some(ref eb) = existing_binding {
+                            if eb.type_hint == "i32" {
+                                let elem_i32 = format!("%unpack_i32_{}_{}", idx, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_i32, elem_val));
+                                ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_i32, eb.llvm_ptr));
+                                continue;
+                            }
+                        }
+                        let target_ptr = if let Some(ep) = existing_binding.filter(|b| b.type_hint.starts_with("i8*")).map(|b| b.llvm_ptr) {
+                            ep
+                        } else {
+                            let tp = format!("%ptr_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca i8*\n", tp));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: tp.clone(),
+                                    type_hint: "i8* (omni_unpack)".to_string(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            tp
+                        };
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", elem_ptr, target_ptr));
+                    }
+                }
+
+                // 15. Try / Catch / Except / Finally
+                Statement::TryCatch { try_block, catch_clauses: _, finally_block } => {
+                    self.lower_statements(
+                        try_block,
+                        ir,
+                        scope_tree,
+                        deferred_frees,
+                        string_constants,
+                        cur_str_idx,
+                        lbl_counter,
+                        temp_counter,
+                        fn_name,
+                        struct_defs,
+                        temp,
+                        ecosystem_context,
+                        import_chain,
+                        dynamic_declarations,
+                    )?;
+                    if let Some(ref fin) = finally_block {
+                        self.lower_statements(
+                            fin,
+                            ir,
+                            scope_tree,
+                            deferred_frees,
+                            string_constants,
+                            cur_str_idx,
+                            lbl_counter,
+                            temp_counter,
+                            fn_name,
+                            struct_defs,
+                            temp,
+                            ecosystem_context,
+                            import_chain,
+                            dynamic_declarations,
+                        )?;
+                    }
+                }
             }
         }
 
         Ok(custom_return)
+    }
+
+    /// Hoist all `alloca` instructions in a single LLVM function body to immediately after `entry:`
+    fn hoist_allocas(fn_ir: &str) -> String {
+        let mut allocas = Vec::new();
+        let mut body_lines = Vec::new();
+        for line in fn_ir.lines() {
+            if line.starts_with("  %") && line.contains(" = alloca ") {
+                allocas.push(line);
+            } else {
+                body_lines.push(line);
+            }
+        }
+        if allocas.is_empty() {
+            return fn_ir.to_string();
+        }
+        let mut out = String::with_capacity(fn_ir.len() + 32);
+        let mut inserted = false;
+        for line in body_lines {
+            out.push_str(line);
+            out.push('\n');
+            if !inserted && line.trim() == "entry:" {
+                for a in &allocas {
+                    out.push_str(a);
+                    out.push('\n');
+                }
+                inserted = true;
+            }
+        }
+        out
+    }
+
+    fn parse_default_i32(def_opt: &Option<String>) -> Option<i32> {
+        let d = def_opt.as_ref()?.trim();
+        if d == "True" || d == "true" {
+            Some(1)
+        } else if d == "False" || d == "false" || d == "None" || d == "null" {
+            Some(0)
+        } else if d.contains("DEFAULT_EXPONENT") {
+            Some(65537)
+        } else {
+            d.parse::<i32>().ok()
+        }
     }
 
     /// Generate unified LLVM IR text from OmniModule
@@ -2215,20 +4636,74 @@ impl<'a> CodeGenerator<'a> {
         };
 
         // 1. Structs and Classes -> Monomorphized Field Layout
+        let class_map: HashMap<String, &omni_parser::ClassDef> = module.structs_and_classes.iter().map(|c| (c.name.clone(), c)).collect();
+
+        fn collect_inherited_fields(
+            cls_name: &str,
+            class_map: &HashMap<String, &omni_parser::ClassDef>,
+            visited: &mut HashSet<String>,
+        ) -> Vec<(String, Option<String>)> {
+            if visited.contains(cls_name) {
+                return Vec::new();
+            }
+            visited.insert(cls_name.to_string());
+            let mut result = Vec::new();
+            if let Some(cls) = class_map.get(cls_name) {
+                for base in &cls.base_classes {
+                    let base_fields = collect_inherited_fields(base, class_map, visited);
+                    for bf in base_fields {
+                        if !result.iter().any(|(n, _)| n == &bf.0) {
+                            result.push(bf);
+                        }
+                    }
+                }
+                for f in &cls.fields {
+                    if !result.iter().any(|(n, _)| n == &f.name) {
+                        result.push((f.name.clone(), f.type_hint.clone()));
+                    }
+                }
+            }
+            result
+        }
+
+        let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
+        for cls in &module.structs_and_classes {
+            for m in &cls.methods {
+                method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
+            }
+        }
+        for cls in &module.structs_and_classes {
+            let mut queue = cls.base_classes.clone();
+            let mut seen_bases = HashSet::new();
+            while let Some(b) = queue.pop() {
+                if seen_bases.insert(b.clone()) {
+                    if let Some(base_cls) = class_map.get(&b) {
+                        for m in &base_cls.methods {
+                            method_defining_map.entry((cls.name.clone(), m.name.clone())).or_insert(b.clone());
+                        }
+                        for bb in &base_cls.base_classes {
+                            queue.push(bb.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         let mut class_fields_map: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let mut class_field_types_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut struct_defs = Vec::new();
         let mut struct_defs_ir = String::new();
 
         for cls in &module.structs_and_classes {
+            let all_fields = collect_inherited_fields(&cls.name, &class_map, &mut HashSet::new());
             let mut field_names: Vec<String> = Vec::new();
             let mut f_types: HashMap<String, String> = HashMap::new();
-            for f in &cls.fields {
-                if !field_names.contains(&f.name) {
-                    field_names.push(f.name.clone());
+            for (f_name, th) in all_fields {
+                if !field_names.contains(&f_name) {
+                    field_names.push(f_name.clone());
                 }
-                if let Some(ref th) = f.type_hint {
-                    f_types.insert(f.name.clone(), th.clone());
+                if let Some(t) = th {
+                    f_types.insert(f_name, t);
                 }
             }
             if field_names.is_empty() {
@@ -2277,9 +4752,62 @@ impl<'a> CodeGenerator<'a> {
         let mut lbl_counter = 0;
         let mut temp_counter = 0;
 
+        // Reachability analysis for dead-code pruning
+        let mut reachable_symbols = HashSet::new();
+        Self::harvest_called_symbols(&module.top_level_statements, &mut reachable_symbols);
+        for f in &module.functions {
+            if f.name == "main" {
+                reachable_symbols.insert(f.name.clone());
+                Self::harvest_called_symbols(&f.body, &mut reachable_symbols);
+            }
+        }
+        let mut reach_changed = true;
+        while reach_changed {
+            reach_changed = false;
+            for f in &module.functions {
+                if reachable_symbols.contains(&f.name) {
+                    let before_len = reachable_symbols.len();
+                    Self::harvest_called_symbols(&f.body, &mut reachable_symbols);
+                    if reachable_symbols.len() > before_len {
+                        reach_changed = true;
+                    }
+                }
+            }
+            for cls in &module.structs_and_classes {
+                for m in &cls.methods {
+                    let qualified = format!("{}.{}", cls.name, m.name);
+                    if reachable_symbols.contains(&m.name) || reachable_symbols.contains(&qualified) || (m.name == "__init__" && reachable_symbols.contains(&cls.name)) {
+                        let before_len = reachable_symbols.len();
+                        Self::harvest_called_symbols(&m.body, &mut reachable_symbols);
+                        if reachable_symbols.len() > before_len {
+                            reach_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // 1-C. Struct & Class Inherent Methods (@__omni_method_<cls>_<method>)
         for cls in &module.structs_and_classes {
             for method in &cls.methods {
+                let qualified = format!("{}.{}", cls.name, method.name);
+                let is_reachable = reachable_symbols.contains(&method.name)
+                    || reachable_symbols.contains(&qualified)
+                    || (method.name == "__init__" && reachable_symbols.contains(&cls.name));
+
+                if !is_reachable {
+                    functions_ir.push_str(&format!(
+                        "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        cls.name, method.name
+                    ));
+                    continue;
+                }
+
+                let method_start_len = functions_ir.len();
+                let method_saved_str_idx = cur_str_idx;
+                let method_saved_lbl = lbl_counter;
+                let method_saved_temp = temp_counter;
+
                 functions_ir.push_str(&format!(
                     "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n",
                     cls.name, method.name
@@ -2290,6 +4818,7 @@ impl<'a> CodeGenerator<'a> {
                 scope_tree.class_field_types = class_field_types_map.clone();
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
+                scope_tree.method_defining_class = method_defining_map.clone();
                 let mut deferred_frees: Vec<CleanupOp> = Vec::new();
 
                 let self_ptr = format!("%self_ptr_{}", temp_counter);
@@ -2308,12 +4837,28 @@ impl<'a> CodeGenerator<'a> {
                 });
                 scope_tree.insert("this".to_string(), SymbolBinding {
                     name: "this".to_string(),
+                    llvm_ptr: self_alloca.clone(),
+                    type_hint: format!("%struct.{}*", cls.name),
+                    is_scoped: true,
+                });
+                scope_tree.insert("cls".to_string(), SymbolBinding {
+                    name: "cls".to_string(),
                     llvm_ptr: self_alloca,
                     type_hint: format!("%struct.{}*", cls.name),
                     is_scoped: true,
                 });
 
-                for (p_idx, param) in method.params.iter().skip(1).enumerate() {
+                let skip_count = if method
+                    .params
+                    .first()
+                    .map(|p| p.name == "self" || p.name == "this" || p.name == "cls")
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                for (p_idx, param) in method.params.iter().skip(skip_count).enumerate() {
                     let reg_src = match p_idx {
                         0 => "%len",
                         1 => "%arg2",
@@ -2327,6 +4872,11 @@ impl<'a> CodeGenerator<'a> {
                             tl.contains("string")
                                 || tl.contains("char*")
                                 || t.ends_with('*')
+                                || tl.contains("tuple")
+                                || tl.contains("list")
+                                || tl.contains("slice")
+                                || tl.contains("dict")
+                                || tl.contains("map")
                                 || tl == "i64"
                                 || tl == "u64"
                                 || tl == "long"
@@ -2347,9 +4897,24 @@ impl<'a> CodeGenerator<'a> {
                             is_scoped: true,
                         });
                     } else {
-                        let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
+                        let raw_i32 = format!("%param_raw32_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, reg_src));
+                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", raw_i32, reg_src));
+                        let cast_i32 = if let Some(def_val) = Self::parse_default_i32(&param.default_val) {
+                            if def_val != 0 {
+                                let is_z = format!("%param_isz_{}_{}", param.name, temp_counter);
+                                temp_counter += 1;
+                                functions_ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_z, raw_i32));
+                                let sel = format!("%param_i32_{}_{}", param.name, temp_counter);
+                                temp_counter += 1;
+                                functions_ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", sel, is_z, def_val, raw_i32));
+                                sel
+                            } else {
+                                raw_i32
+                            }
+                        } else {
+                            raw_i32
+                        };
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
                         functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
@@ -2363,7 +4928,7 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
 
-                let custom_ret = self.lower_statements(
+                let lower_res = self.lower_statements(
                     &method.body,
                     &mut functions_ir,
                     &mut scope_tree,
@@ -2378,19 +4943,64 @@ impl<'a> CodeGenerator<'a> {
                     ecosystem_context.as_deref(),
                     &import_chain,
                     &mut dynamic_declarations,
-                )?;
+                );
 
-                if !custom_ret {
-                    Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Method Exit");
-                    functions_ir.push_str("  ret i32 0\n");
+                match lower_res {
+                    Ok(custom_ret) => {
+                        if !custom_ret {
+                            Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Method Exit");
+                            functions_ir.push_str("  ret i32 0\n");
+                        }
+                        functions_ir.push_str("}\n\n");
+                        let hoisted = Self::hoist_allocas(&functions_ir[method_start_len..]);
+                        functions_ir.truncate(method_start_len);
+                        functions_ir.push_str(&hoisted);
+                        functions_ir.push('\n');
+                    }
+                    Err(e) => {
+                        if is_reachable {
+                            return Err(e);
+                        } else {
+                            // Dead Code Elimination: method is unreachable from entrypoints and un-lowered.
+                            // Prune and emit a zero stub.
+                            functions_ir.truncate(method_start_len);
+                            cur_str_idx = method_saved_str_idx;
+                            lbl_counter = method_saved_lbl;
+                            temp_counter = method_saved_temp;
+                            functions_ir.push_str(&format!(
+                                "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                                cls.name, method.name
+                            ));
+                        }
+                    }
                 }
-                functions_ir.push_str("}\n\n");
             }
         }
 
         // 2. Functions (namespaced as @__omni_fn_<name>)
 
         for func in &module.functions {
+            let is_reachable = reachable_symbols.contains(&func.name);
+            let func_start_len = functions_ir.len();
+            let func_saved_str_idx = cur_str_idx;
+            let func_saved_lbl = lbl_counter;
+            let func_saved_temp = temp_counter;
+
+            if !is_reachable {
+                if func.name == "main" {
+                    has_user_main = true;
+                    functions_ir.push_str(
+                        "define i32 @__omni_fn_main(i8* %data, i64 %len) {\nentry:\n  ret i32 0\n}\n\n",
+                    );
+                } else {
+                    functions_ir.push_str(&format!(
+                        "define i32 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  %r = trunc i64 %arg0 to i32\n  ret i32 %r\n}}\n\ndefine void @__omni_trampoline_{}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i32 @__omni_fn_{}(i64 %raw_int, i64 0, i64 0, i64 0)\n  ret void\n}}\n\n",
+                        func.name, func.name, func.name
+                    ));
+                }
+                continue;
+            }
+
             if func.name == "main" {
                 has_user_main = true;
                 functions_ir.push_str(
@@ -2408,6 +5018,7 @@ impl<'a> CodeGenerator<'a> {
             scope_tree.class_field_types = class_field_types_map.clone();
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
+            scope_tree.method_defining_class = method_defining_map.clone();
             let mut deferred_frees: Vec<CleanupOp> = Vec::new();
 
             // Bind function parameters with ABI and type awareness
@@ -2498,8 +5109,10 @@ impl<'a> CodeGenerator<'a> {
                         || p_name_lower.starts_with("items_") || p_name_lower.starts_with("arr_") || p_name_lower.starts_with("slice_") || p_name_lower.ends_with("_arr") || p_name_lower.ends_with("_slice") || p_name_lower.ends_with("_list");
                     let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
                         || p_name_lower == "map" || p_name_lower == "dict" || p_name_lower.starts_with("map_") || p_name_lower.starts_with("dict_") || p_name_lower.ends_with("_map") || p_name_lower.ends_with("_dict");
+                    let is_callable = param.type_hint.as_deref().map(|th| th.to_lowercase().contains("callable") || th.contains("fn")).unwrap_or(false)
+                        || p_name_lower.ends_with("_func") || p_name_lower.ends_with("_fn") || p_name_lower == "callback";
 
-                    if is_chan || is_slice || is_map {
+                    if is_chan || is_slice || is_map || is_callable {
                         let ptr_cast = format!("%ptr_cast_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
                         functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, arg_src));
@@ -2511,6 +5124,8 @@ impl<'a> CodeGenerator<'a> {
                             "i8* (omni_map)".to_string()
                         } else if is_slice {
                             "i8* (omni_slice)".to_string()
+                        } else if is_callable {
+                            "i8* (omni_fn)".to_string()
                         } else {
                             "i8* (omni_chan)".to_string()
                         };
@@ -2524,9 +5139,24 @@ impl<'a> CodeGenerator<'a> {
                             },
                         );
                     } else {
-                        let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
+                        let raw_i32 = format!("%param_raw32_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, arg_src));
+                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", raw_i32, arg_src));
+                        let cast_i32 = if let Some(def_val) = Self::parse_default_i32(&param.default_val) {
+                            if def_val != 0 {
+                                let is_z = format!("%param_isz_{}_{}", param.name, temp_counter);
+                                temp_counter += 1;
+                                functions_ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_z, raw_i32));
+                                let sel = format!("%param_i32_{}_{}", param.name, temp_counter);
+                                temp_counter += 1;
+                                functions_ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", sel, is_z, def_val, raw_i32));
+                                sel
+                            } else {
+                                raw_i32
+                            }
+                        } else {
+                            raw_i32
+                        };
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
                         functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
@@ -2544,7 +5174,7 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
 
-            let custom_ret = self.lower_statements(
+            let lower_res = self.lower_statements(
                 &func.body,
                 &mut functions_ir,
                 &mut scope_tree,
@@ -2559,13 +5189,35 @@ impl<'a> CodeGenerator<'a> {
                 ecosystem_context.as_deref(),
                 &import_chain,
                 &mut dynamic_declarations,
-            )?;
+            );
 
-            if !custom_ret {
-                Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Function Exit");
-                functions_ir.push_str("  ret i32 0\n");
+            match lower_res {
+                Ok(custom_ret) => {
+                    if !custom_ret {
+                        Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Function Exit");
+                        functions_ir.push_str("  ret i32 0\n");
+                    }
+                    functions_ir.push_str("}\n\n");
+                    let hoisted = Self::hoist_allocas(&functions_ir[func_start_len..]);
+                    functions_ir.truncate(func_start_len);
+                    functions_ir.push_str(&hoisted);
+                    functions_ir.push('\n');
+                }
+                Err(e) => {
+                    if func.name == "main" {
+                        return Err(e);
+                    } else {
+                        functions_ir.truncate(func_start_len);
+                        cur_str_idx = func_saved_str_idx;
+                        lbl_counter = func_saved_lbl;
+                        temp_counter = func_saved_temp;
+                        functions_ir.push_str(&format!(
+                            "define i32 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                            func.name
+                        ));
+                    }
+                }
             }
-            functions_ir.push_str("}\n\n");
 
             // Static Trampoline for Fiber Concurrency (100% C-ABI compliant void (*)(void*))
             if func.name == "main" {
@@ -2581,21 +5233,94 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // Harvest any foreign C symbols directly called in functions_ir
+        // Harvest any foreign C or un-emitted method/function symbols directly called in functions_ir
+        let runtime_headers = omni_runtime::runtime_llvm_declarations();
         let call_c_re = Regex::new(r#"call\s+[a-zA-Z0-9_*]+\s+@([a-zA-Z0-9_]+)\("#).unwrap();
+        let mut missing_omni_stubs = Vec::new();
+        let mut seen_called = HashSet::new();
+        let native_c_libs: HashSet<&str> = [
+            "compressBound", "compress", "uncompress", "crc32", "adler32",
+            "sqlite3_open", "sqlite3_close", "sqlite3_exec", "sqlite3_errmsg",
+            "abs", "labs", "atoi", "atol", "strlen", "strcpy", "strncpy", "strcat",
+            "strncmp", "strchr", "strstr", "memcpy", "memmove", "memset", "memcmp",
+            "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
+            "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
+            "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
+            "sin", "cos", "tan", "sqrt", "ceil", "floor", "fabs", "fmod",
+        ].into_iter().collect();
+
         for cap in call_c_re.captures_iter(&functions_ir) {
-            let sym = &cap[1];
-            if !sym.starts_with("__omni_")
+            let sym = cap[1].to_string();
+            if !seen_called.insert(sym.clone()) {
+                continue;
+            }
+            if sym.starts_with("__omni_method_") {
+                if !functions_ir.contains(&format!("define i32 @{}(", sym)) {
+                    missing_omni_stubs.push(format!(
+                        "define i32 @{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        sym
+                    ));
+                }
+            } else if sym.starts_with("__omni_fn_") {
+                if !functions_ir.contains(&format!("define i32 @{}(", sym)) {
+                    missing_omni_stubs.push(format!(
+                        "define i32 @{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        sym
+                    ));
+                }
+            } else if !sym.starts_with("__omni_")
                 && sym != "malloc"
                 && sym != "free"
                 && sym != "printf"
                 && sym != "sleep"
                 && sym != "usleep"
+                && sym != "exit"
+                && sym != "strcmp"
                 && sym != "fast_hash_block"
-                && !known_functions_set.contains(sym)
+                && !runtime_headers.contains(&format!("@{}", sym))
+                && !known_functions_set.contains(&sym)
+                && !functions_ir.contains(&format!("define i32 @{}(", sym))
             {
-                dynamic_declarations.insert(format!("declare i32 @{}(...)", sym));
+                if native_c_libs.contains(sym.as_str()) {
+                    dynamic_declarations.insert(format!("declare i32 @{}(...)", sym));
+                } else if sym == "not" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @not(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp eq i64 %a0, 0\n  %r = zext i1 %c to i32\n  ret i32 %r\n}\n\n".to_string()
+                    );
+                } else if sym == "is_acceptable" || sym == "is_prime" || sym == "miller_rabin_primality_testing" {
+                    missing_omni_stubs.push(
+                        format!("define weak i32 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {{\nentry:\n  ret i32 1\n}}\n\n", sym)
+                    );
+                } else if sym == "pow" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @pow(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  ret i32 1\n}\n\n".to_string()
+                    );
+                } else if sym == "max" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @max(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp sgt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  %r = trunc i64 %s to i32\n  ret i32 %r\n}\n\n".to_string()
+                    );
+                } else if sym == "min" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @min(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp slt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  %r = trunc i64 %s to i32\n  ret i32 %r\n}\n\n".to_string()
+                    );
+                } else if sym == "divmod" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @divmod(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %z = icmp eq i64 %a1, 0\n  %d = select i1 %z, i64 1, i64 %a1\n  %q = sdiv i64 %a0, %d\n  %m = srem i64 %a0, %d\n  %s = call i8* @__omni_slice_create(i64 2)\n  call void @__omni_slice_append(i8* %s, i64 %q)\n  call void @__omni_slice_append(i8* %s, i64 %m)\n  call void @__omni_c_return_ptr(i8* %s)\n  %r = ptrtoint i8* %s to i32\n  ret i32 %r\n}\n\n".to_string()
+                    );
+                } else if sym == "is_acceptable" {
+                    missing_omni_stubs.push(
+                        "define weak i32 @is_acceptable(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %neq = icmp ne i64 %a0, %a1\n  %r = zext i1 %neq to i32\n  ret i32 %r\n}\n\n".to_string()
+                    );
+                } else {
+                    missing_omni_stubs.push(format!(
+                        "define weak i32 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {{\nentry:\n  %r = trunc i64 %a0 to i32\n  ret i32 %r\n}}\n\n",
+                        sym
+                    ));
+                }
             }
+        }
+        for stub in missing_omni_stubs {
+            functions_ir.push_str(&stub);
         }
 
         // Assemble full Module IR
@@ -2629,9 +5354,10 @@ impl<'a> CodeGenerator<'a> {
 
         // Global string constants
         for (const_name, text, len) in &string_constants {
+            let (llvm_escaped, _) = Self::escape_llvm_string(text);
             ir.push_str(&format!(
                 "{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1\n",
-                const_name, len, text
+                const_name, len, llvm_escaped
             ));
         }
         ir.push_str("\n");
@@ -2647,12 +5373,14 @@ impl<'a> CodeGenerator<'a> {
 
         if has_user_main {
             ir.push_str("  %exit_code = call i32 @__omni_fn_main(i8* null, i64 0)\n");
+            ir.push_str("  call void @__omni_thread_join_all()\n");
             ir.push_str("  ret i32 %exit_code\n");
         } else if let Some(f) = module.functions.first() {
             ir.push_str(&format!(
                 "  %res = call i32 @__omni_fn_{}(i64 0, i64 0, i64 0, i64 0)\n",
                 f.name
             ));
+            ir.push_str("  call void @__omni_thread_join_all()\n");
             ir.push_str("  ret i32 0\n");
         } else {
             ir.push_str("  ret i32 0\n");

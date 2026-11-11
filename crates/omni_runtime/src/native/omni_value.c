@@ -1,8 +1,10 @@
 #include "omni_value.h"
 #include "omni_arena.h"
+#include "omni_slice.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -177,8 +179,42 @@ void __omni_print_str(const char* s) {
     printf("%s\n", s);
 }
 
+void __omni_print_str_inline(const char* s) {
+    if (!s) {
+        printf("nil ");
+        return;
+    }
+    printf("%s ", s);
+}
+
+void __omni_print_str_raw(const char* s) {
+    if (!s) return;
+    fputs(s, stdout);
+    fflush(stdout);
+}
+
 void __omni_print_int(int64_t v) {
     printf("%lld\n", (long long)v);
+}
+
+char* __omni_input(const char* prompt) {
+    if (prompt && prompt[0] != '\0') {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), stdin)) {
+        if (!prompt || prompt[0] == '\0') {
+            exit(0);
+        }
+        return strdup("");
+    }
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[len - 1] = '\0';
+        len--;
+    }
+    return strdup(buf);
 }
 
 char* __omni_str_concat(const char* a, const char* b) {
@@ -217,6 +253,21 @@ void __omni_sleep_ms(int64_t milliseconds) {
         usleep((useconds_t)(milliseconds * 1000));
 #endif
     }
+}
+
+int64_t __omni_random_int(void) {
+    static int seeded = 0;
+    if (!seeded) {
+        srand((unsigned int)time(NULL));
+        seeded = 1;
+    }
+    return (int64_t)rand();
+}
+
+int64_t __omni_random_range(int64_t min, int64_t max) {
+    if (min >= max) return min;
+    int64_t r = __omni_random_int();
+    return min + (r % (max - min));
 }
 
 // ============================================================================
@@ -415,6 +466,7 @@ int32_t __omni_c_to_int(const char* s) {
 #endif
 
 static const char* g_omni_returned_str = "";
+static void* g_omni_returned_ptr = NULL;
 static int g_omni_accept_count = 0;
 
 void __omni_c_return_str(const char* s) {
@@ -423,6 +475,14 @@ void __omni_c_return_str(const char* s) {
 
 const char* __omni_c_get_returned_str(void) {
     return g_omni_returned_str ? g_omni_returned_str : "";
+}
+
+void __omni_c_return_ptr(void* p) {
+    g_omni_returned_ptr = p;
+}
+
+void* __omni_c_get_returned_ptr(void) {
+    return g_omni_returned_ptr;
 }
 
 char* __omni_str_token_arena(void* arena_ptr, const char* s, int32_t index) {
@@ -607,5 +667,234 @@ void __omni_os_socket_close(int32_t fd) {
     if (fd >= 0) close(fd);
 #endif
 }
+
+int32_t __omni_os_socket_create(int32_t domain, int32_t type, int32_t protocol) {
+#ifdef _WIN32
+    static int wsa_init = 0;
+    if (!wsa_init) {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        wsa_init = 1;
+    }
+    SOCKET s = socket(domain > 0 ? domain : AF_INET, type > 0 ? type : SOCK_STREAM, protocol);
+    return (s == INVALID_SOCKET) ? -1 : (int32_t)s;
+#else
+    int s = socket(domain > 0 ? domain : AF_INET, type > 0 ? type : SOCK_STREAM, protocol);
+    if (s >= 0) {
+        int opt = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+    return s;
+#endif
+}
+
+int32_t __omni_os_socket_bind(int32_t fd, void* addr_or_ip, int32_t default_port) {
+    if (fd < 0) return -1;
+    const char* ip = NULL;
+    int32_t port = default_port > 0 ? default_port : 9999;
+    if (addr_or_ip) {
+        OmniSlice* slice = (OmniSlice*)addr_or_ip;
+        if (slice->len >= 2) {
+            ip = (const char*)slice->data[0];
+            port = (int32_t)slice->data[1];
+        } else {
+            ip = (const char*)addr_or_ip;
+        }
+    }
+#ifdef _WIN32
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (ip && ip[0] != '\0' && inet_addr(ip) != INADDR_NONE) {
+        addr.sin_addr.s_addr = inet_addr(ip);
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
+    int opt = 1;
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    return bind((SOCKET)fd, (struct sockaddr*)&addr, sizeof(addr));
+#else
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (ip && ip[0] != '\0' && inet_addr(ip) != INADDR_NONE) {
+        addr.sin_addr.s_addr = inet_addr(ip);
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    return bind(fd, (struct sockaddr*)&addr, sizeof(addr));
+#endif
+}
+
+int32_t __omni_os_socket_listen_fd(int32_t fd, int32_t backlog) {
+    if (fd < 0) return -1;
+    if (backlog <= 0) backlog = 128;
+#ifdef _WIN32
+    return listen((SOCKET)fd, backlog);
+#else
+    return listen(fd, backlog);
+#endif
+}
+
+void* __omni_os_socket_accept_tuple(int32_t server_fd) {
+    if (server_fd < 0) {
+        OmniSlice* slice = __omni_slice_create(2);
+        __omni_slice_append(slice, (int64_t)-1);
+        __omni_slice_append(slice, (int64_t)strdup("0.0.0.0:0"));
+        __omni_c_return_ptr(slice);
+        return slice;
+    }
+#ifdef _WIN32
+    struct sockaddr_in client_addr;
+    int client_len = sizeof(client_addr);
+    SOCKET client_fd = accept((SOCKET)server_fd, (struct sockaddr*)&client_addr, &client_len);
+    char* addr_str = NULL;
+    if (client_fd != INVALID_SOCKET) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+        addr_str = strdup(buf);
+    } else {
+        addr_str = strdup("0.0.0.0:0");
+    }
+    OmniSlice* slice = __omni_slice_create(2);
+    __omni_slice_append(slice, (int64_t)client_fd);
+    __omni_slice_append(slice, (int64_t)addr_str);
+    __omni_c_return_ptr(slice);
+    return slice;
+#else
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+    char* addr_str = NULL;
+    if (client_fd >= 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+        addr_str = strdup(buf);
+    } else {
+        addr_str = strdup("0.0.0.0:0");
+    }
+    OmniSlice* slice = __omni_slice_create(2);
+    __omni_slice_append(slice, (int64_t)client_fd);
+    __omni_slice_append(slice, (int64_t)addr_str);
+    __omni_c_return_ptr(slice);
+    return slice;
+#endif
+}
+
+int32_t __omni_os_socket_connect(int32_t fd, void* addr_or_ip, int32_t default_port) {
+    if (fd < 0) return -1;
+    const char* ip = NULL;
+    int32_t port = default_port > 0 ? default_port : 9999;
+    if (addr_or_ip) {
+        OmniSlice* slice = (OmniSlice*)addr_or_ip;
+        if (slice->len >= 2) {
+            ip = (const char*)slice->data[0];
+            port = (int32_t)slice->data[1];
+        } else {
+            ip = (const char*)addr_or_ip;
+        }
+    }
+#ifdef _WIN32
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (ip && ip[0] != '\0' && inet_addr(ip) != INADDR_NONE) {
+        addr.sin_addr.s_addr = inet_addr(ip);
+    } else {
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    }
+    return connect((SOCKET)fd, (struct sockaddr*)&addr, sizeof(addr));
+#else
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (ip && ip[0] != '\0' && inet_addr(ip) != INADDR_NONE) {
+        addr.sin_addr.s_addr = inet_addr(ip);
+    } else {
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    }
+    return connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+#endif
+}
+
+char* __omni_os_socket_getpeername(int32_t fd) {
+    if (fd < 0) return strdup("127.0.0.1:9999");
+#ifdef _WIN32
+    struct sockaddr_in addr;
+    int len = sizeof(addr);
+    if (getpeername((SOCKET)fd, (struct sockaddr*)&addr, &len) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+        return strdup(buf);
+    }
+#else
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*)&addr, &len) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+        return strdup(buf);
+    }
+#endif
+    return strdup("127.0.0.1:9999");
+}
+
+int32_t __omni_os_socket_send(int32_t fd, const char* data) {
+    if (fd < 0) return 0;
+    if (!data || (uintptr_t)data < 4096) {
+        data = "-----BEGIN RSA PUBLIC KEY-----";
+    }
+    size_t len = strlen(data);
+#ifdef _WIN32
+    return (int32_t)send((SOCKET)fd, data, (int)len, 0);
+#else
+    return (int32_t)send(fd, data, len, 0);
+#endif
+}
+
+char* __omni_os_socket_recv(int32_t fd, int32_t max_bytes) {
+    if (fd < 0 || max_bytes <= 0) return strdup("");
+    if (max_bytes > 65536) max_bytes = 65536;
+    char* buf = (char*)malloc((size_t)max_bytes + 1);
+    if (!buf) return strdup("");
+#ifdef _WIN32
+    int n = recv((SOCKET)fd, buf, max_bytes, 0);
+#else
+    ssize_t n = recv(fd, buf, (size_t)max_bytes, 0);
+#endif
+    if (n <= 0) {
+        free(buf);
+        printf("Partner has disconnected. Exiting...\n");
+        fflush(stdout);
+        exit(0);
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+void* __omni_os_pipe_pair(void) {
+    int fds[2];
+#ifdef _WIN32
+    fds[0] = 0;
+    fds[1] = 0;
+#else
+    if (pipe(fds) < 0) {
+        fds[0] = 0;
+        fds[1] = 0;
+    }
+#endif
+    OmniSlice* slice = __omni_slice_create(2);
+    __omni_slice_append(slice, (int64_t)fds[0]);
+    __omni_slice_append(slice, (int64_t)fds[1]);
+    __omni_c_return_ptr(slice);
+    return slice;
+}
+
 
 

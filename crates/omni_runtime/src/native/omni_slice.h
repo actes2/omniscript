@@ -17,6 +17,7 @@ int64_t __omni_slice_get(OmniSlice* slice, size_t index);
 void __omni_slice_set(OmniSlice* slice, size_t index, int64_t val);
 size_t __omni_slice_len(OmniSlice* slice);
 int64_t __omni_slice_pop(OmniSlice* slice);
+void __omni_slice_print(OmniSlice* slice);
 void __omni_slice_destroy(OmniSlice* slice);
 
 #endif // OMNI_SLICE_H

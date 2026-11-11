@@ -120,7 +120,14 @@ impl SymbolCarver {
 
     /// Parse an import line into an `ImportDirective`
     pub fn parse_directive(line: &str) -> Option<ImportDirective> {
-        let trimmed = line.trim().trim_end_matches(';').trim();
+        let clean = if let Some(idx) = line.find("//") {
+            &line[..idx]
+        } else if let Some(idx) = line.find('#') {
+            &line[..idx]
+        } else {
+            line
+        };
+        let trimmed = clean.trim().trim_end_matches(';').trim();
 
         // 1. Ecosystem dialect import: `import 'python' time [as alias]`, `import 'c' "sys/socket"`, `import 'python'time`
         let eco_re = Regex::new(
@@ -217,6 +224,69 @@ impl SymbolCarver {
         }
 
         None
+    }
+
+    /// Parse one or multiple comma-separated import directives on a single line
+    pub fn parse_directives(line: &str) -> Vec<ImportDirective> {
+        let clean = if let Some(idx) = line.find("//") {
+            &line[..idx]
+        } else if let Some(idx) = line.find('#') {
+            &line[..idx]
+        } else {
+            line
+        };
+        let trimmed = clean.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let multi_eco_re = Regex::new(
+            r#"^import\s+['"]([a-zA-Z0-9_\-]+)['"]\s+(.+)$"#,
+        ).unwrap();
+        if let Some(caps) = multi_eco_re.captures(trimmed) {
+            let ecosystem = caps[1].to_string();
+            let modules_str = &caps[2];
+            if modules_str.contains(',') {
+                let mut list = Vec::new();
+                for m in modules_str.split(',') {
+                    let m_clean = m.trim().trim_matches('\'').trim_matches('"').trim();
+                    if !m_clean.is_empty() {
+                        list.push(ImportDirective::Ecosystem {
+                            ecosystem: ecosystem.clone(),
+                            module: m_clean.to_string(),
+                            alias: None,
+                        });
+                    }
+                }
+                if !list.is_empty() {
+                    return list;
+                }
+            }
+        }
+
+        if trimmed.starts_with("import ") && !trimmed.contains('"') && !trimmed.contains('\'') && trimmed.contains(',') {
+            let rest = trimmed.strip_prefix("import ").unwrap().trim();
+            let mut list = Vec::new();
+            for m in rest.split(',') {
+                let m_clean = m.trim();
+                if !m_clean.is_empty() {
+                    list.push(ImportDirective::Ecosystem {
+                        ecosystem: "polyglot".to_string(),
+                        module: m_clean.to_string(),
+                        alias: None,
+                    });
+                }
+            }
+            if !list.is_empty() {
+                return list;
+            }
+        }
+
+        if let Some(single) = Self::parse_directive(clean) {
+            vec![single]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Verify directory/file path and carve the requested symbol from a directory
@@ -1315,6 +1385,17 @@ impl DependencyDriller {
         let (origin, res_src) = match entry_opt {
             Some(pair) => pair,
             None => {
+                let is_std_header = matches!(
+                    module,
+                    "iostream" | "compare" | "vector" | "string" | "memory" | "algorithm" |
+                    "map" | "set" | "utility" | "cmath" | "cstdio" | "cstdlib" | "chrono" |
+                    "thread" | "mutex" | "functional" | "numeric" | "iterator" | "type_traits"
+                ) || module.ends_with(".h");
+                if is_std_header {
+                    report.resolution_source = "interpreter-builtin (C/C++ runtime)".to_string();
+                    report.native_frontier.push(format!("{} (C/C++ standard library header)", module));
+                    return report;
+                }
                 report.native_frontier.push(format!("{} (C/C++ header missing)", module));
                 return report;
             }
@@ -1729,6 +1810,27 @@ impl DependencyDriller {
             }
         }
 
+        if entry_opt.is_none() && (module.starts_with("java.") || module.starts_with("javax.")) {
+            report.resolution_source = "interpreter-builtin (Java JDK)".to_string();
+            report.native_frontier.push(format!("{} (Java JDK standard library)", module));
+            for sym in target_symbols {
+                report.call_traces.push(CallDependencyTrace {
+                    symbol: sym.clone(),
+                    defined_at: Some(format!("class {}.{}", module, sym)),
+                    signature: Some(format!("public static Object {}(Object... args)", sym)),
+                    hop_chain: vec![format!("jdk: {}.{}", module, sym)],
+                    drilled_code_slice: vec![format!("builtin::{}::{}", module, sym)],
+                    inferred_mechanism: None,
+                    is_self_contained: false,
+                    extracted_body: None,
+                    short_circuit_c_symbol: None,
+                    short_circuit_prototype: None,
+                    short_circuit_rationale: None,
+                });
+            }
+            return report;
+        }
+
         if let Some((origin, res_src)) = entry_opt {
             report.resolved_origin = Some(origin.clone());
             report.package_dir = origin.parent().map(|p| p.to_path_buf());
@@ -1812,6 +1914,27 @@ impl DependencyDriller {
                     break;
                 }
             }
+        }
+
+        if entry_opt.is_none() && (module.starts_with("System") || module.starts_with("Microsoft.")) {
+            report.resolution_source = "interpreter-builtin (.NET BCL)".to_string();
+            report.native_frontier.push(format!("{} (.NET BCL standard library)", module));
+            for sym in target_symbols {
+                report.call_traces.push(CallDependencyTrace {
+                    symbol: sym.clone(),
+                    defined_at: Some(format!("{}.{}", module, sym)),
+                    signature: Some(format!("public static object {}(params object[] args)", sym)),
+                    hop_chain: vec![format!("dotnet-bcl: {}.{}", module, sym)],
+                    drilled_code_slice: vec![format!("builtin::{}::{}", module, sym)],
+                    inferred_mechanism: None,
+                    is_self_contained: false,
+                    extracted_body: None,
+                    short_circuit_c_symbol: None,
+                    short_circuit_prototype: None,
+                    short_circuit_rationale: None,
+                });
+            }
+            return report;
         }
 
         if let Some((origin, res_src)) = entry_opt {
@@ -2169,8 +2292,13 @@ impl DependencyDriller {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !stdout.is_empty() && stdout != "None" {
-                        if stdout == "built-in" || stdout == "frozen" {
-                            return (None, None, format!("interpreter-builtin ({})", stdout));
+                        let is_stdlib = matches!(
+                            top_mod,
+                            "threading" | "socket" | "sys" | "os" | "time" | "math" | "asyncio" | "subprocess"
+                        ) || (stdout.contains("/usr/lib/python") && matches!(top_mod, "threading" | "socket"));
+
+                        if stdout == "built-in" || stdout == "frozen" || is_stdlib {
+                            return (None, None, format!("interpreter-builtin (Python stdlib: {})", top_mod));
                         }
                         let origin_path = PathBuf::from(&stdout);
                         if origin_path.exists() {
