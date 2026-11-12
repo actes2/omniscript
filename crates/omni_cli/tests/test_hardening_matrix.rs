@@ -1,6 +1,44 @@
 use omni_parser::OmniParser;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+
+#[test]
+fn test_compile_and_execute_comment_torture() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let target_file = repo_root.join("examples/hardening/comment_torture.omni");
+
+    let omnic_bin = env!("CARGO_BIN_EXE_omnic");
+    let output = Command::new(omnic_bin)
+        .arg("--no-cache")
+        .arg("run")
+        .arg(&target_file)
+        .current_dir(repo_root)
+        .output()
+        .expect("Failed to execute omnic on comment_torture.omni");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    assert!(
+        output.status.success(),
+        "comment_torture.omni failed!\nExit: {:?}\nOutput:\n{}",
+        output.status.code(),
+        combined
+    );
+    assert!(
+        combined.contains("Vault total: 197"),
+        "Expected 'Vault total: 197' in output:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("markers: # // /* */ -- ;; %% <!-- -->"),
+        "Expected literal comment markers preserved inside string:\n{}",
+        combined
+    );
+}
 
 #[test]
 fn test_debug_hardening_files() {

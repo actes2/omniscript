@@ -142,6 +142,11 @@ impl LlvmVerifier {
         }
 
         cmd.arg("-o").arg(out_path);
+        #[cfg(unix)]
+        {
+            cmd.arg("-lm");
+            cmd.arg("-lpthread");
+        }
 
         let output = cmd.output().map_err(|e| VerifyError::Io(e.to_string()))?;
         let _ = fs::remove_file(&temp_ll);

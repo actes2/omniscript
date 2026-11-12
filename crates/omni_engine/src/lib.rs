@@ -380,6 +380,36 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_os_pipe_pair",
 ];
 
+// Ordered stem-to-intrinsic map used to reconcile non-canonical `__omni_*` calls synthesized by the LLM.
+// Specific multi-token stems (e.g. `sleep_ms`, `print_int`, `map_set_int`) precede broad stems (`sleep`, `print`).
+const FUZZY_STEM_MAP: &[(&[&str], &str)] = &[
+    (&["msleep", "usleep", "sleep_ms"], "__omni_sleep_ms"),
+    (&["sleep", "delay", "wait_s"], "__omni_sleep_s"),
+    (&["print_int"], "__omni_print_int"),
+    (&["slice_print", "list_print"], "__omni_slice_print"),
+    (&["print", "puts", "println", "log"], "__omni_print_str"),
+    (&["slice_append", "list_append", "vec_push", "array_push"], "__omni_slice_append"),
+    (&["slice_get", "list_get"], "__omni_slice_get"),
+    (&["slice_set", "list_set"], "__omni_slice_set"),
+    (&["slice_len", "list_len"], "__omni_slice_len"),
+    (&["slice_pop", "list_pop"], "__omni_slice_pop"),
+    (&["map_set_int"], "__omni_map_set_int"),
+    (&["map_get_int"], "__omni_map_get_int"),
+    (&["map_set", "dict_set"], "__omni_map_set"),
+    (&["map_get", "dict_get"], "__omni_map_get"),
+    (&["map_len", "dict_len"], "__omni_map_len"),
+    (&["http_get", "requests_get", "request_get", "urlopen"], "__omni_c_http_get"),
+    (&["json_parse", "json_loads", "response_json"], "__omni_c_json_parse"),
+    (&["json_get", "obj_get"], "__omni_c_json_get"),
+    (&["to_float", "parse_float"], "__omni_c_to_float"),
+    (&["to_int", "parse_int"], "__omni_c_to_int"),
+    (&["random_range", "getint32"], "__omni_random_range"),
+    (&["random", "nextint"], "__omni_random_int"),
+    (&["getpeername", "remote_addr"], "__omni_os_socket_getpeername"),
+    (&["socket_send"], "__omni_os_socket_send"),
+    (&["socket_recv"], "__omni_os_socket_recv"),
+];
+
 /// Language-agnostic fuzzy stem resolver: maps any model-invented `@__omni_<prefix>_<stem>`
 /// symbol to its canonical C runtime intrinsic, and normalizes C-style type slips.
 pub fn rectify_omni_call_line(line: &str) -> String {
@@ -426,53 +456,10 @@ pub fn rectify_omni_call_line(line: &str) -> String {
                 && !CANONICAL_OMNI_SYMBOLS.contains(&sym_name.as_str())
             {
                 let lower = sym_name.to_lowercase();
-                let canonical = if lower.contains("msleep") || lower.contains("usleep") || lower.contains("sleep_ms") {
-                    Some("__omni_sleep_ms")
-                } else if lower.contains("sleep") || lower.contains("delay") || lower.contains("wait_s") {
-                    Some("__omni_sleep_s")
-                } else if lower.contains("print_int") {
-                    Some("__omni_print_int")
-                } else if lower.contains("slice_print") || lower.contains("list_print") {
-                    Some("__omni_slice_print")
-                } else if lower.contains("print") || lower.contains("puts") || lower.contains("println") || lower.contains("log") {
-                    Some("__omni_print_str")
-                } else if lower.contains("slice_append") || lower.contains("list_append") || lower.contains("vec_push") || lower.contains("array_push") {
-                    Some("__omni_slice_append")
-                } else if lower.contains("slice_get") || lower.contains("list_get") {
-                    Some("__omni_slice_get")
-                } else if lower.contains("slice_set") || lower.contains("list_set") {
-                    Some("__omni_slice_set")
-                } else if lower.contains("slice_len") || lower.contains("list_len") {
-                    Some("__omni_slice_len")
-                } else if lower.contains("slice_pop") || lower.contains("list_pop") {
-                    Some("__omni_slice_pop")
-                } else if lower.contains("map_set_int") {
-                    Some("__omni_map_set_int")
-                } else if lower.contains("map_get_int") {
-                    Some("__omni_map_get_int")
-                } else if lower.contains("map_set") || lower.contains("dict_set") {
-                    Some("__omni_map_set")
-                } else if lower.contains("map_get") || lower.contains("dict_get") {
-                    Some("__omni_map_get")
-                } else if lower.contains("map_len") || lower.contains("dict_len") {
-                    Some("__omni_map_len")
-                } else if lower.contains("http_get") || lower.contains("requests_get") || lower.contains("request_get") || lower.contains("urlopen") {
-                    Some("__omni_c_http_get")
-                } else if lower.contains("json_parse") || lower.contains("json_loads") || lower.contains("response_json") {
-                    Some("__omni_c_json_parse")
-                } else if lower.contains("json_get") || lower.contains("obj_get") {
-                    Some("__omni_c_json_get")
-                } else if lower.contains("to_float") || lower.contains("parse_float") {
-                    Some("__omni_c_to_float")
-                } else if lower.contains("to_int") || lower.contains("parse_int") {
-                    Some("__omni_c_to_int")
-                } else if lower.contains("random_range") || lower.contains("getint32") {
-                    Some("__omni_random_range")
-                } else if lower.contains("random") || lower.contains("nextint") {
-                    Some("__omni_random_int")
-                } else {
-                    None
-                };
+                let canonical = FUZZY_STEM_MAP
+                    .iter()
+                    .find(|(stems, _)| stems.iter().any(|stem| lower.contains(stem)))
+                    .map(|(_, target)| *target);
 
                 if let Some(target_sym) = canonical {
                     s = s.replacen(&sym_name, target_sym, 1);

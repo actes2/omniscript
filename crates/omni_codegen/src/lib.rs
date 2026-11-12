@@ -9,6 +9,101 @@ pub fn host_target_triple() -> &'static str {
     omni_runtime::host_target_triple()
 }
 
+// Type-hint substrings that require 64-bit / pointer-width ABI slots instead of 32-bit integer truncation.
+const ABI_64BIT_SUBSTRINGS: &[&str] = &[
+    "string", "char*", "tuple", "list", "slice", "dict", "map",
+];
+
+// Exact scalar type names mapped to 64-bit LLVM registers (`i64`).
+const ABI_64BIT_EXACT: &[&str] = &[
+    "i64", "u64", "long", "usize", "int64",
+];
+
+// Type-hint substrings representing raw C string pointers (`i8*`).
+const STRING_HINT_SUBSTRINGS: &[&str] = &[
+    "string", "char*",
+];
+
+// Canonical POSIX `<sys/socket.h>` / `<netinet/in.h>` constants lowered without LLM round-trips.
+const POSIX_SOCKET_CONSTANTS: &[(&str, &str)] = &[
+    ("socket.AF_INET", "2"),
+    ("AF_INET", "2"),
+    ("socket.AF_INET6", "10"),
+    ("AF_INET6", "10"),
+    ("socket.SOCK_STREAM", "1"),
+    ("SOCK_STREAM", "1"),
+    ("socket.SOCK_DGRAM", "2"),
+    ("SOCK_DGRAM", "2"),
+    ("socket.SOL_SOCKET", "1"),
+    ("SOL_SOCKET", "1"),
+    ("socket.SO_REUSEADDR", "2"),
+    ("SO_REUSEADDR", "2"),
+    ("socket.IPPROTO_MPTCP", "262"),
+    ("IPPROTO_MPTCP", "262"),
+];
+
+// Receiver-qualified constructors lowered directly to OS socket/thread/pipe runtime primitives.
+const NATIVE_MODULE_CONSTRUCTORS: &[(&str, &str)] = &[
+    ("socket", "socket"),
+    ("threading", "Thread"),
+    ("mp", "Pipe"),
+    ("mp", "Process"),
+];
+
+// Method names intercepted by deterministic C runtime intrinsics when not overridden by a user `%struct.*`.
+const NATIVE_RUNTIME_METHODS: &[&str] = &[
+    "send", "recv", "bind", "listen", "accept", "connect", "close", "getpeername",
+    "start", "terminate", "encode", "decode", "encrypt", "decrypt",
+    "save_pkcs1", "load_pkcs1", "join", "replace", "urandom", "randint",
+];
+
+// Call substrings handled natively by deterministic lowering rather than external FFI synthesis.
+const NATIVE_CALL_PATTERNS: &[&str] = &[
+    "Thread(", "Process(", "rsa.encrypt(", "rsa.decrypt(", "randnum",
+];
+
+// Self/class receiver keywords excluded from external foreign-module classification.
+const SELF_RECEIVERS: &[&str] = &["self", "this", "cls"];
+
+/// Classifies whether a parsed type annotation requires a 64-bit / pointer-width LLVM slot.
+#[inline]
+pub fn is_64bit_type_hint(type_hint: &str) -> bool {
+    if type_hint.ends_with('*') {
+        return true;
+    }
+    let tl = type_hint.to_lowercase();
+    ABI_64BIT_EXACT.contains(&tl.as_str())
+        || ABI_64BIT_SUBSTRINGS.iter().any(|tok| tl.contains(tok))
+}
+
+/// Classifies whether a type annotation represents a C string pointer (`i8*` / `String` / `char*`).
+#[inline]
+pub fn is_string_type_hint(type_hint: &str) -> bool {
+    if type_hint == "i8*" {
+        return true;
+    }
+    let tl = type_hint.to_lowercase();
+    STRING_HINT_SUBSTRINGS.iter().any(|tok| tl.contains(tok))
+}
+
+// Advances `temp_counter` past all `%<stem>_<N>` registers emitted in an AI-synthesized IR snippet
+// so subsequent deterministic lowering never collides with synthesized local SSA names.
+fn advance_ssa_counter_past_body(body: &str, temp_counter: &mut usize) {
+    let mut max_seen = *temp_counter + 16;
+    for token in body.split(|c: char| !c.is_ascii_alphanumeric() && c != '%' && c != '_') {
+        if let Some(reg) = token.strip_prefix('%') {
+            if let Some(num_str) = reg.rsplit('_').next() {
+                if let Ok(n) = num_str.parse::<usize>() {
+                    if n + 1 > max_seen {
+                        max_seen = n + 1;
+                    }
+                }
+            }
+        }
+    }
+    *temp_counter = max_seen;
+}
+
 #[derive(Debug, Clone)]
 pub enum CleanupOp {
     Free(String),
@@ -56,6 +151,39 @@ impl ScopeTree {
             .get(&(cls.to_string(), method.to_string()))
             .cloned()
             .unwrap_or_else(|| cls.to_string())
+    }
+
+    /// Checks if `rec` is a bound `%struct.*` instance or known class that explicitly defines `method`,
+    /// preventing OS/runtime duck-typed intrinsics from shadowing user-defined methods.
+    pub fn has_user_struct_method(&self, rec: &str, method: &str) -> bool {
+        if let Some(b) = self.resolve(rec) {
+            if b.type_hint.starts_with("%struct.") {
+                let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                return self
+                    .method_defining_class
+                    .contains_key(&(cls.to_string(), method.to_string()));
+            }
+        }
+        if self.class_fields.contains_key(rec) {
+            return self
+                .method_defining_class
+                .contains_key(&(rec.to_string(), method.to_string()));
+        }
+        false
+    }
+
+    /// Determines whether a dotted call (`rec.method(...)`) is handled natively by local scope or
+    /// deterministic runtime intrinsics rather than requiring external foreign-module FFI synthesis.
+    pub fn is_natively_routed_call(&self, rec: &str, method: &str, parts: &[&str], full_expr: &str) -> bool {
+        NATIVE_MODULE_CONSTRUCTORS.contains(&(rec, method))
+            || NATIVE_RUNTIME_METHODS.contains(&method)
+            || NATIVE_CALL_PATTERNS.iter().any(|pat| full_expr.contains(pat))
+            || SELF_RECEIVERS.contains(&rec)
+            || rec.starts_with('"')
+            || rec.starts_with('\'')
+            || self.known_functions.contains(method)
+            || parts.iter().any(|p| self.class_fields.contains_key(*p))
+            || self.method_defining_class.iter().any(|((_, m), _)| m == method)
     }
 
     pub fn resolve_enum_variant(&self, expr: &str) -> Option<(String, (usize, Option<String>))> {
@@ -537,6 +665,13 @@ impl<'a> CodeGenerator<'a> {
         if trimmed.starts_with("input(") || trimmed == "input()" {
             return true;
         }
+        if (trimmed.starts_with("str(")
+            || trimmed.starts_with("String(")
+            || trimmed.starts_with("tostring("))
+            && trimmed.ends_with(')')
+        {
+            return true;
+        }
         if trimmed.ends_with(".encode()") || trimmed.ends_with(".decode()") {
             return true;
         }
@@ -570,15 +705,14 @@ impl<'a> CodeGenerator<'a> {
                             .class_field_types
                             .get(cls_name)
                             .and_then(|m| m.get(fld))
-                            .map(|th| th.to_lowercase().contains("string") || th.contains("char*") || th.starts_with("i8*"))
+                            .map(|th| th.starts_with("i8*") || is_string_type_hint(th))
                             .unwrap_or(false);
                     }
                 }
             }
         }
         if let Some(b) = scope_tree.resolve(trimmed) {
-            let tl = b.type_hint.to_lowercase();
-            return tl.contains("string") || tl.contains("char*") || b.type_hint == "i8*";
+            return is_string_type_hint(&b.type_hint);
         }
         false
     }
@@ -609,14 +743,29 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // Python byte encode/decode identity on i8*
+        // Python UTF-8 str/bytes identity on `i8*` buffers, skipped if receiver defines a custom method.
         if trimmed.ends_with(".decode()") {
             let base = trimmed[..trimmed.len() - 9].trim();
-            return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+            if !scope_tree.has_user_struct_method(base, "decode") {
+                return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+            }
         }
         if trimmed.ends_with(".encode()") {
             let base = trimmed[..trimmed.len() - 9].trim();
-            return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+            if !scope_tree.has_user_struct_method(base, "encode") {
+                return self.eval_str_ptr(base, ir, scope_tree, string_constants, temp_counter);
+            }
+        }
+
+        // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
+        for prefix in &["str(", "String(", "tostring("] {
+            if trimmed.starts_with(prefix) && trimmed.ends_with(')') {
+                let fn_ident = prefix.trim_end_matches('(');
+                if !scope_tree.known_functions.contains(fn_ident) {
+                    let inner = trimmed[prefix.len()..trimmed.len() - 1].trim();
+                    return self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                }
+            }
         }
 
         // Builtin input(prompt)
@@ -637,27 +786,31 @@ impl<'a> CodeGenerator<'a> {
             return input_ptr;
         }
 
-        // Socket getpeername / recv returning string / bytes
+        // POSIX socket getpeername / recv returning `i8*` unless receiver is a user struct with that method.
         if let Some(lp) = trimmed.find(".getpeername(") {
             if !trimmed[..lp].contains('(') {
                 let rec = trimmed[..lp].trim();
-                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
-                let peer_ptr = format!("%peer_str_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_getpeername(i32 {})\n", peer_ptr, r_fd));
-                return peer_ptr;
+                if !scope_tree.has_user_struct_method(rec, "getpeername") {
+                    let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                    let peer_ptr = format!("%peer_str_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_os_socket_getpeername(i32 {})\n", peer_ptr, r_fd));
+                    return peer_ptr;
+                }
             }
         }
         if let Some(lp) = trimmed.find(".recv(") {
             if !trimmed[..lp].contains('(') {
                 let rec = trimmed[..lp].trim();
-                let inner = &trimmed[lp + 6..trimmed.len() - 1].trim();
-                let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
-                let max_bytes = if inner.is_empty() { "1024".to_string() } else { self.eval_val(inner, ir, scope_tree, string_constants, temp_counter) };
-                let recv_ptr = format!("%recv_str_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = call i8* @__omni_os_socket_recv(i32 {}, i32 {})\n", recv_ptr, r_fd, max_bytes));
-                return recv_ptr;
+                if !scope_tree.has_user_struct_method(rec, "recv") {
+                    let inner = &trimmed[lp + 6..trimmed.len() - 1].trim();
+                    let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
+                    let max_bytes = if inner.is_empty() { "1024".to_string() } else { self.eval_val(inner, ir, scope_tree, string_constants, temp_counter) };
+                    let recv_ptr = format!("%recv_str_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_os_socket_recv(i32 {}, i32 {})\n", recv_ptr, r_fd, max_bytes));
+                    return recv_ptr;
+                }
             }
         }
 
@@ -721,7 +874,7 @@ impl<'a> CodeGenerator<'a> {
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", str_ptr, b.llvm_ptr));
                 return str_ptr;
-            } else if b.type_hint.to_lowercase().contains("string") || b.type_hint.contains("char*") {
+            } else if is_string_type_hint(&b.type_hint) {
                 let val64 = format!("%var_val64_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, b.llvm_ptr));
@@ -833,6 +986,17 @@ impl<'a> CodeGenerator<'a> {
             return self.eval_val(base, ir, scope_tree, string_constants, temp_counter);
         }
 
+        // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
+        for prefix in &["str(", "String(", "tostring("] {
+            if trimmed.starts_with(prefix) && trimmed.ends_with(')') {
+                let fn_ident = prefix.trim_end_matches('(');
+                if !scope_tree.known_functions.contains(fn_ident) {
+                    let inner = trimmed[prefix.len()..trimmed.len() - 1].trim();
+                    return self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                }
+            }
+        }
+
         // Builtin input(prompt)
         if trimmed == "input()" || (trimmed.starts_with("input(") && trimmed.ends_with(')')) {
             let prompt_ptr = if trimmed == "input()" {
@@ -871,12 +1035,9 @@ impl<'a> CodeGenerator<'a> {
             return "0".to_string();
         }
 
-        // Socket constants
-        if trimmed == "socket.AF_INET" {
-            return "2".to_string();
-        }
-        if trimmed == "socket.SOCK_STREAM" {
-            return "1".to_string();
+        // Canonical POSIX socket constants from top-of-file lookup table
+        if let Some((_, val)) = POSIX_SOCKET_CONSTANTS.iter().find(|(k, _)| *k == trimmed) {
+            return (*val).to_string();
         }
 
         // Builtin OS Pipe creation: `mp.Pipe(...)` or `Pipe(...)`
@@ -1059,7 +1220,9 @@ impl<'a> CodeGenerator<'a> {
                                 return sock_fd;
                             }
 
-                            if method == "send" {
+                            let is_user_method = scope_tree.has_user_struct_method(rec, method);
+
+                            if !is_user_method && method == "send" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let arg_data = if let Some(a) = raw_args.first() {
                                     let a_trim = a.trim();
@@ -1081,7 +1244,7 @@ impl<'a> CodeGenerator<'a> {
                                 return ret_reg;
                             }
 
-                            if method == "recv" {
+                            if !is_user_method && method == "recv" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let max_bytes = if let Some(a) = raw_args.first() {
                                     self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)
@@ -1098,7 +1261,7 @@ impl<'a> CodeGenerator<'a> {
                                 return cast_i32;
                             }
 
-                            if method == "bind" {
+                            if !is_user_method && method == "bind" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let addr_ptr = if let Some(a) = raw_args.first() {
                                     let a_trim = a.trim();
@@ -1131,7 +1294,7 @@ impl<'a> CodeGenerator<'a> {
                                 return ret_reg;
                             }
 
-                            if method == "listen" {
+                            if !is_user_method && method == "listen" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let ret_reg = format!("%listen_ret_{}", *temp_counter);
                                 *temp_counter += 1;
@@ -1139,7 +1302,7 @@ impl<'a> CodeGenerator<'a> {
                                 return ret_reg;
                             }
 
-                            if method == "accept" {
+                            if !is_user_method && method == "accept" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let slice_ptr = format!("%accept_tuple_{}", *temp_counter);
                                 *temp_counter += 1;
@@ -1151,7 +1314,7 @@ impl<'a> CodeGenerator<'a> {
                                 return cast_i32;
                             }
 
-                            if method == "connect" {
+                            if !is_user_method && method == "connect" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let addr_ptr = if let Some(a) = raw_args.first() {
                                     let a_trim = a.trim();
@@ -1184,7 +1347,7 @@ impl<'a> CodeGenerator<'a> {
                                 return ret_reg;
                             }
 
-                            if method == "getpeername" {
+                            if !is_user_method && method == "getpeername" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 let peer_ptr = format!("%peer_ptr_{}", *temp_counter);
                                 *temp_counter += 1;
@@ -1196,17 +1359,17 @@ impl<'a> CodeGenerator<'a> {
                                 return cast_i32;
                             }
 
-                            if method == "close" {
+                            if !is_user_method && method == "close" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 ir.push_str(&format!("  call void @__omni_os_socket_close(i32 {})\n", r_fd));
                                 return "0".to_string();
                             }
 
-                            if method == "terminate" || method == "start" {
+                            if !is_user_method && (method == "terminate" || method == "start") {
                                 return "0".to_string();
                             }
 
-                            if method == "encrypt" || method == "decrypt" {
+                            if !is_user_method && (method == "encrypt" || method == "decrypt") {
                                 if let Some(a) = raw_args.first() {
                                     let a_trim = a.trim();
                                     let str_ptr = self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter);
@@ -1414,8 +1577,7 @@ impl<'a> CodeGenerator<'a> {
                                     a_trim = v.trim();
                                 }
                                 if let Some(b) = scope_tree.resolve(a_trim) {
-                                    let tl = b.type_hint.to_lowercase();
-                                    if b.type_hint.ends_with('*') || tl.contains("string") || tl.contains("char*") || tl == "i64" || tl == "u64" || tl == "long" || tl == "usize" {
+                                    if is_64bit_type_hint(&b.type_hint) {
                                         let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
@@ -2151,7 +2313,7 @@ impl<'a> CodeGenerator<'a> {
                                         .unwrap_or(false);
                                     let is_field_access = trimmed_expr.contains('.') && !trimmed_expr.contains('(');
                                     let is_str_binding = scope_tree.resolve(trimmed_expr)
-                                        .map(|sb| sb.type_hint.to_lowercase().contains("string") || sb.type_hint.contains("char*"))
+                                        .map(|sb| is_string_type_hint(&sb.type_hint))
                                         .unwrap_or(false);
                                     let store_val = if is_struct_var {
                                         let src_b = scope_tree.resolve(trimmed_expr).unwrap();
@@ -2385,15 +2547,7 @@ impl<'a> CodeGenerator<'a> {
                                         continue;
                                     }
                                     if let Some(b) = scope_tree.resolve(a_trim) {
-                                        let tl = b.type_hint.to_lowercase();
-                                        let is_ptr_or_64 = b.type_hint.ends_with('*')
-                                            || tl.contains("string")
-                                            || tl.contains("char*")
-                                            || tl == "i64"
-                                            || tl == "u64"
-                                            || tl == "long"
-                                            || tl == "usize";
-                                        if is_ptr_or_64 {
+                                        if is_64bit_type_hint(&b.type_hint) {
                                             let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
                                             *temp_counter += 1;
                                             ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
@@ -2599,23 +2753,7 @@ impl<'a> CodeGenerator<'a> {
                                 let parts: Vec<&str> = callee.split('.').collect();
                                 let rec = parts[0].trim();
                                 let method = parts[parts.len() - 1].trim();
-                                if (rec == "socket" && method == "socket")
-                                    || (rec == "threading" && method == "Thread")
-                                    || (rec == "mp" && (method == "Pipe" || method == "Process"))
-                                    || trimmed_expr.contains("Thread(")
-                                    || trimmed_expr.contains("Process(")
-                                    || method == "send" || method == "recv" || method == "bind" || method == "listen"
-                                    || method == "accept" || method == "connect" || method == "close" || method == "getpeername"
-                                    || method == "start" || method == "terminate" || method == "encode" || method == "decode"
-                                    || method == "encrypt" || method == "decrypt" || method == "save_pkcs1" || method == "load_pkcs1"
-                                    || trimmed_expr.contains("rsa.encrypt(") || trimmed_expr.contains("rsa.decrypt(")
-                                    || scope_tree.known_functions.contains(method)
-                                    || parts.iter().any(|p| scope_tree.class_fields.contains_key(*p))
-                                    || rec == "self" || rec == "this" || rec == "cls"
-                                    || rec.starts_with('"') || rec.starts_with('\'') || method == "join" || method == "replace"
-                                    || method == "urandom" || method == "randint" || trimmed_expr.contains("randnum")
-                                    || scope_tree.method_defining_class.iter().any(|((_, m), _)| m == method)
-                                {
+                                if scope_tree.is_natively_routed_call(rec, method, &parts, trimmed_expr) {
                                     false
                                 } else {
                                     scope_tree.resolve(rec).is_none() && !scope_tree.class_fields.contains_key(rec)
@@ -2692,8 +2830,8 @@ impl<'a> CodeGenerator<'a> {
                         };
 
                         let synthesized = self.engine.lower_intent(&envelope, temp)?;
-                        *temp_counter += 16;
                         let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                        advance_ssa_counter_past_body(&body, temp_counter);
                         for d in dyn_decls {
                             dynamic_declarations.insert(d);
                         }
@@ -3993,6 +4131,7 @@ impl<'a> CodeGenerator<'a> {
                     ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    advance_ssa_counter_past_body(&body, temp_counter);
                     for d in dyn_decls {
                         dynamic_declarations.insert(d);
                     }
@@ -4066,6 +4205,7 @@ impl<'a> CodeGenerator<'a> {
                     ));
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    advance_ssa_counter_past_body(&body, temp_counter);
                     for d in dyn_decls {
                         dynamic_declarations.insert(d);
                     }
@@ -4219,6 +4359,7 @@ impl<'a> CodeGenerator<'a> {
 
                     let synthesized = self.engine.lower_intent(&envelope, temp)?;
                     let (dyn_decls, body) = extract_declarations_and_body(&synthesized);
+                    advance_ssa_counter_past_body(&body, temp_counter);
                     for d in dyn_decls {
                         dynamic_declarations.insert(d);
                     }
@@ -4867,22 +5008,7 @@ impl<'a> CodeGenerator<'a> {
                     let is_64bit = param
                         .type_hint
                         .as_deref()
-                        .map(|t| {
-                            let tl = t.to_lowercase();
-                            tl.contains("string")
-                                || tl.contains("char*")
-                                || t.ends_with('*')
-                                || tl.contains("tuple")
-                                || tl.contains("list")
-                                || tl.contains("slice")
-                                || tl.contains("dict")
-                                || tl.contains("map")
-                                || tl == "i64"
-                                || tl == "u64"
-                                || tl == "long"
-                                || tl == "usize"
-                                || tl == "int64"
-                        })
+                        .map(is_64bit_type_hint)
                         .unwrap_or(false);
                     if is_64bit {
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
@@ -5246,7 +5372,6 @@ impl<'a> CodeGenerator<'a> {
             "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
             "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
             "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
-            "sin", "cos", "tan", "sqrt", "ceil", "floor", "fabs", "fmod",
         ].into_iter().collect();
 
         for cap in call_c_re.captures_iter(&functions_ir) {

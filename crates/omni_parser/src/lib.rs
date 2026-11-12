@@ -6,6 +6,45 @@ use serde::{Deserialize, Serialize};
 pub mod diagnostic;
 pub use diagnostic::*;
 
+// Paired block-comment delimiters `(open, close, allow_nesting)` across supported ecosystems:
+// HTML/XML, Jinja/Twig, PowerShell, Lisp/Scheme/Racket, Julia, Haskell/Elm, OCaml/Pascal/ML, C-family/Rust, CoffeeScript.
+const POLYGLOT_BLOCK_COMMENTS: &[(&str, &str, bool)] = &[
+    ("<!--", "-->", false),
+    ("{#", "#}", false),
+    ("<#", "#>", false),
+    ("#|", "|#", true),
+    ("#=", "=#", true),
+    ("{-", "-}", true),
+    ("(*", "*)", true),
+    ("/*", "*/", true),
+    ("###", "###", false),
+];
+
+// Line-anchored block-comment pairs `(start_prefix, end_prefix)` matched at the beginning of trimmed lines
+// (Ruby `=begin`/`=end`, Perl POD `=pod`/`=head`/`=cut`, MATLAB/Octave `%{`/`%}`).
+const LINE_ANCHORED_BLOCK_COMMENTS: &[(&[&str], &str)] = &[
+    (&["=begin"], "=end"),
+    (&["=pod", "=head1", "=head2", "=head3", "=head4", "=over"], "=cut"),
+];
+
+// Statement prefixes from brace/semicolon languages that never use `//` as Python floor division.
+const NON_FLOOR_DIV_PREFIXES: &[&str] = &[
+    "let ", "const ", "var ", "int ", "int32 ", "int64 ", "long ", "float ", "double ",
+    "bool ", "boolean ", "void ", "auto ", "char ", "char*", "public ", "private ",
+    "protected ", "internal ", "static ", "final ", "sealed ", "fn ", "func ",
+    "function ", "package ", "use ", "struct ", "impl ", "interface ", "enum ",
+];
+
+// Valid Python binary/clause keywords permitted between adjacent identifiers after `//` floor division.
+const PYTHON_EXPR_KEYWORDS: &[&str] = &[
+    "in", "not", "is", "and", "or", "if", "else", "for",
+];
+
+// Standard comment prose markers that immediately classify `//` as a comment rather than division.
+const COMMENT_PROSE_MARKERS: &[&str] = &[
+    "todo", "fixme", "note:", "hack", "xxx", "bug:",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmniModule {
     pub name: String,
@@ -477,7 +516,7 @@ impl OmniParser {
         Self {
             // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++
             fn_re: Regex::new(
-                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|[a-zA-Z_0-9*&\[\]:,"' .]+)|[a-zA-Z_0-9*&\[\]:]+\s*)?(?::|\{|\;)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*(?:<[^>]*>)?\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|[a-zA-Z_0-9*&\[\]:,"' .]+)|[a-zA-Z_0-9*&\[\]:]+\s*)?(?::|\{|\;)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -609,7 +648,677 @@ impl OmniParser {
         parts
     }
 
-    /// Strip trailing single-line comment (`//` or `#`) outside of string quotes
+    /// Checks whether `#` starts a comment/shebang/directive rather than a Rust/C# attribute (`#[...]`, `#![...]`).
+    #[inline]
+    pub fn is_hash_comment(trimmed: &str) -> bool {
+        trimmed.starts_with('#') && !trimmed.starts_with("#[") && !trimmed.starts_with("#![")
+    }
+
+    /// Distinguishes Python/Lua floor division (`q = a // b`) from C-family `//` single-line comments.
+    fn is_python_floor_div(line_before: &str, after_slashes: &str) -> bool {
+        let prefix = line_before.trim();
+        if prefix.is_empty()
+            || prefix.contains(';')
+            || prefix.contains(":=")
+            || prefix.contains("->")
+            || prefix.contains('{')
+            || NON_FLOOR_DIV_PREFIXES.iter().any(|p| prefix.starts_with(p))
+        {
+            return false;
+        }
+
+        let last_b = match prefix.as_bytes().last() {
+            Some(&b) => b,
+            None => return false,
+        };
+        if !(last_b.is_ascii_alphanumeric() || last_b == b'_' || last_b == b')' || last_b == b']') {
+            return false;
+        }
+
+        // Trim any trailing `#` comment on the same Python line before inspecting the RHS operand.
+        let rhs_raw = after_slashes.split('#').next().unwrap_or(after_slashes).trim();
+        if rhs_raw.is_empty() {
+            return false;
+        }
+
+        let lower_rhs = rhs_raw.to_lowercase();
+        if COMMENT_PROSE_MARKERS.iter().any(|m| lower_rhs.starts_with(m))
+            || rhs_raw.ends_with('.')
+            || rhs_raw.ends_with('!')
+            || rhs_raw.ends_with('?')
+        {
+            return false;
+        }
+
+        let first_rhs = rhs_raw.as_bytes()[0];
+        let valid_start = first_rhs.is_ascii_alphanumeric()
+            || matches!(first_rhs, b'_' | b'(' | b'[' | b'-' | b'+' | b'~');
+        if !valid_start {
+            return false;
+        }
+
+        // Reject natural-language prose (two adjacent identifier words not joined by a Python keyword).
+        let mut prev_was_ident = false;
+        for tok in rhs_raw.split_whitespace() {
+            let clean = tok.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ':' | ','));
+            if clean.is_empty() {
+                continue;
+            }
+            let is_word = clean.chars().all(|c| c.is_ascii_alphabetic() || c == '_');
+            let is_kw = PYTHON_EXPR_KEYWORDS.contains(&clean);
+            if is_word && !is_kw {
+                if prev_was_ident {
+                    return false;
+                }
+                prev_was_ident = true;
+            } else {
+                prev_was_ident = false;
+            }
+        }
+
+        true
+    }
+
+    /// Distinguishes C/JS/Go `--` decrement (`i--`, `--i`) from Lua/SQL/Haskell/Ada `--` comments.
+    fn is_decrement_op(bytes: &[u8], i: usize, line_before: &str) -> bool {
+        let line_end = bytes[i + 2..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| i + 2 + p)
+            .unwrap_or(bytes.len());
+        let after = std::str::from_utf8(&bytes[i + 2..line_end]).unwrap_or("");
+        let after_trim = after.trim_start_matches(|c: char| c == ' ' || c == '\t');
+
+        // Postfix decrement: `i--`, `arr[idx]--`, `get()--`
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b')' | b']') {
+                if after_trim.is_empty()
+                    || after_trim.starts_with(';')
+                    || after_trim.starts_with(')')
+                    || after_trim.starts_with(']')
+                    || after_trim.starts_with(',')
+                    || after_trim.starts_with('}')
+                    || after_trim.starts_with('{')
+                    || after_trim.starts_with("//")
+                    || after_trim.starts_with("/*")
+                    || after_trim.starts_with('#')
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Prefix decrement: `--i;`, `x = --i`, `foo(--i)`
+        let prev_non_ws = line_before.trim_end().as_bytes().last().copied();
+        let valid_prefix_ctx = matches!(
+            prev_non_ws,
+            None | Some(b'=' | b'(' | b'[' | b',' | b';' | b':' | b'+' | b'-' | b'*' | b'{')
+        );
+        if valid_prefix_ctx && !after.is_empty() {
+            let first = after.as_bytes()[0];
+            if first.is_ascii_alphabetic() || first == b'_' {
+                let ident_len = after
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+                    .count();
+                let tail = after[ident_len..].trim_start_matches(|c: char| c == ' ' || c == '\t');
+                let has_stmt_delim = tail.starts_with(';')
+                    || tail.starts_with(')')
+                    || tail.starts_with(']')
+                    || tail.starts_with(',');
+                if has_stmt_delim || (prev_non_ws.is_some() && tail.is_empty()) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Checks if `'` at `pos` opens a single-quoted literal on the same line (excluding Rust lifetimes `'a`).
+    fn is_single_quote_literal_start(bytes: &[u8], pos: usize) -> bool {
+        let prev = if pos > 0 { Some(bytes[pos - 1]) } else { None };
+
+        // Rust reference lifetime `&'a` or generic lifetime `<'a>` / `<'a, 'b>`
+        if matches!(prev, Some(b'&' | b'<')) && pos + 1 < bytes.len() {
+            let first = bytes[pos + 1];
+            if first.is_ascii_alphabetic() || first == b'_' {
+                let mut k = pos + 2;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                if k >= bytes.len() || bytes[k] != b'\'' {
+                    return false;
+                }
+            }
+        }
+
+        //Haskell/ML primed identifier `x'`
+        if let Some(p) = prev {
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                // Allow Python/Rust byte/raw/format prefixes (`b'x'`, `r'x'`, `f'x'`, `u'x'`)
+                let is_str_prefix = matches!(p, b'b' | b'r' | b'f' | b'u' | b'B' | b'R' | b'F' | b'U');
+                if !is_str_prefix {
+                    return false;
+                }
+            }
+        }
+
+        let mut j = pos + 1;
+        let mut escaped = false;
+        while j < bytes.len() && bytes[j] != b'\n' {
+            if escaped {
+                escaped = false;
+            } else if bytes[j] == b'\\' {
+                escaped = true;
+            } else if bytes[j] == b'\'' {
+                return true;
+            }
+            j += 1;
+        }
+        false
+    }
+
+    /// Verifies that treating `open` at `pos_after_open` as a nested block-comment opener still
+    /// allows `depth` to reach `0` before EOF—skipping live-code string literals once `depth == 1`
+    /// so C glob docs (`/* matches /*.c */`) never swallow subsequent code via a later `"*/"` string.
+    fn can_close_nested_comment(source: &str, pos_after_open: usize, open: &str, close: &str, mut depth: usize) -> bool {
+        let bytes = source.as_bytes();
+        let len = bytes.len();
+        let mut j = pos_after_open;
+        while j < len {
+            if depth == 1 && (bytes[j] == b'"' || bytes[j] == b'`') {
+                let delim = bytes[j];
+                j += 1;
+                while j < len {
+                    if bytes[j] == b'\\' && j + 1 < len {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == delim {
+                        j += 1;
+                        break;
+                    }
+                    j += source[j..].chars().next().unwrap().len_utf8();
+                }
+                continue;
+            }
+            if source[j..].starts_with(open) && !(open == "(*" && source[j..].starts_with("(*)")) {
+                depth += 1;
+                j += open.len();
+            } else if source[j..].starts_with(close) {
+                depth -= 1;
+                j += close.len();
+                if depth == 0 {
+                    return true;
+                }
+            } else {
+                j += source[j..].chars().next().unwrap().len_utf8();
+            }
+        }
+        false
+    }
+
+    /// Disambiguates block-comment openers (`(*`, `{-`, etc.) from Python `*args` unpacking
+    /// (`cls(*as_ints)`), C pointer dereferences (`(*ptr)`), and negative set/array literals (`{-1, -2}`).
+    fn is_valid_block_comment_open(source: &str, i: usize, open: &str, close: &str) -> bool {
+        let rest = &source[i..];
+        if !rest.starts_with(open) {
+            return false;
+        }
+        let after = &source[i + open.len()..];
+        if !after.contains(close) {
+            return false;
+        }
+        let bytes = source.as_bytes();
+        let next_b = bytes.get(i + open.len()).copied();
+        match open {
+            "(*" => {
+                if rest.starts_with("(*)") {
+                    return false;
+                }
+                if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                    return false;
+                }
+                if matches!(next_b, Some(b' ' | b'\t' | b'\r' | b'\n' | b'*')) {
+                    return true;
+                }
+                let line_after = after.split('\n').next().unwrap_or("");
+                match (line_after.find("*)"), line_after.find(')')) {
+                    (Some(c_idx), Some(p_idx)) => c_idx < p_idx,
+                    _ => false,
+                }
+            }
+            "{-" => {
+                if matches!(next_b, Some(b' ' | b'\t' | b'\r' | b'\n' | b'-' | b'#')) {
+                    return true;
+                }
+                let line_after = after.split('\n').next().unwrap_or("");
+                match (line_after.find("-}"), line_after.find('}')) {
+                    (Some(c_idx), Some(p_idx)) => c_idx < p_idx,
+                    _ => false,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    /// Stateful byte-level pre-scanner that strips single-line, inline, nested, and line-anchored
+    /// comments across all supported languages while preserving exact line counts, indentation,
+    /// string literals, Rust attributes (`#[...]`), C decrements (`i--`), and Python `//` floor division.
+    pub fn strip_polyglot_comments(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len);
+        let mut i = 0usize;
+        let mut at_line_start = true;
+        let mut paren_depth = 0usize;
+
+        while i < len {
+            let b = bytes[i];
+
+            if b == b'\n' {
+                out.push('\n');
+                at_line_start = true;
+                i += 1;
+                continue;
+            }
+
+            if b == b' ' || b == b'\t' || b == b'\r' {
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+
+            let rest = &source[i..];
+
+            // 1. Line-anchored multi-line comments when at the first non-whitespace column of a line
+            if at_line_start {
+                let line_end = rest.find('\n').map(|p| i + p).unwrap_or(len);
+                let line_trimmed = source[i..line_end].trim_end();
+
+                // Ruby `=begin`..`=end` and Perl POD `=pod`/`=head1`..`=cut`
+                if let Some((_, end_marker)) = LINE_ANCHORED_BLOCK_COMMENTS.iter().find(|(starts, _)| {
+                    starts.iter().any(|st| {
+                        line_trimmed == *st
+                            || (line_trimmed.starts_with(st)
+                                && line_trimmed[st.len()..].starts_with(|c: char| c.is_whitespace()))
+                    })
+                }) {
+                    i = line_end;
+                    while i < len {
+                        if bytes[i] == b'\n' {
+                            out.push('\n');
+                            i += 1;
+                            let nl_end = source[i..].find('\n').map(|p| i + p).unwrap_or(len);
+                            let cand = source[i..nl_end].trim();
+                            if cand == *end_marker
+                                || (cand.starts_with(end_marker)
+                                    && cand[end_marker.len()..].starts_with(|c: char| c.is_whitespace()))
+                            {
+                                i = nl_end;
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // MATLAB / Octave `%{` .. `%}` (valid only when `%{` is alone on the trimmed line)
+                if line_trimmed == "%{" {
+                    i = line_end;
+                    while i < len {
+                        if bytes[i] == b'\n' {
+                            out.push('\n');
+                            i += 1;
+                            let nl_end = source[i..].find('\n').map(|p| i + p).unwrap_or(len);
+                            if source[i..nl_end].trim() == "%}" {
+                                i = nl_end;
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // Standalone multi-line docstring (`"""..."""`, `'''...'''`, plus raw/byte/format prefixes `r"""..."""`, `fr'''...'''`)
+                let doc_prefix_len = {
+                    let b0 = bytes[i].to_ascii_lowercase();
+                    let b1 = bytes.get(i + 1).map(|c| c.to_ascii_lowercase());
+                    if rest.len() >= 5
+                        && matches!(
+                            (b0, b1),
+                            (b'f', Some(b'r')) | (b'r', Some(b'f')) | (b'b', Some(b'r')) | (b'r', Some(b'b'))
+                        )
+                        && (rest[2..].starts_with("\"\"\"") || rest[2..].starts_with("'''"))
+                    {
+                        Some(2usize)
+                    } else if rest.len() >= 4
+                        && matches!(b0, b'r' | b'b' | b'u' | b'f')
+                        && (rest[1..].starts_with("\"\"\"") || rest[1..].starts_with("'''"))
+                    {
+                        Some(1usize)
+                    } else if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+                        Some(0usize)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(plen) = doc_prefix_len {
+                    let quote = &rest[plen..plen + 3];
+                    i += plen + 3;
+                    while i < len {
+                        if source[i..].starts_with(quote) {
+                            i += 3;
+                            break;
+                        }
+                        if bytes[i] == b'\\' && i + 1 < len {
+                            if bytes[i + 1] == b'\n' {
+                                out.push('\n');
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += source[i..].chars().next().unwrap().len_utf8();
+                    }
+                    continue;
+                }
+
+                // Full-line Assembly/Lisp/INI `;`, Erlang/Prolog/MATLAB/LaTeX `%`, Fortran `! `, BASIC/Batch `REM `
+                let is_bol_rem = (line_trimmed.len() >= 4
+                    && line_trimmed[..3].eq_ignore_ascii_case("rem")
+                    && line_trimmed.as_bytes()[3].is_ascii_whitespace())
+                    || line_trimmed.eq_ignore_ascii_case("rem");
+                let is_bol_fortran = rest.starts_with("! ") || rest.starts_with("!\t") || rest.starts_with("!!");
+                let is_bol_percent = b == b'%'
+                    && (rest.starts_with("%%")
+                        || (paren_depth == 0 && !rest[1..].trim_start().starts_with('(')));
+                if b == b';' || is_bol_percent || is_bol_fortran || is_bol_rem {
+                    i = line_end;
+                    continue;
+                }
+            }
+
+            // 2. Lua parameterized long-bracket block comments: `--[[ ... ]]`, `--[=[ ... ]=]`
+            if rest.starts_with("--[") {
+                let mut eq_cnt = 0usize;
+                let mut k = i + 3;
+                while k < len && bytes[k] == b'=' {
+                    eq_cnt += 1;
+                    k += 1;
+                }
+                if k < len && bytes[k] == b'[' {
+                    let close_pat = format!("]{}]", "=".repeat(eq_cnt));
+                    if source[k + 1..].contains(&close_pat) {
+                        i = k + 1;
+                        let mut spanned_nl = false;
+                        while i < len {
+                            if source[i..].starts_with(&close_pat) {
+                                i += close_pat.len();
+                                break;
+                            }
+                            if bytes[i] == b'\n' {
+                                out.push('\n');
+                                spanned_nl = true;
+                            }
+                            i += source[i..].chars().next().unwrap().len_utf8();
+                        }
+                        if !spanned_nl {
+                            if at_line_start {
+                                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                                    i += 1;
+                                }
+                            } else {
+                                out.push(' ');
+                            }
+                        } else {
+                            at_line_start = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // 3. Paired polyglot block comments (`/* */`, `(* *)`, `{- -}`, `#| |#`, `#= =#`, `<!-- -->`, `{# #}`, `<# #>`, `### ###`)
+            if let Some(&(open, close, allow_nesting)) = POLYGLOT_BLOCK_COMMENTS
+                .iter()
+                .find(|&&(op, cl, _)| Self::is_valid_block_comment_open(source, i, op, cl))
+            {
+                i += open.len();
+                let mut depth = 1usize;
+                let mut spanned_nl = false;
+                while i < len && depth > 0 {
+                    if bytes[i] == b'\n' {
+                        out.push('\n');
+                        spanned_nl = true;
+                        i += 1;
+                    } else if allow_nesting
+                        && open != close
+                        && source[i..].starts_with(open)
+                        && Self::can_close_nested_comment(source, i + open.len(), open, close, depth + 1)
+                    {
+                        depth += 1;
+                        i += open.len();
+                    } else if source[i..].starts_with(close) {
+                        depth -= 1;
+                        i += close.len();
+                    } else {
+                        i += source[i..].chars().next().unwrap().len_utf8();
+                    }
+                }
+                if !spanned_nl {
+                    if at_line_start {
+                        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                            i += 1;
+                        }
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    at_line_start = true;
+                }
+                continue;
+            }
+
+            // 4. Protected String Literals (Rust raw strings, value triple-strings, backticks, double & single quotes)
+            // 4a. Rust raw string `r#"..."#` / `br#"..."#`
+            let is_ident_prev = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !is_ident_prev && (b == b'r' || (b == b'b' && i + 1 < len && bytes[i + 1] == b'r')) {
+                let r_pos = if b == b'b' { i + 1 } else { i };
+                let mut h_pos = r_pos + 1;
+                let mut hashes = 0usize;
+                while h_pos < len && bytes[h_pos] == b'#' {
+                    hashes += 1;
+                    h_pos += 1;
+                }
+                if hashes > 0 && h_pos < len && bytes[h_pos] == b'"' {
+                    let close_raw = format!("\"{}", "#".repeat(hashes));
+                    let start_i = i;
+                    i = h_pos + 1;
+                    while i < len {
+                        if source[i..].starts_with(&close_raw) {
+                            i += close_raw.len();
+                            break;
+                        }
+                        i += source[i..].chars().next().unwrap().len_utf8();
+                    }
+                    out.push_str(&source[start_i..i]);
+                    at_line_start = out.ends_with('\n');
+                    continue;
+                }
+            }
+
+            // 4b. Value-position triple-quoted string (`msg = """hello # world"""`)
+            if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+                let quote = &rest[..3];
+                let start_i = i;
+                i += 3;
+                while i < len {
+                    if source[i..].starts_with(quote) {
+                        i += 3;
+                        break;
+                    }
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    i += source[i..].chars().next().unwrap().len_utf8();
+                }
+                out.push_str(&source[start_i..i]);
+                at_line_start = false;
+                continue;
+            }
+
+            // 4c. Double-quoted `"..."` or backtick `` `...` `` string literal
+            if b == b'"' || b == b'`' {
+                let delim = b;
+                let start_i = i;
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == delim {
+                        i += 1;
+                        break;
+                    }
+                    i += source[i..].chars().next().unwrap().len_utf8();
+                }
+                out.push_str(&source[start_i..i]);
+                at_line_start = false;
+                continue;
+            }
+
+            // 4d. Single-quoted `'...'` literal (guarded against Rust lifetimes `'a` and primed idents `x'`)
+            if b == b'\'' && Self::is_single_quote_literal_start(bytes, i) {
+                let start_i = i;
+                i += 1;
+                while i < len && bytes[i] != b'\n' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += source[i..].chars().next().unwrap().len_utf8();
+                }
+                out.push_str(&source[start_i..i]);
+                at_line_start = false;
+                continue;
+            }
+
+            // 5. Single-Line Comments (outside literals)
+            let cur_line_start = out.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let line_before = &out[cur_line_start..];
+            let line_end = rest.find('\n').map(|p| i + p).unwrap_or(len);
+
+            // 5a. Rust / C# attributes (`#[...]` / `#![...]`) preserved before `#` comment stripping
+            if rest.starts_with("#[") || rest.starts_with("#![") {
+                out.push('#');
+                at_line_start = false;
+                i += 1;
+                continue;
+            }
+
+            // 5b. Hash `#` comment (Python, Ruby, Bash, Perl, YAML, TOML, R, Elixir, Julia, Shebang `#!`)
+            if b == b'#' {
+                let trim_len = out.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                if !at_line_start {
+                    out.truncate(trim_len);
+                }
+                i = line_end;
+                continue;
+            }
+
+            // 5c. Double-slash `//` comment vs Python `//` floor division (`a // b`, `a //= b`)
+            if rest.starts_with("//") {
+                if rest.starts_with("//=") {
+                    out.push_str("//=");
+                    at_line_start = false;
+                    i += 3;
+                    continue;
+                }
+                let after_slashes = &source[i + 2..line_end];
+                if !rest.starts_with("///")
+                    && !rest.starts_with("//!")
+                    && Self::is_python_floor_div(line_before, after_slashes)
+                {
+                    out.push_str("//");
+                    at_line_start = false;
+                    i += 2;
+                    continue;
+                }
+                let trim_len = out.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                if !at_line_start {
+                    out.truncate(trim_len);
+                }
+                i = line_end;
+                continue;
+            }
+
+            // 5d. Double-dash `--` comment (Lua, SQL, Haskell, Ada, VHDL) vs `--` decrement (`i--`, `--i`)
+            if rest.starts_with("--") {
+                if !rest.starts_with("---") && Self::is_decrement_op(bytes, i, line_before) {
+                    out.push_str("--");
+                    at_line_start = false;
+                    i += 2;
+                    continue;
+                }
+                let trim_len = out.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                if !at_line_start {
+                    out.truncate(trim_len);
+                }
+                i = line_end;
+                continue;
+            }
+
+            // 5e. Double-semicolon `;;` comment (Lisp, Clojure, Scheme, WebAssembly WAT), preserving C `for (;;)`
+            if rest.starts_with(";;") && !line_before.contains("for") {
+                let trim_len = out.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                if !at_line_start {
+                    out.truncate(trim_len);
+                }
+                i = line_end;
+                continue;
+            }
+
+            // 5f. Double-percent `%%` comment (Erlang, Prolog, MATLAB, LaTeX)
+            if rest.starts_with("%%") {
+                let trim_len = out.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                if !at_line_start {
+                    out.truncate(trim_len);
+                }
+                i = line_end;
+                continue;
+            }
+
+            // Regular source character
+            if b == b'(' || b == b'[' {
+                paren_depth += 1;
+            } else if b == b')' || b == b']' {
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            at_line_start = false;
+            i += ch.len_utf8();
+        }
+
+        out
+    }
+
+    /// Strip trailing single-line comment (`//`, `#`, `--`, `;;`, `%%`) outside string literals on a single line.
     pub fn strip_trailing_comment(line: &str) -> &str {
         let mut in_single = false;
         let mut in_double = false;
@@ -632,29 +1341,37 @@ impl OmniParser {
             }
 
             if b == b'\'' && !in_double && !in_backtick {
-                in_single = !in_single;
+                if in_single || Self::is_single_quote_literal_start(bytes, i) {
+                    in_single = !in_single;
+                }
             } else if b == b'"' && !in_single && !in_backtick {
                 in_double = !in_double;
             } else if b == b'`' && !in_single && !in_double {
                 in_backtick = !in_backtick;
             } else if !in_single && !in_double && !in_backtick {
-                if b == b'#' {
+                let rest = &line[i..];
+                if b == b'#' && !rest.starts_with("#[") && !rest.starts_with("#![") {
                     return line[..i].trim_end();
                 }
-                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    // Only treat `//` as a C-style comment if there is no assignment `=` on the line
-                    // or if `//` is at the start of the line (`trimmed.starts_with("//")`), preserving Python floor division `q = a // b`.
-                    let prefix = line[..i].trim();
-                    if prefix.is_empty()
-                        || (!prefix.contains('=')
-                            && !prefix.starts_with("return ")
-                            && !prefix.starts_with("if ")
-                            && !prefix.starts_with("elif ")
-                            && !prefix.starts_with("while ")
-                            && !prefix.starts_with("print("))
+                if rest.starts_with("//") && !rest.starts_with("//=") {
+                    if rest.starts_with("///")
+                        || rest.starts_with("//!")
+                        || !Self::is_python_floor_div(&line[..i], &line[i + 2..])
                     {
                         return line[..i].trim_end();
                     }
+                    i += 2;
+                    continue;
+                }
+                if rest.starts_with("--") {
+                    if rest.starts_with("---") || !Self::is_decrement_op(bytes, i, &line[..i]) {
+                        return line[..i].trim_end();
+                    }
+                    i += 2;
+                    continue;
+                }
+                if (rest.starts_with(";;") && !line[..i].contains("for")) || rest.starts_with("%%") {
+                    return line[..i].trim_end();
                 }
             }
             i += 1;
@@ -729,25 +1446,24 @@ impl OmniParser {
         Some((kind.to_string(), name, bases))
     }
 
-    /// Canonicalizes source code: unifies bracket blocks (`{ ... }`), `end` blocks, postfix conditionals,
-    /// and increments (`i++`) into hierarchical canonical AST lines.
+    /// Canonicalizes source code: runs the stateful polyglot comment pre-scanner first, then unifies
+    /// bracket blocks (`{ ... }`), `end` blocks, postfix conditionals, and `++`/`--` into hierarchical AST lines.
     /// Preserves operators like `:=` and `=>` without destructive string replacement.
     pub fn canonicalize_source(source: &str) -> String {
-        let base_indent = source
+        let stripped_source = Self::strip_polyglot_comments(source);
+        let base_indent = stripped_source
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| Self::indent_level(l))
             .min()
             .unwrap_or(0);
 
-        let raw_lines: Vec<&str> = source.lines().collect();
+        let raw_lines: Vec<&str> = stripped_source.lines().collect();
         let mut out_lines = Vec::new();
         let mut brace_depth: usize = 0;
-        let mut in_docstring: Option<&'static str> = None;
-        let mut in_block_comment = false;
 
-        let inc_re = Regex::new(r#"^([a-zA-Z_0-9]+)\+\+$"#).unwrap();
-        let dec_re = Regex::new(r#"^([a-zA-Z_0-9]+)\-\-$"#).unwrap();
+        let inc_re = Regex::new(r#"^(?:([a-zA-Z_0-9]+)\+\+|\+\+([a-zA-Z_0-9]+))$"#).unwrap();
+        let dec_re = Regex::new(r#"^(?:([a-zA-Z_0-9]+)\-\-|\-\-([a-zA-Z_0-9]+))$"#).unwrap();
         let postfix_if_re = Regex::new(r#"^(.*?)\s+if\s+(.*)$"#).unwrap();
 
         let mut idx = 0;
@@ -763,43 +1479,17 @@ impl OmniParser {
                 raw_line
             };
 
-            let stripped = Self::strip_trailing_comment(line);
-            let mut trimmed = stripped.trim();
+            let mut trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            if let Some(quote) = in_docstring {
-                if trimmed.contains(quote) {
-                    in_docstring = None;
-                }
-                continue;
-            }
-
-            if in_block_comment {
-                if trimmed.contains("*/") {
-                    in_block_comment = false;
-                }
-                continue;
-            }
-
-            if trimmed.starts_with("/*") {
-                if !trimmed.ends_with("*/") {
-                    in_block_comment = true;
-                }
-                continue;
-            }
-
-            if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
-                let quote = if trimmed.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
-                if trimmed.len() > 3 && trimmed[3..].contains(quote) {
-                    continue;
-                }
-                in_docstring = Some(quote);
-                continue;
-            }
-
-            if trimmed.starts_with(':') && (trimmed.starts_with(":param") || trimmed.starts_with(":type") || trimmed.starts_with(":return") || trimmed.starts_with(":rtype")) {
+            if trimmed.starts_with(':')
+                && (trimmed.starts_with(":param")
+                    || trimmed.starts_with(":type")
+                    || trimmed.starts_with(":return")
+                    || trimmed.starts_with(":rtype"))
+            {
                 continue;
             }
 
@@ -809,23 +1499,65 @@ impl OmniParser {
             let has_open_delimiter =
                 trimmed.ends_with('(') || trimmed.ends_with('[') || is_dict_assign;
             if has_open_delimiter {
-                let close_char = if trimmed.ends_with('{') { '}' } else if trimmed.ends_with('[') { ']' } else { ')' };
+                let (open_char, close_char) = if trimmed.ends_with('{') {
+                    ('{', '}')
+                } else if trimmed.ends_with('[') {
+                    ('[', ']')
+                } else {
+                    ('(', ')')
+                };
+                let count_delim_delta = |s: &str| -> isize {
+                    let mut delta = 0isize;
+                    let mut in_q: Option<char> = None;
+                    let mut esc = false;
+                    for ch in s.chars() {
+                        if esc {
+                            esc = false;
+                            continue;
+                        }
+                        if in_q.is_some() {
+                            if ch == '\\' {
+                                esc = true;
+                            } else if Some(ch) == in_q {
+                                in_q = None;
+                            }
+                            continue;
+                        }
+                        if ch == '"' || ch == '\'' || ch == '`' {
+                            in_q = Some(ch);
+                        } else if ch == open_char {
+                            delta += 1;
+                        } else if ch == close_char {
+                            delta -= 1;
+                        }
+                    }
+                    delta
+                };
+                let mut delim_depth = count_delim_delta(trimmed);
                 let mut accum_str = trimmed.to_string();
-                while idx < raw_lines.len() {
+                while delim_depth > 0 && idx < raw_lines.len() {
                     let n_raw = raw_lines[idx];
                     idx += 1;
                     let n_stripped = Self::strip_trailing_comment(n_raw).trim();
                     if n_stripped.is_empty() {
                         continue;
                     }
+                    delim_depth += count_delim_delta(n_stripped);
                     accum_str.push(' ');
                     accum_str.push_str(n_stripped);
-                    if n_stripped.contains(close_char) {
-                        break;
-                    }
                 }
-                let current_indent = " ".repeat(Self::indent_level(line));
-                out_lines.push(format!("{}{}", current_indent, accum_str));
+                if accum_str.ends_with(';') {
+                    accum_str.truncate(accum_str.len() - 1);
+                    accum_str = accum_str.trim_end().to_string();
+                }
+                let current_indent = " ".repeat(Self::indent_level(line).max(brace_depth * 4));
+                if !is_dict_assign && accum_str.ends_with('{') {
+                    accum_str = accum_str[..accum_str.len() - 1].trim_end().to_string();
+                    out_lines.push(format!("{}{}", current_indent, accum_str));
+                    brace_depth += 1;
+                } else {
+                    out_lines.push(format!("{}{}", current_indent, accum_str));
+                }
                 continue;
             }
 
@@ -857,12 +1589,12 @@ impl OmniParser {
                 line_str = line_str[..line_str.len() - 3].trim().to_string();
             }
 
-            // 5. Handle C-style increment/decrement: `i++` -> `i = i + 1`
+            // 5. Handle C-style increment/decrement: `i++` / `++i` -> `i = i + 1`
             if let Some(caps) = inc_re.captures(&line_str) {
-                let var = &caps[1];
+                let var = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
                 line_str = format!("{} = {} + 1", var, var);
             } else if let Some(caps) = dec_re.captures(&line_str) {
-                let var = &caps[1];
+                let var = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
                 line_str = format!("{} = {} - 1", var, var);
             }
 
@@ -995,7 +1727,13 @@ impl OmniParser {
             let line = raw_lines[idx];
             let trimmed = line.trim();
 
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            if trimmed.is_empty() || Self::is_hash_comment(trimmed) || trimmed.starts_with("//") {
+                idx += 1;
+                continue;
+            }
+
+            // Inner crate/module attributes (`#![allow(...)]`)
+            if trimmed.starts_with("#![") && trimmed.ends_with(']') {
                 idx += 1;
                 continue;
             }
@@ -1332,7 +2070,7 @@ impl OmniParser {
                         let next_trimmed = next_line.trim();
 
                         if next_trimmed.is_empty()
-                            || next_trimmed.starts_with('#')
+                            || Self::is_hash_comment(next_trimmed)
                             || next_trimmed.starts_with("//")
                             || next_trimmed.starts_with("/*")
                             || next_trimmed.starts_with('*')
@@ -2775,5 +3513,132 @@ def main():
         let f = &module.functions[0];
         assert_eq!(f.name, "add");
         assert_eq!(f.body.len(), 1);
+    }
+
+    #[test]
+    fn test_polyglot_comments_every_language() {
+        let src = r#"#!/usr/bin/env omni
+#![allow(unused)]
+; Assembly / INI full-line comment
+% Erlang / MATLAB / LaTeX full-line comment
+! Fortran 90 full-line comment
+!! Fortran doc comment
+REM BASIC / Batch full-line comment
+rem lowercase batch comment
+=begin
+Ruby multi-line comment with "unclosed quote and # and */ inside
+=end
+=pod
+=head1 Perl POD block
+Ignored documentation with // and /*
+=cut
+%{
+MATLAB multi-line comment with 100 % 3 inside
+%}
+<!-- HTML / XML
+     multi-line comment -->
+{# Jinja2 / Twig
+   template comment #}
+<# PowerShell
+   block comment #>
+#| Common Lisp / Scheme
+   #| nested inner comment |#
+   outer comment |#
+#= Julia
+   #= nested julia comment =#
+   still comment =#
+{- Haskell / Elm
+   {- nested haskell comment -}
+   still comment -}
+(* OCaml / Pascal / ML
+   (* nested ocaml comment *)
+   still comment *)
+###
+CoffeeScript block comment
+###
+--[[ Lua block comment ]]
+--[==[ Lua parameterized
+       ] ] --[[ still inside ]]
+       block comment ]==]
+#[inline]
+def compute(/* inline param comment */ a: int, b: int) -> int:
+    """
+    Standalone Python docstring with unbalanced quote: don't # break */
+    """
+    r"""Raw Python docstring with \x00 and >>> doctests
+    >>> block = compute(1, 2)
+    """
+    '''Single-quoted standalone docstring'''
+    /* prefix block comment preserving 4-space indent */ x = a + b // C++ trailing comment after =
+    int /* mid-token */ y = /* rhs */ 10; /* trailing C block */
+    /* outer Rust block /* nested inner block */ back to outer */
+    /* C glob doc comment matching /*.c without second close */
+    z = x + y -- Lua inline comment
+    --- EmmyLua doc comment
+    w = z + 5 ;; Clojure / Lisp / WAT inline comment
+    total = w + 7 %% Erlang / Prolog / MATLAB inline comment
+    return total // final prose comment with multiple words
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("comment_every_lang", src);
+
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        assert_eq!(f.name, "compute");
+        // Verify `#[inline]` survived `#` comment stripping!
+        assert_eq!(f.annotations.len(), 1);
+        assert_eq!(f.annotations[0].target_expr, "inline");
+        assert_eq!(f.params.len(), 2);
+        assert_eq!(f.params[0].name, "a");
+        assert_eq!(f.params[1].name, "b");
+        // Statements inside compute: x, y, z, w, total, return total => 6 statements
+        assert_eq!(f.body.len(), 6, "Parsed body was: {:#?}", f.body);
+    }
+
+    #[test]
+    fn test_comment_vs_operator_and_attribute_disambiguation() {
+        let src = r#"
+fn borrow<'a>(s: &'a str) -> i32 { // Rust lifetimes must not swallow trailing comment
+    int count = 10; // semicolon C assignment comment
+    count++; // postfix inc
+    ++count; // prefix inc
+    count--; -- Lua comment after postfix dec? No: `;` ended statement!
+    --count; // prefix dec
+    return count; // done
+}
+
+def py_math(a, b):
+    q = a // b # Python floor division preserved while # comment stripped
+    r = a % b # modulo preserved
+    msg = "keep // and /* and # and -- and ;; and %% inside quotes"
+    raw_msg = """keep # inside assigned triple string"""
+    key = cls(*as_ints) # Python *args unpacking must never trigger OCaml (* *)
+    deref = (*ptr) + 1 // C pointer dereference must never trigger OCaml (* *)
+    neg_set = {-1, -2} # Negative set literal must never trigger Haskell {- -}
+    fmt_cont = (
+        "vals %d %d"
+        % (a, b)
+    )
+    return q + r
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("disambig", src);
+
+        let borrow_fn = module.functions.iter().find(|f| f.name == "borrow").expect("borrow fn");
+        assert_eq!(borrow_fn.body.len(), 6, "borrow body: {:#?}", borrow_fn.body);
+
+        let py_fn = module.functions.iter().find(|f| f.name == "py_math").expect("py_math fn");
+        assert_eq!(py_fn.body.len(), 9, "py_math body: {:#?}", py_fn.body);
+        if let Statement::Assign { target, expr, .. } = &py_fn.body[0] {
+            assert_eq!(target, "q");
+            assert_eq!(expr, "a // b");
+        } else {
+            panic!("Expected floor division Assign, got {:?}", py_fn.body[0]);
+        }
+        let stripped = OmniParser::strip_polyglot_comments(src);
+        assert!(stripped.contains("cls(*as_ints)"), "stripped broke *args: {}", stripped);
+        assert!(stripped.contains("(*ptr)"), "stripped broke C deref: {}", stripped);
+        assert!(stripped.contains("{-1, -2}"), "stripped broke negative set: {}", stripped);
+        assert!(stripped.contains("% (a, b)"), "stripped broke multiline % fmt: {}", stripped);
     }
 }

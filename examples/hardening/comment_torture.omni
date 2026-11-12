@@ -1,0 +1,77 @@
+#!/usr/bin/env omni
+#![allow(unused)]
+; x86 Assembly / Lisp / INI full-line comment
+% Erlang / Prolog / MATLAB / LaTeX full-line comment
+! Fortran 90 full-line comment
+!! Fortran module doc comment
+REM BASIC / Batch full-line comment
+=begin
+Ruby multi-line comment containing "unbalanced quotes, # hashes, and */ delimiters
+=end
+=pod
+=head1 Perl POD Documentation
+Ignored multi-line POD section with // and /* markers
+=cut
+%{
+MATLAB / Octave block comment with 99 % 4 inside
+%}
+<!-- HTML / XML / Markdown
+     multi-line comment -->
+{# Jinja2 / Twig
+   template block comment #}
+<# PowerShell
+   multi-line comment #>
+#| Common Lisp / Scheme / Racket
+   #| nested inner block comment |#
+   outer block comment |#
+#= Julia
+   #= nested julia comment =#
+   outer julia comment =#
+{- Haskell / Elm / PureScript
+   {- nested haskell comment -}
+   outer haskell comment -}
+(* OCaml / F# / Pascal / Standard ML
+   (* nested ocaml comment *)
+   outer ocaml comment *)
+###
+CoffeeScript multi-line block comment
+###
+--[[ Lua standard block comment ]]
+--[==[ Lua parameterized long-bracket comment
+       containing ]] and --[[ safely inside ]==]
+
+class CustomVault:
+    """
+    Standalone Python docstring with apostrophe: don't # break */
+    """
+    def __init__(self, key: int):
+        self.key = key // trailing C++ comment after assignment
+
+    #[inline]
+    def encrypt(self, /* inline param comment */ val: int) -> int:
+        /* prefix comment preserving 8-space indent */ return val + self.key
+
+    def send(self, val: int) -> int:
+        return val * 2 -- Lua trailing comment
+
+#[inline]
+def main() -> int:
+    '''Single-quoted standalone docstring'''
+    /// Rust outer doc comment
+    //! Rust inner doc comment
+    /* Rust nested /* inner */ block comment */
+    /* C glob safe-EOF comment matching /*.c */
+    vault = CustomVault(100) # Python trailing comment
+    enc = vault.encrypt(23) ;; Clojure / Lisp / WAT inline comment
+    sent = vault.send(10) %% Erlang / Prolog / MATLAB inline comment
+    q = 85 // 2 # Python floor division preserved (= 42)
+    r = 85 % 2 # Modulo preserved (= 1)
+    int /* mid-decl */ c = /* mid-rhs */ 10; /* trailing C block */
+    c++; // postfix increment (= 11)
+    ++c; // prefix increment (= 12)
+    c--; // postfix decrement (= 11)
+    --- EmmyLua doc comment
+    total = enc + sent + q + r + c // prose comment: 123 + 20 + 42 + 1 + 11 = 197
+    print("Vault total: " + str(total))
+    print("markers: # // /* */ -- ;; %% <!-- -->")
+    return 0
