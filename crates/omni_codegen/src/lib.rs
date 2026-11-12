@@ -9,19 +9,57 @@ pub fn host_target_triple() -> &'static str {
     omni_runtime::host_target_triple()
 }
 
+// First-class LLVM value type lattice for lossless 64-bit integer, IEEE-754 `double`, and pointer lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrType {
+    I64,
+    I32,
+    F64,
+    I1,
+    Ptr,
+    StructPtr(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedValue {
+    pub reg: String,
+    pub ty: IrType,
+}
+
 // Type-hint substrings that require 64-bit / pointer-width ABI slots instead of 32-bit integer truncation.
 const ABI_64BIT_SUBSTRINGS: &[&str] = &[
-    "string", "char*", "tuple", "list", "slice", "dict", "map",
+    "string", "char*", "error", "tuple", "list", "slice", "dict", "map",
 ];
 
 // Exact scalar type names mapped to 64-bit LLVM registers (`i64`).
 const ABI_64BIT_EXACT: &[&str] = &[
-    "i64", "u64", "long", "usize", "int64",
+    "i64", "u64", "long", "usize", "isize", "int64", "uint64", "int",
 ];
 
-// Type-hint substrings representing raw C string pointers (`i8*`).
+// Exact/substring type annotations mapped to IEEE-754 64-bit `double`.
+const FLOAT_TYPE_HINTS: &[&str] = &[
+    "double", "float", "f64", "f32", "float64", "float32",
+];
+
+// Polyglot float cast prefixes lowered to `sitofp` / `@__omni_c_str_to_f64`.
+const FLOAT_CAST_PREFIXES: &[&str] = &[
+    "float(", "f64(", "float64(", "double(", "f64::from(", "f32::from(",
+];
+
+// Polyglot integer cast prefixes lowered to 64-bit `i64` (`fptosi` / `@__omni_c_str_to_i64` / `sext`).
+const INT_CAST_PREFIXES: &[&str] = &[
+    "u32::from(", "u64::from(", "i32::from(", "i64::from(", "usize::from(",
+    "uint64(", "uint32(", "uint16(", "uint8(", "int64(", "int32(", "int(", "byte(",
+];
+
+// Polyglot string cast prefixes lowered to `eval_str_ptr`.
+const STRING_CAST_PREFIXES: &[&str] = &[
+    "str(", "String(", "tostring(",
+];
+
+// Type-hint substrings representing raw C string or Go `error` message pointers (`i8*`).
 const STRING_HINT_SUBSTRINGS: &[&str] = &[
-    "string", "char*",
+    "string", "char*", "error",
 ];
 
 // Canonical POSIX `<sys/socket.h>` / `<netinet/in.h>` constants lowered without LLM round-trips.
@@ -35,19 +73,21 @@ const POSIX_SOCKET_CONSTANTS: &[(&str, &str)] = &[
     ("socket.SOCK_DGRAM", "2"),
     ("SOCK_DGRAM", "2"),
     ("socket.SOL_SOCKET", "1"),
-    ("SOL_SOCKET", "1"),
-    ("socket.SO_REUSEADDR", "2"),
+    ("socket.SOL_SOCKET", "1"),
     ("SO_REUSEADDR", "2"),
+    ("socket.SO_REUSEADDR", "2"),
     ("socket.IPPROTO_MPTCP", "262"),
     ("IPPROTO_MPTCP", "262"),
 ];
 
-// Receiver-qualified constructors lowered directly to OS socket/thread/pipe runtime primitives.
+// Receiver-qualified constructors lowered directly to OS socket/thread/pipe/error runtime primitives.
 const NATIVE_MODULE_CONSTRUCTORS: &[(&str, &str)] = &[
     ("socket", "socket"),
     ("threading", "Thread"),
     ("mp", "Pipe"),
     ("mp", "Process"),
+    ("errors", "New"),
+    ("fmt", "Errorf"),
 ];
 
 // Method names intercepted by deterministic C runtime intrinsics when not overridden by a user `%struct.*`.
@@ -59,11 +99,34 @@ const NATIVE_RUNTIME_METHODS: &[&str] = &[
 
 // Call substrings handled natively by deterministic lowering rather than external FFI synthesis.
 const NATIVE_CALL_PATTERNS: &[&str] = &[
-    "Thread(", "Process(", "rsa.encrypt(", "rsa.decrypt(", "randnum",
+    "Thread(", "Process(", "rsa.encrypt(", "rsa.decrypt(", "randnum", "errors.New(", "fmt.Errorf(",
 ];
 
 // Self/class receiver keywords excluded from external foreign-module classification.
 const SELF_RECEIVERS: &[&str] = &["self", "this", "cls"];
+
+// Standard C / system library functions invoked via direct vararg FFI.
+const NATIVE_C_LIB_FNS: &[&str] = &[
+    "compressBound", "compress", "uncompress", "crc32", "adler32",
+    "sqlite3_open", "sqlite3_close", "sqlite3_exec", "sqlite3_errmsg",
+    "abs", "labs", "atoi", "atol", "strlen", "strcpy", "strncpy", "strcat",
+    "strncmp", "strchr", "strstr", "memcpy", "memmove", "memset", "memcmp",
+    "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
+    "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
+    "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
+];
+
+// Subset of `NATIVE_C_LIB_FNS` whose C ABI return width on LP64 / 64-bit targets is `i64` (`uLong` / `size_t` / `long`).
+const NATIVE_C_LIB_I64_FNS: &[&str] = &[
+    "compressBound", "strlen", "atol", "labs", "time", "ftell",
+];
+
+/// Classifies whether a parsed type annotation maps to IEEE-754 `double`.
+#[inline]
+pub fn is_float_type_hint(type_hint: &str) -> bool {
+    let tl = type_hint.trim().to_lowercase();
+    FLOAT_TYPE_HINTS.contains(&tl.as_str())
+}
 
 /// Classifies whether a parsed type annotation requires a 64-bit / pointer-width LLVM slot.
 #[inline]
@@ -71,19 +134,218 @@ pub fn is_64bit_type_hint(type_hint: &str) -> bool {
     if type_hint.ends_with('*') {
         return true;
     }
-    let tl = type_hint.to_lowercase();
+    let tl = type_hint.trim().to_lowercase();
     ABI_64BIT_EXACT.contains(&tl.as_str())
         || ABI_64BIT_SUBSTRINGS.iter().any(|tok| tl.contains(tok))
 }
 
-/// Classifies whether a type annotation represents a C string pointer (`i8*` / `String` / `char*`).
+/// Classifies whether a type annotation represents a C string or Go `error` pointer (`i8*`).
 #[inline]
 pub fn is_string_type_hint(type_hint: &str) -> bool {
     if type_hint == "i8*" {
         return true;
     }
+    if type_hint.contains("omni_slice")
+        || type_hint.contains("omni_map")
+        || type_hint.contains("omni_chan")
+        || type_hint.contains("omni_fn")
+        || type_hint.contains("omni_unpack")
+    {
+        return false;
+    }
     let tl = type_hint.to_lowercase();
     STRING_HINT_SUBSTRINGS.iter().any(|tok| tl.contains(tok))
+}
+
+#[inline]
+fn is_null_literal(expr: &str) -> bool {
+    matches!(expr.trim(), "null" | "nil" | "None")
+}
+
+fn classify_type_token(tok: &str, class_fields: &HashMap<String, HashMap<String, usize>>) -> IrType {
+    let clean = tok
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches('&')
+        .trim_end_matches('*')
+        .trim();
+    if is_float_type_hint(clean) {
+        IrType::F64
+    } else if is_string_type_hint(clean) || clean == "str" || clean == "bytes" {
+        IrType::Ptr
+    } else if class_fields.contains_key(clean) {
+        IrType::StructPtr(clean.to_string())
+    } else if clean == "bool" || clean == "boolean" || clean == "i1" {
+        IrType::I1
+    } else {
+        IrType::I64
+    }
+}
+
+fn parse_tuple_return_types(
+    ret_hint: &str,
+    class_fields: &HashMap<String, HashMap<String, usize>>,
+) -> Option<Vec<IrType>> {
+    let t = ret_hint.trim();
+    let inner = if t.starts_with('(') && t.ends_with(')') {
+        &t[1..t.len() - 1]
+    } else if let Some(open_b) = t.find('[') {
+        let head = t[..open_b].trim().to_lowercase();
+        if (head.ends_with("tuple") || head == "pair") && t.ends_with(']') {
+            &t[open_b + 1..t.len() - 1]
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    let parts = omni_parser::OmniParser::split_respecting_quotes(inner, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(
+        parts
+            .iter()
+            .map(|p| {
+                let pt = p.trim();
+                // Support Go named return slots like `(quot int64, err error)`
+                let ty_part = pt.split_whitespace().last().unwrap_or(pt);
+                classify_type_token(ty_part, class_fields)
+            })
+            .collect(),
+    )
+}
+
+// Parses decimal, hex (`0x`), binary (`0b`), and octal (`0o`) 64-bit integer literals with optional `_` separators.
+fn parse_polyglot_i64(raw: &str) -> Option<i64> {
+    let s = raw.trim().replace('_', "");
+    if s.is_empty() {
+        return None;
+    }
+    let s_clean = s
+        .trim_end_matches("LL")
+        .trim_end_matches("ll")
+        .trim_end_matches("i64")
+        .trim_end_matches("u64")
+        .trim_end_matches('L');
+    if s_clean.is_empty() {
+        return None;
+    }
+    let (neg, rest) = if let Some(r) = s_clean.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s_clean.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s_clean)
+    };
+    let val_u64 = if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if let Some(bin) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        u64::from_str_radix(bin, 2).ok()?
+    } else if let Some(oct) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+        u64::from_str_radix(oct, 8).ok()?
+    } else {
+        if rest.contains('.') || rest.contains('e') || rest.contains('E') {
+            return None;
+        }
+        rest.parse::<u64>().ok()?
+    };
+    if neg {
+        Some((val_u64 as i64).wrapping_neg())
+    } else {
+        Some(val_u64 as i64)
+    }
+}
+
+// Parses IEEE-754 floating-point literals (`3.14`, `-0.25`, `1.5e-3`, `2e6`, `4.0f64`).
+fn parse_polyglot_f64(raw: &str) -> Option<f64> {
+    let s = raw.trim().replace('_', "");
+    if s.is_empty() {
+        return None;
+    }
+    let body = s.trim_start_matches(['+', '-']);
+    if body.starts_with("0x") || body.starts_with("0X") || body.starts_with("0b") || body.starts_with("0B") || body.starts_with("0o") || body.starts_with("0O") {
+        return None;
+    }
+    let clean = s
+        .trim_end_matches("f64")
+        .trim_end_matches("f32")
+        .trim_end_matches('f');
+    if !clean.contains('.') && !clean.contains('e') && !clean.contains('E') {
+        return None;
+    }
+    clean.parse::<f64>().ok()
+}
+
+// Formats an `f64` into LLVM IR's exact 64-bit IEEE-754 hexadecimal `double` literal (`0x...`).
+#[inline]
+fn format_llvm_f64(val: f64) -> String {
+    format!("0x{:016X}", val.to_bits())
+}
+
+// Splits a top-level ternary expression `cond ? then_expr : else_expr` outside quotes and parens/brackets.
+fn split_ternary_expr(expr: &str) -> Option<(&str, &str, &str)> {
+    let bytes = expr.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0i32;
+    let mut in_q: Option<u8> = None;
+    let mut q_idx = None;
+    let mut colon_idx = None;
+    let mut ternary_nest = 0i32;
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if let Some(q) = in_q {
+            if b == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_q = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => in_q = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'?' if depth == 0 => {
+                // Ignore Rust `?` postfix or C# `?.` / `??`
+                let next = bytes.get(i + 1).copied();
+                if next != Some(b'.') && next != Some(b'?') && i + 1 < len {
+                    if q_idx.is_none() {
+                        q_idx = Some(i);
+                    } else {
+                        ternary_nest += 1;
+                    }
+                }
+            }
+            b':' if depth == 0 && q_idx.is_some() => {
+                if bytes.get(i + 1) == Some(&b':') || bytes.get(i.wrapping_sub(1)) == Some(&b':') {
+                    i += 1;
+                    continue;
+                }
+                if ternary_nest == 0 {
+                    colon_idx = Some(i);
+                    break;
+                } else {
+                    ternary_nest -= 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let qi = q_idx?;
+    let ci = colon_idx?;
+    let cond = expr[..qi].trim();
+    let tr = expr[qi + 1..ci].trim();
+    let fa = expr[ci + 1..].trim();
+    if cond.is_empty() || tr.is_empty() || fa.is_empty() {
+        return None;
+    }
+    Some((cond, tr, fa))
 }
 
 // Advances `temp_counter` past all `%<stem>_<N>` registers emitted in an AI-synthesized IR snippet
@@ -110,6 +372,7 @@ pub enum CleanupOp {
     DestroySlice(String),
     DestroyMap(String),
     DestroyChan(String),
+    PopTryFrame,
 }
 
 #[derive(Debug, Clone)]
@@ -128,8 +391,13 @@ pub struct ScopeTree {
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
     pub method_defining_class: HashMap<(String, String), String>,
+    pub fn_return_types: HashMap<String, IrType>,
+    pub fn_tuple_return_types: HashMap<String, Vec<IrType>>,
+    pub method_return_types: HashMap<(String, String), IrType>,
     pub loop_exit_labels: Vec<String>,
     pub loop_cond_labels: Vec<String>,
+    pub loop_entry_try_depths: Vec<usize>,
+    pub active_try_depth: usize,
 }
 
 impl ScopeTree {
@@ -141,8 +409,13 @@ impl ScopeTree {
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
             method_defining_class: HashMap::new(),
+            fn_return_types: HashMap::new(),
+            fn_tuple_return_types: HashMap::new(),
+            method_return_types: HashMap::new(),
             loop_exit_labels: Vec::new(),
             loop_cond_labels: Vec::new(),
+            loop_entry_try_depths: Vec::new(),
+            active_try_depth: 0,
         }
     }
 
@@ -177,11 +450,13 @@ impl ScopeTree {
     pub fn is_natively_routed_call(&self, rec: &str, method: &str, parts: &[&str], full_expr: &str) -> bool {
         NATIVE_MODULE_CONSTRUCTORS.contains(&(rec, method))
             || NATIVE_RUNTIME_METHODS.contains(&method)
+            || NATIVE_C_LIB_FNS.contains(&method)
             || NATIVE_CALL_PATTERNS.iter().any(|pat| full_expr.contains(pat))
             || SELF_RECEIVERS.contains(&rec)
             || rec.starts_with('"')
             || rec.starts_with('\'')
             || self.known_functions.contains(method)
+            || self.known_functions.contains(&format!("{}_{}", rec, method))
             || parts.iter().any(|p| self.class_fields.contains_key(*p))
             || self.method_defining_class.iter().any(|((_, m), _)| m == method)
     }
@@ -267,7 +542,7 @@ impl<'a> CodeGenerator<'a> {
     pub fn new(engine: &'a dyn InferenceEngine) -> Self {
         Self {
             engine,
-            cmp_re: Regex::new(r#"^\s*(.*?)\s*(==|!=|<=|>=|<|>)\s*(.*?)\s*$"#).unwrap(),
+            cmp_re: Regex::new(r#"^\s*(.*?)\s*(===|!==|==|!=|~=|<=|>=|<|>)\s*(.*?)\s*$"#).unwrap(),
             idx_re: Regex::new(r#"^([a-zA-Z_0-9]+)\[(.+?)\]$"#).unwrap(),
             len_re: Regex::new(r#"^len\s*\(\s*([a-zA-Z_0-9]+)\s*\)$"#).unwrap(),
             pop_re: Regex::new(r#"^([a-zA-Z_0-9]+)\.pop\s*\(\s*\)$"#).unwrap(),
@@ -414,8 +689,70 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
                     ir.push_str(&format!("  call void @__omni_chan_destroy(i8* {})\n", loaded));
                 }
+                CleanupOp::PopTryFrame => {
+                    ir.push_str(&format!("  ; [Unwind Try Frame Pop at {}]\n", context));
+                    ir.push_str("  call void @__omni_try_pop()\n");
+                }
             }
         }
+    }
+
+    /// Parses Python `raise [ExcType(msg)] [from cause]` and JS/Java/C++ `throw [new] ExcType(msg)` / `throw expr`.
+    /// Returns `Some((None, None))` for bare rethrow (`raise` / `throw`), or `Some((Some(type_name), msg_expr))`.
+    fn parse_raise_or_throw(code: &str) -> Option<(Option<String>, Option<String>)> {
+        let trimmed = code.trim().trim_end_matches(';').trim();
+        if trimmed == "raise" || trimmed == "throw" {
+            return Some((None, None));
+        }
+        let rest = if let Some(r) = trimmed.strip_prefix("raise ") {
+            r.trim()
+        } else if let Some(r) = trimmed.strip_prefix("throw ") {
+            r.trim()
+        } else {
+            return None;
+        };
+        if rest.is_empty() {
+            return Some((None, None));
+        }
+        // Strip Python exception chaining suffix: `raise ValueError("x") from err`
+        let core = if let Some(idx) = rest.rfind(" from ") {
+            let suffix = rest[idx + 6..].trim();
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+                rest[..idx].trim()
+            } else {
+                rest
+            }
+        } else {
+            rest
+        };
+        let core = core.strip_prefix("new ").map(|s| s.trim()).unwrap_or(core);
+        if let Some(lp) = core.find('(') {
+            if core.ends_with(')') {
+                let ty_cand = core[..lp].trim();
+                if !ty_cand.is_empty()
+                    && ty_cand.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                {
+                    let inside = core[lp + 1..core.len() - 1].trim();
+                    let args = omni_parser::OmniParser::split_respecting_quotes(inside, ',');
+                    let msg_expr = args
+                        .first()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    return Some((Some(ty_cand.to_string()), msg_expr));
+                }
+            }
+        }
+        // Bare exception class `raise StopIteration` vs value `throw "bad"`
+        if core
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false)
+            && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            return Some((Some(core.to_string()), None));
+        }
+        Some((Some("Exception".to_string()), Some(core.to_string())))
     }
 
     fn split_binary_expr(expr: &str) -> Option<(String, String, String)> {
@@ -476,6 +813,11 @@ impl<'a> CodeGenerator<'a> {
             if c == ')' { depth += 1; }
             else if c == '(' { depth -= 1; }
             if depth == 0 && (c == '<' || c == '>') {
+                if i >= 2 && c == '>' && chars[i - 1] == '>' && chars[i - 2] == '>' {
+                    let left: String = chars[..i - 2].iter().collect();
+                    let right: String = chars[i + 1..].iter().collect();
+                    return Some((left.trim().to_string(), ">>>".to_string(), right.trim().to_string()));
+                }
                 if i > 0 && chars[i - 1] == c {
                     let left: String = chars[..i - 1].iter().collect();
                     let right: String = chars[i + 1..].iter().collect();
@@ -498,11 +840,25 @@ impl<'a> CodeGenerator<'a> {
             if c == ')' { depth += 1; }
             else if c == '(' { depth -= 1; }
             if depth == 0 && (c == '+' || c == '-') {
-                let prev = chars[i - 1];
-                if prev != '+' && prev != '-' && prev != '*' && prev != '/' && prev != '%' && prev != '(' {
-                    let left: String = chars[..i].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
+                // Do not split IEEE-754 scientific notation exponents (e.g. `1.5e-3`, `2e+6`)
+                if (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                    && i >= 2
+                    && (chars[i - 2].is_ascii_digit() || chars[i - 2] == '.')
+                    && !trimmed.starts_with("0x")
+                    && !trimmed.starts_with("0X")
+                {
+                    continue;
+                }
+                let prev_non_ws = chars[..i].iter().rev().find(|ch| !ch.is_whitespace()).copied();
+                if let Some(prev) = prev_non_ws {
+                    if !matches!(
+                        prev,
+                        '+' | '-' | '*' | '/' | '%' | '(' | ',' | '^' | '&' | '|' | '<' | '>' | '=' | '?' | ':'
+                    ) {
+                        let left: String = chars[..i].iter().collect();
+                        let right: String = chars[i + 1..].iter().collect();
+                        return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
+                    }
                 }
             }
         }
@@ -616,6 +972,13 @@ impl<'a> CodeGenerator<'a> {
                 }
                 Statement::Concrete { code, .. } => {
                     scan_text(code, string_constants, counter);
+                    if let Some((exc_ty_opt, _)) = Self::parse_raise_or_throw(code) {
+                        Self::intern_string(string_constants, counter, "");
+                        Self::intern_string(string_constants, counter, "Exception");
+                        if let Some(exc_ty) = exc_ty_opt {
+                            Self::intern_string(string_constants, counter, &exc_ty);
+                        }
+                    }
                 }
                 Statement::Match { arms, .. } => {
                     for arm in arms {
@@ -638,8 +1001,13 @@ impl<'a> CodeGenerator<'a> {
                     self.scan_strings_recursive(body, string_constants, counter);
                 }
                 Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    Self::intern_string(string_constants, counter, "");
+                    Self::intern_string(string_constants, counter, "Exception");
                     self.scan_strings_recursive(try_block, string_constants, counter);
                     for c in catch_clauses {
+                        if let Some(ref et) = c.exception_type {
+                            Self::intern_string(string_constants, counter, et);
+                        }
                         self.scan_strings_recursive(&c.body, string_constants, counter);
                     }
                     if let Some(ref fb) = finally_block {
@@ -665,9 +1033,13 @@ impl<'a> CodeGenerator<'a> {
         if trimmed.starts_with("input(") || trimmed == "input()" {
             return true;
         }
-        if (trimmed.starts_with("str(")
-            || trimmed.starts_with("String(")
-            || trimmed.starts_with("tostring("))
+        if STRING_CAST_PREFIXES
+            .iter()
+            .any(|p| trimmed.starts_with(p) && trimmed.ends_with(')'))
+        {
+            return true;
+        }
+        if (trimmed.starts_with("errors.New(") || trimmed.starts_with("fmt.Errorf("))
             && trimmed.ends_with(')')
         {
             return true;
@@ -684,6 +1056,14 @@ impl<'a> CodeGenerator<'a> {
         for pat in &[".getpeername(", ".recv(", ".join("] {
             if let Some(lp) = trimmed.find(pat) {
                 if !trimmed[..lp].contains('(') {
+                    return true;
+                }
+            }
+        }
+        if let Some(lp) = trimmed.find('(') {
+            if trimmed.ends_with(')') {
+                let callee = trimmed[..lp].trim();
+                if let Some(IrType::Ptr) = scope_tree.fn_return_types.get(callee) {
                     return true;
                 }
             }
@@ -743,6 +1123,22 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
+        if is_null_literal(trimmed) {
+            return "null".to_string();
+        }
+
+        // Go `errors.New(msg)` / `fmt.Errorf(fmt, ...)` error string constructors
+        for err_prefix in &["errors.New(", "fmt.Errorf("] {
+            if trimmed.starts_with(err_prefix) && trimmed.ends_with(')') {
+                let inner = trimmed[err_prefix.len()..trimmed.len() - 1].trim();
+                let args = omni_parser::OmniParser::split_respecting_quotes(inner, ',');
+                if let Some(first) = args.first() {
+                    return self.eval_str_ptr(first.trim(), ir, scope_tree, string_constants, temp_counter);
+                }
+                return "null".to_string();
+            }
+        }
+
         // Python UTF-8 str/bytes identity on `i8*` buffers, skipped if receiver defines a custom method.
         if trimmed.ends_with(".decode()") {
             let base = trimmed[..trimmed.len() - 9].trim();
@@ -757,8 +1153,22 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
+        // Top-level ternary conditional returning `i8*` (`cond ? then_str : else_str`)
+        if let Some((cond_s, tr_s, fa_s)) = split_ternary_expr(trimmed) {
+            let cond_v = self.eval_cond(cond_s, ir, scope_tree, string_constants, temp_counter);
+            let tr_p = self.eval_str_ptr(tr_s, ir, scope_tree, string_constants, temp_counter);
+            let fa_p = self.eval_str_ptr(fa_s, ir, scope_tree, string_constants, temp_counter);
+            let tern_ptr = format!("%tern_str_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = select i1 {}, i8* {}, i8* {}\n",
+                tern_ptr, cond_v, tr_p, fa_p
+            ));
+            return tern_ptr;
+        }
+
         // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
-        for prefix in &["str(", "String(", "tostring("] {
+        for prefix in STRING_CAST_PREFIXES {
             if trimmed.starts_with(prefix) && trimmed.ends_with(')') {
                 let fn_ident = prefix.trim_end_matches('(');
                 if !scope_tree.known_functions.contains(fn_ident) {
@@ -848,6 +1258,19 @@ impl<'a> CodeGenerator<'a> {
                     if b.type_hint.starts_with("%struct.") {
                         let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                         if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fld)) {
+                            let is_float_fld = scope_tree
+                                .class_field_types
+                                .get(cls_name)
+                                .and_then(|m| m.get(fld))
+                                .map(|th| is_float_type_hint(th))
+                                .unwrap_or(false);
+                            let is_str_fld = scope_tree
+                                .class_field_types
+                                .get(cls_name)
+                                .and_then(|m| m.get(fld))
+                                .map(|th| th.starts_with("i8*") || is_string_type_hint(th))
+                                .unwrap_or(false);
+
                             let inst_ld = format!("%inst_fld_str_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
@@ -857,10 +1280,25 @@ impl<'a> CodeGenerator<'a> {
                             let val64 = format!("%val64_str_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
-                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
-                            return str_ptr;
+                            if is_str_fld {
+                                let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
+                                return str_ptr;
+                            } else if is_float_fld {
+                                let fval = format!("%fld_f64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, val64));
+                                let fstr = format!("%fld_fstr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_float_to_str(double {})\n", fstr, fval));
+                                return fstr;
+                            } else {
+                                let istr = format!("%fld_istr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", istr, val64));
+                                return istr;
+                            }
                         }
                     }
                 }
@@ -869,62 +1307,294 @@ impl<'a> CodeGenerator<'a> {
 
         // 4. Local string variable in scope
         if let Some(b) = scope_tree.resolve(trimmed) {
-            if b.type_hint.starts_with("i8*") {
-                let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = load i8*, i8** {}\n", str_ptr, b.llvm_ptr));
-                return str_ptr;
-            } else if is_string_type_hint(&b.type_hint) {
-                let val64 = format!("%var_val64_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, b.llvm_ptr));
-                let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
-                return str_ptr;
+            if is_string_type_hint(&b.type_hint) {
+                if b.type_hint.starts_with("i8*") {
+                    let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", str_ptr, b.llvm_ptr));
+                    return str_ptr;
+                } else {
+                    let val64 = format!("%var_val64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, b.llvm_ptr));
+                    let str_ptr = format!("%var_str_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", str_ptr, val64));
+                    return str_ptr;
+                }
             }
         }
 
-        // 5. Fallback: evaluate integer / expression and convert to string via @__omni_int_to_str
-        let int_val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
-        if trimmed.ends_with(')') {
-            let ret_ptr = format!("%call_str_ptr_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", ret_ptr));
-            let is_non_null = format!("%call_str_non_null_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", is_non_null, ret_ptr));
-            let ext = format!("%ext_concat_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, int_val));
-            let int_str = format!("%int_str_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, ext));
-            let sel_str = format!("%sel_str_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, is_non_null, ret_ptr, int_str));
-            return sel_str;
+        // 5. Typed fallback: format `double` via `@__omni_float_to_str`, pass `i8*`, or format `i64` via `@__omni_int_to_str`
+        let tv = self.eval_typed(trimmed, ir, scope_tree, string_constants, temp_counter);
+        match tv.ty {
+            IrType::F64 => {
+                let flt_str = format!("%flt_str_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @__omni_float_to_str(double {})\n", flt_str, tv.reg));
+                flt_str
+            }
+            IrType::Ptr => tv.reg,
+            IrType::StructPtr(cls) => {
+                let raw = format!("%struct_str_cast_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw, cls, tv.reg));
+                raw
+            }
+            IrType::I64 | IrType::I32 | IrType::I1 => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                if trimmed.ends_with(')') {
+                    let ret_ptr = format!("%call_str_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", ret_ptr));
+                    let is_non_null = format!("%call_str_non_null_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", is_non_null, ret_ptr));
+                    let int_str = format!("%int_str_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, v64));
+                    let sel_str = format!("%sel_str_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, is_non_null, ret_ptr, int_str));
+                    return sel_str;
+                }
+                let int_str = format!("%int_str_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, v64));
+                int_str
+            }
         }
-        let ext = format!("%ext_concat_{}", *temp_counter);
-        *temp_counter += 1;
-        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, int_val));
-        let int_str = format!("%int_str_{}", *temp_counter);
-        *temp_counter += 1;
-        ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", int_str, ext));
-        int_str
     }
 
-    /// Evaluates an expression or variable into an LLVM i32 register
-    fn eval_val(
+    fn strip_kwarg_prefix(arg: &str) -> &str {
+        let trimmed = arg.trim();
+        if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+            return trimmed;
+        }
+        if let Some((lhs, rhs)) = trimmed.split_once('=') {
+            if !rhs.starts_with('=')
+                && !lhs.ends_with('!')
+                && !lhs.ends_with('<')
+                && !lhs.ends_with('>')
+                && !lhs.trim().is_empty()
+                && lhs
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return rhs.trim();
+            }
+        }
+        trimmed
+    }
+
+    fn coerce_to_i64(&self, tv: TypedValue, ir: &mut String, temp_counter: &mut usize) -> String {
+        match tv.ty {
+            IrType::I64 => tv.reg,
+            IrType::I32 => {
+                if tv.reg.parse::<i64>().is_ok() {
+                    tv.reg
+                } else {
+                    let ext = format!("%sext64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, tv.reg));
+                    ext
+                }
+            }
+            IrType::I1 => {
+                let ext = format!("%zext64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = zext i1 {} to i64\n", ext, tv.reg));
+                ext
+            }
+            IrType::F64 => {
+                let f2i = format!("%fptosi64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = fptosi double {} to i64\n", f2i, tv.reg));
+                f2i
+            }
+            IrType::Ptr => {
+                if tv.reg == "null" {
+                    "0".to_string()
+                } else {
+                    let p2i = format!("%p2i64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p2i, tv.reg));
+                    p2i
+                }
+            }
+            IrType::StructPtr(cls) => {
+                if tv.reg == "null" {
+                    "0".to_string()
+                } else {
+                    let p2i = format!("%sp2i64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = ptrtoint %struct.{}* {} to i64\n", p2i, cls, tv.reg));
+                    p2i
+                }
+            }
+        }
+    }
+
+    /// Packs any `TypedValue` into a lossless 64-bit ABI slot (`double` is `bitcast` to `i64` rather than truncated).
+    fn coerce_to_raw_i64_bits(
+        &self,
+        tv: TypedValue,
+        ir: &mut String,
+        temp_counter: &mut usize,
+    ) -> String {
+        if tv.ty == IrType::F64 {
+            let bits = format!("%f64_bits_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = bitcast double {} to i64\n", bits, tv.reg));
+            bits
+        } else {
+            self.coerce_to_i64(tv, ir, temp_counter)
+        }
+    }
+
+    fn coerce_to_i32(&self, tv: TypedValue, ir: &mut String, temp_counter: &mut usize) -> String {
+        match tv.ty {
+            IrType::I32 => tv.reg,
+            IrType::I64 => {
+                if let Ok(n64) = tv.reg.parse::<i64>() {
+                    (n64 as i32).to_string()
+                } else {
+                    let tr = format!("%trunc32_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", tr, tv.reg));
+                    tr
+                }
+            }
+            IrType::I1 => {
+                let ext = format!("%zext32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = zext i1 {} to i32\n", ext, tv.reg));
+                ext
+            }
+            IrType::F64 => {
+                let f2i = format!("%fptosi32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = fptosi double {} to i32\n", f2i, tv.reg));
+                f2i
+            }
+            IrType::Ptr | IrType::StructPtr(_) => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                if v64 == "0" {
+                    "0".to_string()
+                } else {
+                    let tr = format!("%ptr_trunc32_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", tr, v64));
+                    tr
+                }
+            }
+        }
+    }
+
+    fn coerce_to_f64(&self, tv: TypedValue, ir: &mut String, temp_counter: &mut usize) -> String {
+        match tv.ty {
+            IrType::F64 => tv.reg,
+            IrType::I64 => {
+                let cvt = format!("%sitofp64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = sitofp i64 {} to double\n", cvt, tv.reg));
+                cvt
+            }
+            IrType::I32 => {
+                let cvt = format!("%sitofp32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = sitofp i32 {} to double\n", cvt, tv.reg));
+                cvt
+            }
+            IrType::I1 => {
+                let cvt = format!("%uitofp1_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = uitofp i1 {} to double\n", cvt, tv.reg));
+                cvt
+            }
+            IrType::Ptr | IrType::StructPtr(_) => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                let cvt = format!("%psitofp_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = sitofp i64 {} to double\n", cvt, v64));
+                cvt
+            }
+        }
+    }
+
+    fn coerce_to_ptr(&self, tv: TypedValue, ir: &mut String, temp_counter: &mut usize) -> String {
+        match tv.ty {
+            IrType::Ptr => tv.reg,
+            IrType::StructPtr(cls) => {
+                if tv.reg == "null" {
+                    "null".to_string()
+                } else {
+                    let bc = format!("%sp_to_i8_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", bc, cls, tv.reg));
+                    bc
+                }
+            }
+            _ => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                if v64 == "0" {
+                    "null".to_string()
+                } else {
+                    let i2p = format!("%i64_to_p_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", i2p, v64));
+                    i2p
+                }
+            }
+        }
+    }
+
+    fn apply_return_ir_type(
+        ret_i64_reg: String,
+        ret_ty: Option<&IrType>,
+        ir: &mut String,
+        temp_counter: &mut usize,
+    ) -> TypedValue {
+        match ret_ty {
+            Some(IrType::F64) => {
+                let f_reg = format!("%ret_f64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = bitcast i64 {} to double\n", f_reg, ret_i64_reg));
+                TypedValue { reg: f_reg, ty: IrType::F64 }
+            }
+            Some(IrType::Ptr) => {
+                let p_reg = format!("%ret_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", p_reg, ret_i64_reg));
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p_reg));
+                TypedValue { reg: p_reg, ty: IrType::Ptr }
+            }
+            Some(IrType::StructPtr(cls)) => {
+                let sp_reg = format!("%ret_sptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", sp_reg, ret_i64_reg, cls));
+                let raw_p = format!("%ret_rawp_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_p, cls, sp_reg));
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_p));
+                TypedValue { reg: sp_reg, ty: IrType::StructPtr(cls.clone()) }
+            }
+            _ => TypedValue { reg: ret_i64_reg, ty: IrType::I64 },
+        }
+    }
+
+    /// Evaluates an expression into a first-class 64-bit `TypedValue` (`I64`, `F64`, `Ptr`, `StructPtr`, `I32`, `I1`).
+    pub fn eval_typed(
         &self,
         expr: &str,
         ir: &mut String,
         scope_tree: &ScopeTree,
         string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
-    ) -> String {
+    ) -> TypedValue {
         let trimmed = expr.trim();
-        if trimmed.starts_with('(') && trimmed.ends_with(')') && !trimmed.contains(',') {
+        if trimmed.starts_with('(') && trimmed.ends_with(')') {
             let mut depth = 0;
             let mut wraps_all = true;
             let chars: Vec<char> = trimmed.chars().collect();
@@ -937,16 +1607,34 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
             if wraps_all {
-                return self.eval_val(&trimmed[1..trimmed.len() - 1], ir, scope_tree, string_constants, temp_counter);
+                let inner = trimmed[1..trimmed.len() - 1].trim();
+                if !inner.contains(',') {
+                    return self.eval_typed(inner, ir, scope_tree, string_constants, temp_counter);
+                } else if let Some(single_tuple_elem) = inner.strip_suffix(',') {
+                    if !single_tuple_elem.contains(',') {
+                        return self.eval_typed(single_tuple_elem.trim(), ir, scope_tree, string_constants, temp_counter);
+                    }
+                }
             }
         }
 
-        // 1. Integer constant
-        if let Ok(num) = trimmed.parse::<i32>() {
-            return num.to_string();
+        // 1a. IEEE-754 double literal (`3.14159`, `1.5e-3`, `2e6`)
+        if let Some(fv) = parse_polyglot_f64(trimmed) {
+            return TypedValue {
+                reg: format_llvm_f64(fv),
+                ty: IrType::F64,
+            };
         }
 
-        // String constant literal: `"hello"` or `'world'`
+        // 1b. 64-bit integer constant (decimal, 0x hex, 0b binary, 0o octal, `_` separators)
+        if let Some(num) = parse_polyglot_i64(trimmed) {
+            return TypedValue {
+                reg: num.to_string(),
+                ty: IrType::I64,
+            };
+        }
+
+        // 1c. String constant literal (`"hello"` or `'world'`)
         if (trimmed.starts_with('"') && trimmed.ends_with('"'))
             || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         {
@@ -958,41 +1646,132 @@ impl<'a> CodeGenerator<'a> {
                     "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
                     str_ptr, len, len, const_name
                 ));
-                let str_i32 = format!("%str_i32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", str_i32, str_ptr));
-                return str_i32;
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
+                return TypedValue { reg: str_ptr, ty: IrType::Ptr };
             }
         }
 
         // Literal keywords
-        if trimmed == "null" || trimmed == "nil" || trimmed == "None" {
-            return "0".to_string();
+        if is_null_literal(trimmed) {
+            ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+            return TypedValue { reg: "null".to_string(), ty: IrType::Ptr };
         }
         if trimmed == "true" || trimmed == "True" {
-            return "1".to_string();
+            return TypedValue { reg: "1".to_string(), ty: IrType::I64 };
         }
         if trimmed == "false" || trimmed == "False" {
-            return "0".to_string();
+            return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
         }
 
-        // Python byte encode/decode identity
+        // Go error constructors: `errors.New("...")` / `fmt.Errorf("...")`
+        if (trimmed.starts_with("errors.New(") || trimmed.starts_with("fmt.Errorf("))
+            && trimmed.ends_with(')')
+        {
+            let err_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", err_ptr));
+            return TypedValue { reg: err_ptr, ty: IrType::Ptr };
+        }
+
+        // Python byte encode/decode identity unless user struct defines custom `.encode()` / `.decode()`
         if trimmed.ends_with(".decode()") {
             let base = trimmed[..trimmed.len() - 9].trim();
-            return self.eval_val(base, ir, scope_tree, string_constants, temp_counter);
+            if !scope_tree.has_user_struct_method(base, "decode") {
+                return self.eval_typed(base, ir, scope_tree, string_constants, temp_counter);
+            }
         }
         if trimmed.ends_with(".encode()") {
             let base = trimmed[..trimmed.len() - 9].trim();
-            return self.eval_val(base, ir, scope_tree, string_constants, temp_counter);
+            if !scope_tree.has_user_struct_method(base, "encode") {
+                return self.eval_typed(base, ir, scope_tree, string_constants, temp_counter);
+            }
+        }
+
+        // Top-level ternary conditional (`cond ? then_expr : else_expr`)
+        if let Some((cond_s, tr_s, fa_s)) = split_ternary_expr(trimmed) {
+            let cond_v = self.eval_cond(cond_s, ir, scope_tree, string_constants, temp_counter);
+            let tr_tv = self.eval_typed(tr_s, ir, scope_tree, string_constants, temp_counter);
+            let fa_tv = self.eval_typed(fa_s, ir, scope_tree, string_constants, temp_counter);
+            if tr_tv.ty == IrType::F64 || fa_tv.ty == IrType::F64 {
+                let tr_f = self.coerce_to_f64(tr_tv, ir, temp_counter);
+                let fa_f = self.coerce_to_f64(fa_tv, ir, temp_counter);
+                let tern_reg = format!("%tern_f64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = select i1 {}, double {}, double {}\n",
+                    tern_reg, cond_v, tr_f, fa_f
+                ));
+                return TypedValue { reg: tern_reg, ty: IrType::F64 };
+            }
+            if tr_tv.ty == IrType::Ptr && fa_tv.ty == IrType::Ptr {
+                let tern_reg = format!("%tern_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = select i1 {}, i8* {}, i8* {}\n",
+                    tern_reg, cond_v, tr_tv.reg, fa_tv.reg
+                ));
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", tern_reg));
+                return TypedValue { reg: tern_reg, ty: IrType::Ptr };
+            }
+            let tr_i = self.coerce_to_i64(tr_tv, ir, temp_counter);
+            let fa_i = self.coerce_to_i64(fa_tv, ir, temp_counter);
+            let tern_reg = format!("%tern_i64_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = select i1 {}, i64 {}, i64 {}\n",
+                tern_reg, cond_v, tr_i, fa_i
+            ));
+            return TypedValue { reg: tern_reg, ty: IrType::I64 };
         }
 
         // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
-        for prefix in &["str(", "String(", "tostring("] {
+        for prefix in STRING_CAST_PREFIXES {
             if trimmed.starts_with(prefix) && trimmed.ends_with(')') {
                 let fn_ident = prefix.trim_end_matches('(');
                 if !scope_tree.known_functions.contains(fn_ident) {
                     let inner = trimmed[prefix.len()..trimmed.len() - 1].trim();
-                    return self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                    let str_ptr = self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
+                    return TypedValue { reg: str_ptr, ty: IrType::Ptr };
+                }
+            }
+        }
+
+        // Polyglot float casts: Python `float(x)`, Go `float64(x)`, Rust `f64::from(x)`, JS `Number(x)`
+        for flt_prefix in FLOAT_CAST_PREFIXES {
+            if trimmed.starts_with(flt_prefix) && trimmed.ends_with(')') {
+                let fn_ident = flt_prefix.trim_end_matches('(');
+                if !scope_tree.known_functions.contains(fn_ident) {
+                    let inner = trimmed[flt_prefix.len()..trimmed.len() - 1].trim();
+                    if Self::is_string_expr(inner, scope_tree) {
+                        let sptr = self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                        let freg = format!("%str_to_f64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call double @__omni_c_str_to_f64(i8* {})\n", freg, sptr));
+                        return TypedValue { reg: freg, ty: IrType::F64 };
+                    }
+                    let inner_tv = self.eval_typed(inner, ir, scope_tree, string_constants, temp_counter);
+                    let freg = self.coerce_to_f64(inner_tv, ir, temp_counter);
+                    return TypedValue { reg: freg, ty: IrType::F64 };
+                }
+            }
+        }
+
+        // Polyglot integer conversions: Rust `i64::from(x)` / Go `int64(x)` / Python `int(x)`
+        for num_prefix in INT_CAST_PREFIXES {
+            if trimmed.starts_with(num_prefix) && trimmed.ends_with(')') {
+                let fn_ident = num_prefix.trim_end_matches('(');
+                if !scope_tree.known_functions.contains(fn_ident) {
+                    let inner = trimmed[num_prefix.len()..trimmed.len() - 1].trim();
+                    if Self::is_string_expr(inner, scope_tree) {
+                        let sptr = self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+                        let ireg = format!("%str_to_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i64 @__omni_c_str_to_i64(i8* {})\n", ireg, sptr));
+                        return TypedValue { reg: ireg, ty: IrType::I64 };
+                    }
+                    let inner_tv = self.eval_typed(inner, ir, scope_tree, string_constants, temp_counter);
+                    let ireg = self.coerce_to_i64(inner_tv, ir, temp_counter);
+                    return TypedValue { reg: ireg, ty: IrType::I64 };
                 }
             }
         }
@@ -1013,10 +1792,7 @@ impl<'a> CodeGenerator<'a> {
             *temp_counter += 1;
             ir.push_str(&format!("  {} = call i8* @__omni_input(i8* {})\n", input_ptr, prompt_ptr));
             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", input_ptr));
-            let cast_i32 = format!("%input_val_i32_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, input_ptr));
-            return cast_i32;
+            return TypedValue { reg: input_ptr, ty: IrType::Ptr };
         }
 
         // Builtin exit(code)
@@ -1032,12 +1808,12 @@ impl<'a> CodeGenerator<'a> {
                 }
             };
             ir.push_str(&format!("  call void @exit(i32 {})\n", code_val));
-            return "0".to_string();
+            return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
         }
 
         // Canonical POSIX socket constants from top-of-file lookup table
         if let Some((_, val)) = POSIX_SOCKET_CONSTANTS.iter().find(|(k, _)| *k == trimmed) {
-            return (*val).to_string();
+            return TypedValue { reg: (*val).to_string(), ty: IrType::I64 };
         }
 
         // Builtin OS Pipe creation: `mp.Pipe(...)` or `Pipe(...)`
@@ -1046,14 +1822,10 @@ impl<'a> CodeGenerator<'a> {
             *temp_counter += 1;
             ir.push_str(&format!("  {} = call i8* @__omni_os_pipe_pair()\n", slice_ptr));
             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", slice_ptr));
-            let cast_i32 = format!("%pipe_i32_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, slice_ptr));
-            return cast_i32;
+            return TypedValue { reg: slice_ptr, ty: IrType::Ptr };
         }
 
-        // Concurrency Fiber Spawning via Thread/Process abstractions:
-        // `threading.Thread(target=..., args=...).start()` or `Thread(...)` or `mp.Process(...)`
+        // Concurrency Fiber Spawning via Thread/Process abstractions
         let unwrap_start = if trimmed.ends_with(".start()") {
             trimmed[..trimmed.len() - 8].trim()
         } else {
@@ -1086,24 +1858,41 @@ impl<'a> CodeGenerator<'a> {
             }
             let arg_reg = if !arg_val.is_empty() {
                 if let Some(binding) = scope_tree.resolve(&arg_val) {
-                    if binding.type_hint == "i32" {
+                    if binding.type_hint == "i64" {
+                        let loaded = format!("%arg_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i64, i64* {}\n", loaded, binding.llvm_ptr));
+                        let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, loaded));
+                        ptr_cast
+                    } else if binding.type_hint == "i32" {
                         let loaded = format!("%arg_i32_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i32, i32* {}\n", loaded, binding.llvm_ptr));
                         let ext = format!("%arg_i64_{}", *temp_counter);
                         *temp_counter += 1;
-                        ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext, loaded));
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, loaded));
                         let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, ext));
                         ptr_cast
+                    } else if binding.type_hint.starts_with("%struct.") {
+                        let cls_name = binding.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        let loaded = format!("%arg_s_ld_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", loaded, cls_name, cls_name, binding.llvm_ptr));
+                        let bc = format!("%arg_s_bc_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", bc, cls_name, loaded));
+                        bc
                     } else {
                         let loaded = format!("%arg_load_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
                         loaded
                     }
-                } else if let Ok(val) = arg_val.parse::<i32>() {
+                } else if let Some(val) = parse_polyglot_i64(&arg_val) {
                     let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, val));
@@ -1125,7 +1914,7 @@ impl<'a> CodeGenerator<'a> {
                     spawn_fn, target_fn, arg_reg
                 ));
             }
-            return "0".to_string();
+            return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
         }
 
         // Random generator calls: `new Random().nextInt()` or `Random.nextInt()`
@@ -1133,32 +1922,7 @@ impl<'a> CodeGenerator<'a> {
             let r = format!("%rnd_{}", *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!("  {} = call i64 @__omni_random_int()\n", r));
-            let r32 = format!("%rnd32_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = trunc i64 {} to i32\n", r32, r));
-            return r32;
-        }
-
-        // Ternary conditional expression: `cond ? then_expr : else_expr`
-        if let Some((cond_part, rest)) = trimmed.split_once('?') {
-            if let Some((then_part, else_part)) = rest.split_once(':') {
-                let cond_clean = cond_part.trim().trim_start_matches('(').trim_end_matches(')').trim();
-                let cond_val = if cond_clean.contains("==") || cond_clean.contains("!=") || cond_clean.contains("<") || cond_clean.contains(">") {
-                    self.eval_cond(cond_clean, ir, scope_tree, string_constants, temp_counter)
-                } else {
-                    let r = self.eval_val(cond_clean, ir, scope_tree, string_constants, temp_counter);
-                    let cmp = format!("%tern_cmp_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp, r));
-                    cmp
-                };
-                let then_val = self.eval_val(then_part.trim(), ir, scope_tree, string_constants, temp_counter);
-                let else_val = self.eval_val(else_part.trim(), ir, scope_tree, string_constants, temp_counter);
-                let res = format!("%tern_res_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", res, cond_val, then_val, else_val));
-                return res;
-            }
+            return TypedValue { reg: r, ty: IrType::I64 };
         }
 
         // Struct field access: rec.fld
@@ -1180,10 +1944,27 @@ impl<'a> CodeGenerator<'a> {
                             let val64 = format!("%val64_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
-                            let val32 = format!("%val32_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val32, val64));
-                            return val32;
+
+                            if let Some(ft) = scope_tree.class_field_types.get(cls_name).and_then(|m| m.get(fld)) {
+                                if is_float_type_hint(ft) {
+                                    let fval = format!("%fld_f64_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, val64));
+                                    return TypedValue { reg: fval, ty: IrType::F64 };
+                                } else if ft.starts_with("i8*") || is_string_type_hint(ft) {
+                                    let sval = format!("%fld_ptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sval, val64));
+                                    return TypedValue { reg: sval, ty: IrType::Ptr };
+                                } else if ft.starts_with("%struct.") {
+                                    let target_c = ft.trim_start_matches("%struct.").trim_end_matches('*');
+                                    let sp = format!("%fld_sptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", sp, val64, target_c));
+                                    return TypedValue { reg: sp, ty: IrType::StructPtr(target_c.to_string()) };
+                                }
+                            }
+                            return TypedValue { reg: val64, ty: IrType::I64 };
                         }
                     }
                 }
@@ -1217,7 +1998,7 @@ impl<'a> CodeGenerator<'a> {
                                 let sock_fd = format!("%sock_fd_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i32 @__omni_os_socket_create(i32 2, i32 1, i32 0)\n", sock_fd));
-                                return sock_fd;
+                                return TypedValue { reg: sock_fd, ty: IrType::I32 };
                             }
 
                             let is_user_method = scope_tree.has_user_struct_method(rec, method);
@@ -1229,11 +2010,8 @@ impl<'a> CodeGenerator<'a> {
                                     if Self::is_string_expr(a_trim, scope_tree) || a_trim.starts_with('"') || a_trim.starts_with('\'') {
                                         self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter)
                                     } else {
-                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                        let ptr = format!("%send_ptr_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", ptr, r));
-                                        ptr
+                                        let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        self.coerce_to_ptr(tv, ir, temp_counter)
                                     }
                                 } else {
                                     "null".to_string()
@@ -1241,7 +2019,7 @@ impl<'a> CodeGenerator<'a> {
                                 let ret_reg = format!("%send_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i32 @__omni_os_socket_send(i32 {}, i8* {})\n", ret_reg, r_fd, arg_data));
-                                return ret_reg;
+                                return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
                             if !is_user_method && method == "recv" {
@@ -1255,10 +2033,7 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i8* @__omni_os_socket_recv(i32 {}, i32 {})\n", ret_ptr, r_fd, max_bytes));
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", ret_ptr));
-                                let cast_i32 = format!("%recv_i32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, ret_ptr));
-                                return cast_i32;
+                                return TypedValue { reg: ret_ptr, ty: IrType::Ptr };
                             }
 
                             if !is_user_method && method == "bind" {
@@ -1272,18 +2047,12 @@ impl<'a> CodeGenerator<'a> {
                                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
                                             ld
                                         } else {
-                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                            let p = format!("%bind_addr_ptr_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
-                                            p
+                                            let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                            self.coerce_to_ptr(tv, ir, temp_counter)
                                         }
                                     } else {
-                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                        let p = format!("%bind_addr_ptr_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
-                                        p
+                                        let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        self.coerce_to_ptr(tv, ir, temp_counter)
                                     }
                                 } else {
                                     "null".to_string()
@@ -1291,7 +2060,7 @@ impl<'a> CodeGenerator<'a> {
                                 let ret_reg = format!("%bind_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i32 @__omni_os_socket_bind(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
-                                return ret_reg;
+                                return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
                             if !is_user_method && method == "listen" {
@@ -1299,7 +2068,7 @@ impl<'a> CodeGenerator<'a> {
                                 let ret_reg = format!("%listen_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i32 @__omni_os_socket_listen_fd(i32 {}, i32 128)\n", ret_reg, r_fd));
-                                return ret_reg;
+                                return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
                             if !is_user_method && method == "accept" {
@@ -1308,10 +2077,7 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i8* @__omni_os_socket_accept_tuple(i32 {})\n", slice_ptr, r_fd));
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", slice_ptr));
-                                let cast_i32 = format!("%accept_i32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, slice_ptr));
-                                return cast_i32;
+                                return TypedValue { reg: slice_ptr, ty: IrType::Ptr };
                             }
 
                             if !is_user_method && method == "connect" {
@@ -1325,18 +2091,12 @@ impl<'a> CodeGenerator<'a> {
                                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
                                             ld
                                         } else {
-                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                            let p = format!("%conn_addr_ptr_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
-                                            p
+                                            let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                            self.coerce_to_ptr(tv, ir, temp_counter)
                                         }
                                     } else {
-                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                        let p = format!("%conn_addr_ptr_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", p, r));
-                                        p
+                                        let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                        self.coerce_to_ptr(tv, ir, temp_counter)
                                     }
                                 } else {
                                     "null".to_string()
@@ -1344,7 +2104,7 @@ impl<'a> CodeGenerator<'a> {
                                 let ret_reg = format!("%conn_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i32 @__omni_os_socket_connect(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
-                                return ret_reg;
+                                return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
                             if !is_user_method && method == "getpeername" {
@@ -1353,20 +2113,17 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i8* @__omni_os_socket_getpeername(i32 {})\n", peer_ptr, r_fd));
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", peer_ptr));
-                                let cast_i32 = format!("%peer_i32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, peer_ptr));
-                                return cast_i32;
+                                return TypedValue { reg: peer_ptr, ty: IrType::Ptr };
                             }
 
                             if !is_user_method && method == "close" {
                                 let r_fd = self.eval_val(rec, ir, scope_tree, string_constants, temp_counter);
                                 ir.push_str(&format!("  call void @__omni_os_socket_close(i32 {})\n", r_fd));
-                                return "0".to_string();
+                                return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
                             }
 
                             if !is_user_method && (method == "terminate" || method == "start") {
-                                return "0".to_string();
+                                return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
                             }
 
                             if !is_user_method && (method == "encrypt" || method == "decrypt") {
@@ -1374,12 +2131,9 @@ impl<'a> CodeGenerator<'a> {
                                     let a_trim = a.trim();
                                     let str_ptr = self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter);
                                     ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
-                                    let cast_i32 = format!("%crypt_i32_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, str_ptr));
-                                    return cast_i32;
+                                    return TypedValue { reg: str_ptr, ty: IrType::Ptr };
                                 }
-                                return "0".to_string();
+                                return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
                             }
 
                             if let Some(b) = scope_tree.resolve(rec) {
@@ -1396,65 +2150,60 @@ impl<'a> CodeGenerator<'a> {
 
                                     let mut arg_regs = Vec::new();
                                     for a in &raw_args {
-                                        let a_trim = a.trim();
-                                        if let Some(ab) = scope_tree.resolve(a_trim) {
-                                            if ab.type_hint.starts_with("i8*") {
-                                                let ld_ptr = format!("%arg_ptr_ld_{}", *temp_counter);
-                                                *temp_counter += 1;
-                                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld_ptr, ab.llvm_ptr));
-                                                let p64 = format!("%arg_ptr_64_{}", *temp_counter);
-                                                *temp_counter += 1;
-                                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p64, ld_ptr));
-                                                arg_regs.push(p64);
-                                                continue;
-                                            }
-                                        }
-                                        let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                        let ext = format!("%call_ext_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                        arg_regs.push(ext);
+                                        let a_clean = Self::strip_kwarg_prefix(a);
+                                        let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                        arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                     }
-                                    while arg_regs.len() < 3 {
+                                    while arg_regs.len() < 5 {
                                         arg_regs.push("0".to_string());
                                     }
 
                                     let ret_reg = format!("%method_ret_{}", *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!(
-                                        "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                        "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                     ));
-                                    return ret_reg;
-                                } else if b.type_hint.starts_with("i8*") {
+                                    let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
+                                    return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
+                                } else if b.type_hint.starts_with("i8*") || b.type_hint == "i64" {
                                     if let Some((_, def_cls)) = scope_tree.method_defining_class.iter().find(|((_, m), _)| m == method) {
-                                        let raw_inst = format!("%raw_i8_inst_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", raw_inst, b.llvm_ptr));
+                                        let def_cls = def_cls.clone();
+                                        let raw_inst = if b.type_hint.starts_with("i8*") {
+                                            let ld = format!("%raw_i8_inst_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                            ld
+                                        } else {
+                                            let ld64 = format!("%raw_i64_inst_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, b.llvm_ptr));
+                                            let i2p = format!("%raw_i64_i8_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", i2p, ld64));
+                                            i2p
+                                        };
                                         let mut arg_regs = Vec::new();
                                         for a in &raw_args {
-                                            let a_trim = a.trim();
-                                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                            let ext = format!("%call_ext_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                            arg_regs.push(ext);
+                                            let a_clean = Self::strip_kwarg_prefix(a);
+                                            let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                            arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                         }
-                                        while arg_regs.len() < 3 {
+                                        while arg_regs.len() < 5 {
                                             arg_regs.push("0".to_string());
                                         }
                                         let ret_reg = format!("%method_ret_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!(
-                                            "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                            ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                            "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                            ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                         ));
-                                        return ret_reg;
+                                        let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
+                                        return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
                                     }
                                 }
                             } else if scope_tree.class_fields.contains_key(rec) {
                                 // Static / Base class method invocation: ClassName.method(instance, args...)
-                                // e.g. AbstractKey.__init__(self, self.n, self.e) or PublicKey.load_pkcs1(...)
                                 let def_cls = scope_tree.resolve_defining_class(rec, method);
                                 let (raw_inst, remaining_args) = if !raw_args.is_empty() {
                                     let inst_name = raw_args[0].trim();
@@ -1480,65 +2229,95 @@ impl<'a> CodeGenerator<'a> {
 
                                 let mut arg_regs = Vec::new();
                                 for a in remaining_args {
-                                    let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
-                                    let ext = format!("%call_ext_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                    arg_regs.push(ext);
+                                    let a_clean = Self::strip_kwarg_prefix(a);
+                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                 }
-                                while arg_regs.len() < 3 {
+                                while arg_regs.len() < 5 {
                                     arg_regs.push("0".to_string());
                                 }
 
                                 let ret_reg = format!("%method_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
-                                    "  {} = call i32 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                    ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                    ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                 ));
-                                return ret_reg;
+                                let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
+                                return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
                             } else {
                                 // Foreign module call: `fast_math.compute_luhn(card_num)` -> `@__omni_fn_compute_luhn`
                                 if method == "read_random_odd_int" {
-                                    let bit_arg = raw_args.first().map(|a| self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)).unwrap_or_else(|| "0".to_string());
+                                    let bit_arg = raw_args
+                                        .first()
+                                        .map(|a| {
+                                            let tv = self.eval_typed(a.trim(), ir, scope_tree, string_constants, temp_counter);
+                                            self.coerce_to_i64(tv, ir, temp_counter)
+                                        })
+                                        .unwrap_or_else(|| "0".to_string());
                                     let is_large = format!("%rand_cmp_{}", *temp_counter);
                                     *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = icmp sgt i32 {}, 512\n", is_large, bit_arg));
+                                    ir.push_str(&format!("  {} = icmp sgt i64 {}, 512\n", is_large, bit_arg));
                                     let rand_sel = format!("%rand_sel_{}", *temp_counter);
                                     *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = select i1 {}, i32 257, i32 17\n", rand_sel, is_large));
-                                    return rand_sel;
+                                    ir.push_str(&format!("  {} = select i1 {}, i64 257, i64 17\n", rand_sel, is_large));
+                                    return TypedValue { reg: rand_sel, ty: IrType::I64 };
                                 } else if method == "randint" {
-                                    let min_arg = raw_args.first().map(|a| self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter)).unwrap_or_else(|| "2".to_string());
-                                    return min_arg;
+                                    let min_arg = raw_args
+                                        .first()
+                                        .map(|a| {
+                                            let tv = self.eval_typed(a.trim(), ir, scope_tree, string_constants, temp_counter);
+                                            self.coerce_to_i64(tv, ir, temp_counter)
+                                        })
+                                        .unwrap_or_else(|| "2".to_string());
+                                    return TypedValue { reg: min_arg, ty: IrType::I64 };
                                 }
                                 let mut arg_regs = Vec::new();
                                 for a in &raw_args {
-                                    let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
-                                    let ext = format!("%foreign_ext_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                    arg_regs.push(ext);
+                                    let a_clean = Self::strip_kwarg_prefix(a);
+                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                 }
-                                while arg_regs.len() < 4 {
+                                while arg_regs.len() < 6 {
                                     arg_regs.push("0".to_string());
                                 }
 
                                 let ret_reg = format!("%foreign_ret_{}", *temp_counter);
                                 *temp_counter += 1;
+                                let prefixed_fn = format!("{}_{}", rec, method);
                                 if scope_tree.known_functions.contains(method) {
                                     ir.push_str(&format!(
-                                        "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                                        "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
                                     ));
-                                } else {
-                                    // Direct foreign C ABI symbol invocation (e.g. `zlib.compressBound` -> `@compressBound`)
+                                    let fret = scope_tree.fn_return_types.get(method);
+                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                                } else if scope_tree.known_functions.contains(&prefixed_fn) {
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, prefixed_fn, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
+                                    ));
+                                    let fret = scope_tree.fn_return_types.get(&prefixed_fn);
+                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                                } else if NATIVE_C_LIB_I64_FNS.contains(&method) {
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @{}(i64 {})\n",
+                                        ret_reg, method, arg_regs[0]
+                                    ));
+                                    return TypedValue { reg: ret_reg, ty: IrType::I64 };
+                                } else if NATIVE_C_LIB_FNS.contains(&method) {
                                     ir.push_str(&format!(
                                         "  {} = call i32 @{}(i64 {})\n",
                                         ret_reg, method, arg_regs[0]
                                     ));
+                                    return TypedValue { reg: ret_reg, ty: IrType::I32 };
+                                } else {
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
+                                    ));
+                                    return TypedValue { reg: ret_reg, ty: IrType::I64 };
                                 }
-                                return ret_reg;
                             }
                         }
                     } else if !call_target.is_empty()
@@ -1572,26 +2351,11 @@ impl<'a> CodeGenerator<'a> {
 
                             let mut arg_regs = Vec::new();
                             for a in &raw_args {
-                                let mut a_trim = a.trim();
-                                if let Some((_, v)) = a_trim.split_once('=') {
-                                    a_trim = v.trim();
-                                }
-                                if let Some(b) = scope_tree.resolve(a_trim) {
-                                    if is_64bit_type_hint(&b.type_hint) {
-                                        let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
-                                        arg_regs.push(ld_ptr);
-                                        continue;
-                                    }
-                                }
-                                let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                let ext = format!("%ctor_arg_ext_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                arg_regs.push(ext);
+                                let a_clean = Self::strip_kwarg_prefix(a);
+                                let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                             }
-                            while arg_regs.len() < 3 {
+                            while arg_regs.len() < 5 {
                                 arg_regs.push("0".to_string());
                             }
 
@@ -1599,56 +2363,31 @@ impl<'a> CodeGenerator<'a> {
                             let init_ret = format!("%ctor_init_ret_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
-                                "  {} = call i32 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                "  {} = call i64 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                             ));
 
                             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_inst));
-                            let cast_i32 = format!("%ctor_ptr_i32_{}", *temp_counter);
+                            let struct_ptr = format!("%ctor_struct_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, raw_inst));
-                            return cast_i32;
+                            ir.push_str(&format!(
+                                "  {} = bitcast i8* {} to %struct.{}*\n",
+                                struct_ptr, raw_inst, target_cls
+                            ));
+                            return TypedValue {
+                                reg: struct_ptr,
+                                ty: IrType::StructPtr(target_cls),
+                            };
                         }
 
-                        // Direct function invocation: `rotate_hash(seed, 4)` -> `@__omni_fn_rotate_hash`
+                        // Direct or indirect function invocation (`@__omni_fn_<name>` / function pointer)
                         let mut arg_regs = Vec::new();
                         for a in &raw_args {
-                            let mut a_trim = a.trim();
-                            if let Some((_, v)) = a_trim.split_once('=') {
-                                a_trim = v.trim();
-                            }
-                            if let Some(b) = scope_tree.resolve(a_trim) {
-                                if b.type_hint.starts_with("i8*") {
-                                    let ld_ptr = format!("%fn_arg_ptr_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld_ptr, b.llvm_ptr));
-                                    let ext = format!("%fn_arg_ext_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ext, ld_ptr));
-                                    arg_regs.push(ext);
-                                    continue;
-                                }
-                            }
-                            ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
-                            let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                            let tramp = format!("%fn_arg_tramp_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
-                            let is_n = format!("%fn_arg_null_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_n, tramp));
-                            let p64 = format!("%fn_arg_p64_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p64, tramp));
-                            let v64 = format!("%fn_arg_v64_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", v64, r));
-                            let ext = format!("%fn_arg_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = select i1 {}, i64 {}, i64 {}\n", ext, is_n, v64, p64));
-                            arg_regs.push(ext);
+                            let a_clean = Self::strip_kwarg_prefix(a);
+                            let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                            arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                         }
-                        while arg_regs.len() < 4 {
+                        while arg_regs.len() < 6 {
                             arg_regs.push("0".to_string());
                         }
 
@@ -1657,6 +2396,11 @@ impl<'a> CodeGenerator<'a> {
                             *temp_counter += 1;
                             if binding.type_hint.starts_with("i8*") {
                                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", fptr_ld, binding.llvm_ptr));
+                            } else if binding.type_hint == "i64" {
+                                let ld64 = format!("%fptr_ld64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, binding.llvm_ptr));
+                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", fptr_ld, ld64));
                             } else {
                                 let ld32 = format!("%fptr_ld32_{}", *temp_counter);
                                 *temp_counter += 1;
@@ -1672,7 +2416,10 @@ impl<'a> CodeGenerator<'a> {
 
                             let fptr = format!("%fptr_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = bitcast i8* {} to i32 (i64, i64, i64, i64)*\n", fptr, fptr_ld));
+                            ir.push_str(&format!(
+                                "  {} = bitcast i8* {} to i64 (i64, i64, i64, i64, i64, i64)*\n",
+                                fptr, fptr_ld
+                            ));
 
                             let valid_call_lbl = format!("call_valid_{}", *temp_counter);
                             let null_call_lbl = format!("call_null_{}", *temp_counter);
@@ -1684,7 +2431,10 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("{}:\n", valid_call_lbl));
                             let ret_call = format!("%ret_call_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i32 {}(i64 {}, i64 {}, i64 {}, i64 {})\n", ret_call, fptr, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]));
+                            ir.push_str(&format!(
+                                "  {} = call i64 {}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                ret_call, fptr, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
+                            ));
                             ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
 
                             ir.push_str(&format!("{}:\n", null_call_lbl));
@@ -1693,30 +2443,47 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("{}:\n", cont_call_lbl));
                             let phi_ret = format!("%indirect_ret_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = phi i32 [ {}, %{} ], [ 0, %{} ]\n", phi_ret, ret_call, valid_call_lbl, null_call_lbl));
-                            return phi_ret;
+                            ir.push_str(&format!(
+                                "  {} = phi i64 [ {}, %{} ], [ 0, %{} ]\n",
+                                phi_ret, ret_call, valid_call_lbl, null_call_lbl
+                            ));
+                            return TypedValue { reg: phi_ret, ty: IrType::I64 };
                         }
 
                         let ret_reg = format!("%fn_ret_{}", *temp_counter);
                         *temp_counter += 1;
                         if scope_tree.known_functions.contains(call_target) {
                             ir.push_str(&format!(
-                                "  {} = call i32 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                                "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
                             ));
+                            let fret = scope_tree.fn_return_types.get(call_target);
+                            return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                        } else if NATIVE_C_LIB_I64_FNS.contains(&call_target) {
+                            ir.push_str(&format!(
+                                "  {} = call i64 @{}(i64 {})\n",
+                                ret_reg, call_target, arg_regs[0]
+                            ));
+                            return TypedValue { reg: ret_reg, ty: IrType::I64 };
+                        } else if NATIVE_C_LIB_FNS.contains(&call_target) {
+                            ir.push_str(&format!(
+                                "  {} = call i32 @{}(i64 {})\n",
+                                ret_reg, call_target, arg_regs[0]
+                            ));
+                            return TypedValue { reg: ret_reg, ty: IrType::I32 };
                         } else {
                             ir.push_str(&format!(
-                                "  {} = call i32 @{}(i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3]
+                                "  {} = call i64 @{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
                             ));
+                            return TypedValue { reg: ret_reg, ty: IrType::I64 };
                         }
-                        return ret_reg;
                     }
+                }
             }
         }
-    }
 
-        // 2. Builtin len(coll)
+        // 2. Builtin len(coll) -> full i64
         if let Some(caps) = self.len_re.captures(trimmed) {
             let var_name = caps[1].trim();
             if let Some(binding) = scope_tree.resolve(var_name) {
@@ -1733,15 +2500,11 @@ impl<'a> CodeGenerator<'a> {
                 } else {
                     ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", len_res, loaded));
                 }
-
-                let len_32 = format!("%len_32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
-                return len_32;
+                return TypedValue { reg: len_res, ty: IrType::I64 };
             }
         }
 
-        // 3. Slice pop: items.pop()
+        // 3. Slice pop: items.pop() -> full i64
         if let Some(caps) = self.pop_re.captures(trimmed) {
             let var_name = caps[1].trim();
             if let Some(binding) = scope_tree.resolve(var_name) {
@@ -1752,15 +2515,11 @@ impl<'a> CodeGenerator<'a> {
                 let pop_res = format!("%pop_res_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call i64 @__omni_slice_pop(i8* {})\n", pop_res, loaded));
-
-                let pop_32 = format!("%pop_32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", pop_32, pop_res));
-                return pop_32;
+                return TypedValue { reg: pop_res, ty: IrType::I64 };
             }
         }
 
-        // 4. Index Lookup: items[i] or m["key"]
+        // 4. Index Lookup: items[i] or m["key"] -> full i64
         if let Some(caps) = self.idx_re.captures(trimmed) {
             let var_name = caps[1].trim();
             let idx_expr = caps[2].trim();
@@ -1794,27 +2553,24 @@ impl<'a> CodeGenerator<'a> {
                                 val_res, loaded
                             ));
                         }
+                    } else if Self::is_string_expr(idx_expr, scope_tree) {
+                        let key_ptr = self.eval_str_ptr(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!(
+                            "  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n",
+                            val_res, loaded, key_ptr
+                        ));
                     } else {
-                        let idx_val = self.eval_val(idx_expr, ir, scope_tree, string_constants, temp_counter);
-                        let idx_64 = format!("%idx_64_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                        let idx_tv = self.eval_typed(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                        let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
                         ir.push_str(&format!(
                             "  {} = call i64 @__omni_map_get_int(i8* {}, i64 {})\n",
                             val_res, loaded, idx_64
                         ));
                     }
-
-                    let val_32 = format!("%val_32_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val_32, val_res));
-                    return val_32;
+                    return TypedValue { reg: val_res, ty: IrType::I64 };
                 } else {
-                    // Default to Slice
-                    let idx_val = self.eval_val(idx_expr, ir, scope_tree, string_constants, temp_counter);
-                    let idx_64 = format!("%idx_64_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                    let idx_tv = self.eval_typed(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                    let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
 
                     let val_res = format!("%slice_get_{}", *temp_counter);
                     *temp_counter += 1;
@@ -1822,27 +2578,70 @@ impl<'a> CodeGenerator<'a> {
                         "  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n",
                         val_res, loaded, idx_64
                     ));
-
-                    let val_32 = format!("%val_32_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val_32, val_res));
-                    return val_32;
+                    return TypedValue { reg: val_res, ty: IrType::I64 };
                 }
             }
         }
 
-        // 5. Binary arithmetic with operator precedence (+, - first, then *, /, %)
+        // 5. Binary arithmetic with IEEE-754 `double` promotion & 64-bit `i64` arithmetic
         if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
             if op == "+" && (Self::is_string_expr(&left, scope_tree) || Self::is_string_expr(&right, scope_tree)) {
                 let str_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
-                let str_i32 = format!("%str_concat_i32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", str_i32, str_ptr));
-                return str_i32;
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
+                return TypedValue { reg: str_ptr, ty: IrType::Ptr };
             }
 
-            let left_val = self.eval_val(&left, ir, scope_tree, string_constants, temp_counter);
-            let right_val = self.eval_val(&right, ir, scope_tree, string_constants, temp_counter);
+            if op == "**" {
+                if let (Some(lb), Some(rb)) = (parse_polyglot_i64(&left), parse_polyglot_i64(&right)) {
+                    if (0..=62).contains(&rb) {
+                        return TypedValue {
+                            reg: lb.wrapping_pow(rb as u32).to_string(),
+                            ty: IrType::I64,
+                        };
+                    }
+                }
+            }
+
+            let ltv = self.eval_typed(&left, ir, scope_tree, string_constants, temp_counter);
+            let rtv = self.eval_typed(&right, ir, scope_tree, string_constants, temp_counter);
+
+            if ltv.ty == IrType::F64 || rtv.ty == IrType::F64 {
+                let lf = self.coerce_to_f64(ltv, ir, temp_counter);
+                let rf = self.coerce_to_f64(rtv, ir, temp_counter);
+                let res_var = format!("%tf_{}", *temp_counter);
+                *temp_counter += 1;
+                if op == "**" {
+                    if let Some(exp_i) = parse_polyglot_i64(&right) {
+                        if exp_i == 0 {
+                            return TypedValue { reg: format_llvm_f64(1.0), ty: IrType::F64 };
+                        } else if (1..=12).contains(&exp_i) {
+                            let mut acc = lf.clone();
+                            for _ in 1..exp_i {
+                                let step = format!("%powf_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = fmul double {}, {}\n", step, acc, lf));
+                                acc = step;
+                            }
+                            return TypedValue { reg: acc, ty: IrType::F64 };
+                        }
+                    }
+                    ir.push_str(&format!("  {} = fmul double {}, {}\n", res_var, lf, lf));
+                    return TypedValue { reg: res_var, ty: IrType::F64 };
+                }
+                let finstr = match op.as_str() {
+                    "+" => "fadd",
+                    "-" => "fsub",
+                    "*" => "fmul",
+                    "/" => "fdiv",
+                    "%" => "frem",
+                    _ => "fadd",
+                };
+                ir.push_str(&format!("  {} = {} double {}, {}\n", res_var, finstr, lf, rf));
+                return TypedValue { reg: res_var, ty: IrType::F64 };
+            }
+
+            let left_val = self.coerce_to_i64(ltv, ir, temp_counter);
+            let right_val = self.coerce_to_i64(rtv, ir, temp_counter);
 
             let res_var = format!("%t_{}", *temp_counter);
             *temp_counter += 1;
@@ -1851,46 +2650,94 @@ impl<'a> CodeGenerator<'a> {
                 "+" => "add",
                 "-" => "sub",
                 "*" => "mul",
-                "/" | "%" => {
+                "/" | "%" | "//" => {
                     let is_zero = format!("%div_zero_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_zero, right_val));
+                    ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
                     let safe_div = format!("%safe_div_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = select i1 {}, i32 1, i32 {}\n", safe_div, is_zero, right_val));
-                    let op_name = if op == "/" { "sdiv" } else { "srem" };
-                    ir.push_str(&format!("  {} = {} i32 {}, {}\n", res_var, op_name, left_val, safe_div));
-                    return res_var;
+                    ir.push_str(&format!("  {} = select i1 {}, i64 1, i64 {}\n", safe_div, is_zero, right_val));
+                    let op_name = if op == "%" { "srem" } else { "sdiv" };
+                    ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, safe_div));
+                    return TypedValue { reg: res_var, ty: IrType::I64 };
                 }
                 "^" => "xor",
                 "&" => "and",
                 "|" => "or",
                 "<<" => "shl",
                 ">>" => "ashr",
+                ">>>" => "lshr",
                 "**" => {
-                    ir.push_str(&format!("  {} = mul i32 {}, {}\n", res_var, left_val, left_val));
-                    return res_var;
+                    if let Some(exp_i) = parse_polyglot_i64(&right) {
+                        if exp_i == 0 {
+                            return TypedValue { reg: "1".to_string(), ty: IrType::I64 };
+                        } else if (1..=16).contains(&exp_i) {
+                            let mut acc = left_val.clone();
+                            for _ in 1..exp_i {
+                                let step = format!("%pow64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = mul i64 {}, {}\n", step, acc, left_val));
+                                acc = step;
+                            }
+                            return TypedValue { reg: acc, ty: IrType::I64 };
+                        }
+                    }
+                    ir.push_str(&format!("  {} = mul i64 {}, {}\n", res_var, left_val, left_val));
+                    return TypedValue { reg: res_var, ty: IrType::I64 };
                 }
                 _ => "add",
             };
 
-            ir.push_str(&format!("  {} = {} i32 {}, {}\n", res_var, instr, left_val, right_val));
-            return res_var;
+            ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, instr, left_val, right_val));
+            return TypedValue { reg: res_var, ty: IrType::I64 };
+        }
+
+        // Unary negation (`-expr`) and unary plus (`+expr`) on non-literal operands
+        if let Some(neg_inner) = trimmed.strip_prefix('-') {
+            let inner = neg_inner.trim();
+            if !inner.is_empty() {
+                let tv = self.eval_typed(inner, ir, scope_tree, string_constants, temp_counter);
+                if tv.ty == IrType::F64 {
+                    let res = format!("%fneg_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = fsub double 0x0000000000000000, {}\n", res, tv.reg));
+                    return TypedValue { reg: res, ty: IrType::F64 };
+                } else {
+                    let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                    let res = format!("%ineg_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = sub i64 0, {}\n", res, v64));
+                    return TypedValue { reg: res, ty: IrType::I64 };
+                }
+            }
+        }
+        if let Some(pos_inner) = trimmed.strip_prefix('+') {
+            let inner = pos_inner.trim();
+            if !inner.is_empty() {
+                return self.eval_typed(inner, ir, scope_tree, string_constants, temp_counter);
+            }
         }
 
         // 6. Variable in symbol table
         if let Some(binding) = scope_tree.resolve(trimmed) {
-            if binding.type_hint.contains("omni_slice") {
+            if binding.type_hint == "double" {
+                let res_var = format!("%flt_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load double, double* {}\n", res_var, binding.llvm_ptr));
+                return TypedValue { reg: res_var, ty: IrType::F64 };
+            } else if binding.type_hint == "i64" {
+                let res_var = format!("%t64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = load i64, i64* {}\n", res_var, binding.llvm_ptr));
+                return TypedValue { reg: res_var, ty: IrType::I64 };
+            } else if binding.type_hint.contains("omni_slice") {
                 let loaded = format!("%slice_ptr_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
                 let len_res = format!("%len_res_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", len_res, loaded));
-                let len_32 = format!("%len_32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
-                return len_32;
+                return TypedValue { reg: len_res, ty: IrType::I64 };
             } else if binding.type_hint.contains("omni_map") {
                 let loaded = format!("%map_ptr_{}", *temp_counter);
                 *temp_counter += 1;
@@ -1898,38 +2745,26 @@ impl<'a> CodeGenerator<'a> {
                 let len_res = format!("%len_res_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call i64 @__omni_map_len(i8* {})\n", len_res, loaded));
-                let len_32 = format!("%len_32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", len_32, len_res));
-                return len_32;
+                return TypedValue { reg: len_res, ty: IrType::I64 };
             } else if binding.type_hint.starts_with("%struct.") {
                 let cls_name = binding.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                 let loaded = format!("%inst_ptr_ld_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", loaded, cls_name, cls_name, binding.llvm_ptr));
-                let ptr_i64 = format!("%ptr_i64_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = ptrtoint %struct.{}* {} to i64\n", ptr_i64, cls_name, loaded));
-                let ptr_i32 = format!("%ptr_i32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", ptr_i32, ptr_i64));
-                return ptr_i32;
+                return TypedValue {
+                    reg: loaded,
+                    ty: IrType::StructPtr(cls_name.to_string()),
+                };
             } else if binding.type_hint.starts_with("i8*") {
                 let loaded = format!("%ptr_ld_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
-                let ptr_i64 = format!("%ptr_i64_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ptr_i64, loaded));
-                let ptr_i32 = format!("%ptr_i32_{}", *temp_counter);
-                *temp_counter += 1;
-                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", ptr_i32, ptr_i64));
-                return ptr_i32;
+                return TypedValue { reg: loaded, ty: IrType::Ptr };
             } else {
                 let res_var = format!("%t_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = load i32, i32* {}\n", res_var, binding.llvm_ptr));
-                return res_var;
+                return TypedValue { reg: res_var, ty: IrType::I32 };
             }
         }
 
@@ -1952,15 +2787,25 @@ impl<'a> CodeGenerator<'a> {
                     let val64 = format!("%val64_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
-                    let val32 = format!("%val32_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", val32, val64));
-                    return val32;
+                    if let Some(ft) = scope_tree.class_field_types.get(cls_name).and_then(|m| m.get(syn)) {
+                        if is_float_type_hint(ft) {
+                            let fval = format!("%self_fld_f64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, val64));
+                            return TypedValue { reg: fval, ty: IrType::F64 };
+                        } else if ft.starts_with("i8*") || is_string_type_hint(ft) {
+                            let sval = format!("%self_fld_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sval, val64));
+                            return TypedValue { reg: sval, ty: IrType::Ptr };
+                        }
+                    }
+                    return TypedValue { reg: val64, ty: IrType::I64 };
                 }
             }
         }
 
-        // Module-qualified function reference as a first-class value (e.g. `rsa.prime.getprime` or `getprime`)
+        // Module-qualified or bare function reference as a first-class value (`rsa.prime.getprime` or `getprime`)
         if trimmed.contains('.') && !trimmed.contains('(') {
             if let Some(last_seg) = trimmed.rsplit('.').next() {
                 let fn_cand = last_seg.trim();
@@ -1968,40 +2813,41 @@ impl<'a> CodeGenerator<'a> {
                     let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!(
-                        "  {} = bitcast i32 (i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
+                        "  {} = bitcast i64 (i64, i64, i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
                         raw_fptr, fn_cand
                     ));
                     ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
-                    let fptr_cast = format!("%fn_ref_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!(
-                        "  {} = ptrtoint i8* {} to i32\n",
-                        fptr_cast, raw_fptr
-                    ));
-                    return fptr_cast;
+                    return TypedValue { reg: raw_fptr, ty: IrType::Ptr };
                 }
             }
         } else if scope_tree.known_functions.contains(trimmed) {
             let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!(
-                "  {} = bitcast i32 (i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
+                "  {} = bitcast i64 (i64, i64, i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
                 raw_fptr, trimmed
             ));
             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
-            let fptr_cast = format!("%fn_ref_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!(
-                "  {} = ptrtoint i8* {} to i32\n",
-                fptr_cast, raw_fptr
-            ));
-            return fptr_cast;
+            return TypedValue { reg: raw_fptr, ty: IrType::Ptr };
         }
 
-        "0".to_string()
+        TypedValue { reg: "0".to_string(), ty: IrType::I64 }
     }
 
-    /// Evaluates a comparison expression into an LLVM i1 register
+    /// Evaluates an expression or variable into an LLVM `i32` register (used for POSIX fds & exit codes).
+    fn eval_val(
+        &self,
+        expr: &str,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> String {
+        let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+        self.coerce_to_i32(tv, ir, temp_counter)
+    }
+
+    /// Evaluates a comparison or boolean expression into an LLVM `i1` register (`icmp` / `fcmp` / `@strcmp`).
     fn eval_cond(
         &self,
         cond: &str,
@@ -2017,36 +2863,44 @@ impl<'a> CodeGenerator<'a> {
             clean_cond = clean_cond.replace(" is None", " == null");
         }
 
-        if let Some((left_c, right_c)) = clean_cond.split_once(" and ") {
-            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
-            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
-            let res = format!("%and_cond_{}", *temp_counter);
+        if let Some((left_c, right_c)) = clean_cond
+            .split_once(" or ")
+            .or_else(|| clean_cond.split_once(" || "))
+        {
+            let sc_id = *temp_counter;
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = and i1 {}, {}\n", res, l_res, r_res));
-            return res;
-        }
-        if let Some((left_c, right_c)) = clean_cond.split_once(" && ") {
             let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
-            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
-            let res = format!("%and_cond_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!("  {} = and i1 {}, {}\n", res, l_res, r_res));
-            return res;
-        }
-        if let Some((left_c, right_c)) = clean_cond.split_once(" or ") {
-            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!(
+                "  br i1 {}, label %sc_or_short_{}, label %sc_or_rhs_{}\n\nsc_or_short_{}:\n  br label %sc_or_merge_{}\n\nsc_or_rhs_{}:\n",
+                l_res, sc_id, sc_id, sc_id, sc_id, sc_id
+            ));
             let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
             let res = format!("%or_cond_{}", *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = or i1 {}, {}\n", res, l_res, r_res));
+            ir.push_str(&format!(
+                "  br label %sc_or_done_{}\n\nsc_or_done_{}:\n  br label %sc_or_merge_{}\n\nsc_or_merge_{}:\n  {} = phi i1 [ true, %sc_or_short_{} ], [ {}, %sc_or_done_{} ]\n",
+                sc_id, sc_id, sc_id, sc_id, res, sc_id, r_res, sc_id
+            ));
             return res;
         }
-        if let Some((left_c, right_c)) = clean_cond.split_once(" || ") {
-            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
-            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
-            let res = format!("%or_cond_{}", *temp_counter);
+        if let Some((left_c, right_c)) = clean_cond
+            .split_once(" and ")
+            .or_else(|| clean_cond.split_once(" && "))
+        {
+            let sc_id = *temp_counter;
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = or i1 {}, {}\n", res, l_res, r_res));
+            let l_res = self.eval_cond(left_c, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!(
+                "  br i1 {}, label %sc_and_rhs_{}, label %sc_and_short_{}\n\nsc_and_short_{}:\n  br label %sc_and_merge_{}\n\nsc_and_rhs_{}:\n",
+                l_res, sc_id, sc_id, sc_id, sc_id, sc_id
+            ));
+            let r_res = self.eval_cond(right_c, ir, scope_tree, string_constants, temp_counter);
+            let res = format!("%and_cond_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  br label %sc_and_done_{}\n\nsc_and_done_{}:\n  br label %sc_and_merge_{}\n\nsc_and_merge_{}:\n  {} = phi i1 [ false, %sc_and_short_{} ], [ {}, %sc_and_done_{} ]\n",
+                sc_id, sc_id, sc_id, sc_id, res, sc_id, r_res, sc_id
+            ));
             return res;
         }
 
@@ -2071,9 +2925,48 @@ impl<'a> CodeGenerator<'a> {
             let op = &caps[2];
             let right_raw = caps[3].trim();
 
+            // 1. Null / nil / None checks (`if err != nil`, `if node == null`) — never pass `null` to `@strcmp`
+            if is_null_literal(left_raw) || is_null_literal(right_raw) {
+                let non_null_expr = if is_null_literal(left_raw) { right_raw } else { left_raw };
+                let predicate = match op {
+                    "===" | "==" => "eq",
+                    "!==" | "!=" | "~=" => "ne",
+                    _ => "ne",
+                };
+                if is_null_literal(non_null_expr) {
+                    let cval = if predicate == "eq" { "true" } else { "false" };
+                    let cond_var = format!("%null_const_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp eq i1 {}, true\n", cond_var, cval));
+                    return cond_var;
+                }
+                let tv = self.eval_typed(non_null_expr, ir, scope_tree, string_constants, temp_counter);
+                let cond_var = format!("%null_cmp_{}", *temp_counter);
+                *temp_counter += 1;
+                match tv.ty {
+                    IrType::Ptr => {
+                        ir.push_str(&format!("  {} = icmp {} i8* {}, null\n", cond_var, predicate, tv.reg));
+                    }
+                    IrType::StructPtr(cls) => {
+                        ir.push_str(&format!(
+                            "  {} = icmp {} %struct.{}* {}, null\n",
+                            cond_var, predicate, cls, tv.reg
+                        ));
+                    }
+                    _ => {
+                        let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                        ir.push_str(&format!("  {} = icmp {} i64 {}, 0\n", cond_var, predicate, v64));
+                    }
+                }
+                return cond_var;
+            }
+
+            // 2. Lexicographical string comparisons via `@strcmp`
             if (Self::is_string_expr(left_raw, scope_tree) || Self::is_string_expr(right_raw, scope_tree))
-                && left_raw.parse::<i32>().is_err()
-                && right_raw.parse::<i32>().is_err()
+                && parse_polyglot_i64(left_raw).is_none()
+                && parse_polyglot_i64(right_raw).is_none()
+                && parse_polyglot_f64(left_raw).is_none()
+                && parse_polyglot_f64(right_raw).is_none()
             {
                 let left_ptr = self.eval_str_ptr(left_raw, ir, scope_tree, string_constants, temp_counter);
                 let right_ptr = self.eval_str_ptr(right_raw, ir, scope_tree, string_constants, temp_counter);
@@ -2084,9 +2977,8 @@ impl<'a> CodeGenerator<'a> {
                 let cond_var = format!("%cond_{}", *temp_counter);
                 *temp_counter += 1;
                 let predicate = match op {
-                    "===" => "eq",
-                    "==" => "eq",
-                    "!=" => "ne",
+                    "===" | "==" => "eq",
+                    "!==" | "!=" | "~=" => "ne",
                     "<" => "slt",
                     "<=" => "sle",
                     ">" => "sgt",
@@ -2100,15 +2992,35 @@ impl<'a> CodeGenerator<'a> {
                 return cond_var;
             }
 
-            let left = self.eval_val(left_raw, ir, scope_tree, string_constants, temp_counter);
-            let right = self.eval_val(right_raw, ir, scope_tree, string_constants, temp_counter);
+            // 3. Typed IEEE-754 `fcmp` or 64-bit `icmp`
+            let ltv = self.eval_typed(left_raw, ir, scope_tree, string_constants, temp_counter);
+            let rtv = self.eval_typed(right_raw, ir, scope_tree, string_constants, temp_counter);
 
             let cond_var = format!("%cond_{}", *temp_counter);
             *temp_counter += 1;
 
+            if ltv.ty == IrType::F64 || rtv.ty == IrType::F64 {
+                let lf = self.coerce_to_f64(ltv, ir, temp_counter);
+                let rf = self.coerce_to_f64(rtv, ir, temp_counter);
+                let fpred = match op {
+                    "===" | "==" => "oeq",
+                    "!==" | "!=" | "~=" => "une",
+                    "<" => "olt",
+                    "<=" => "ole",
+                    ">" => "ogt",
+                    ">=" => "oge",
+                    _ => "une",
+                };
+                ir.push_str(&format!("  {} = fcmp {} double {}, {}\n", cond_var, fpred, lf, rf));
+                return cond_var;
+            }
+
+            let left = self.coerce_to_i64(ltv, ir, temp_counter);
+            let right = self.coerce_to_i64(rtv, ir, temp_counter);
+
             let predicate = match op {
-                "==" => "eq",
-                "!=" => "ne",
+                "===" | "==" => "eq",
+                "!==" | "!=" | "~=" => "ne",
                 "<" => "slt",
                 "<=" => "sle",
                 ">" => "sgt",
@@ -2117,17 +3029,38 @@ impl<'a> CodeGenerator<'a> {
             };
 
             ir.push_str(&format!(
-                "  {} = icmp {} i32 {}, {}\n",
+                "  {} = icmp {} i64 {}, {}\n",
                 cond_var, predicate, left, right
             ));
             return cond_var;
         }
 
-        // Truthiness check on value != 0
-        let val = self.eval_val(trimmed, ir, scope_tree, string_constants, temp_counter);
+        // Truthiness check on typed value
+        let tv = self.eval_typed(trimmed, ir, scope_tree, string_constants, temp_counter);
         let cond_var = format!("%cond_{}", *temp_counter);
         *temp_counter += 1;
-        ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cond_var, val));
+        match tv.ty {
+            IrType::F64 => {
+                ir.push_str(&format!(
+                    "  {} = fcmp une double {}, 0x0000000000000000\n",
+                    cond_var, tv.reg
+                ));
+            }
+            IrType::Ptr => {
+                ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", cond_var, tv.reg));
+            }
+            IrType::StructPtr(cls) => {
+                ir.push_str(&format!(
+                    "  {} = icmp ne %struct.{}* {}, null\n",
+                    cond_var, cls, tv.reg
+                ));
+            }
+            IrType::I1 => return tv.reg,
+            _ => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                ir.push_str(&format!("  {} = icmp ne i64 {}, 0\n", cond_var, v64));
+            }
+        }
         cond_var
     }
 
@@ -2204,20 +3137,17 @@ impl<'a> CodeGenerator<'a> {
         let elem_val = format!("%elem_val_{}", *temp_counter);
         *temp_counter += 1;
         ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", elem_val, src_ld, curr_idx));
-        let elem_32 = format!("%elem_32_{}", *temp_counter);
-        *temp_counter += 1;
-        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_32, elem_val));
 
         let param_ptr = format!("%var_{}_{}", param_var, *temp_counter);
         *temp_counter += 1;
-        ir.push_str(&format!("  {} = alloca i32\n", param_ptr));
-        ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_32, param_ptr));
+        ir.push_str(&format!("  {} = alloca i64\n", param_ptr));
+        ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_val, param_ptr));
         scope_tree.insert(
             param_var.to_string(),
             SymbolBinding {
                 name: param_var.to_string(),
                 llvm_ptr: param_ptr,
-                type_hint: "i32".to_string(),
+                type_hint: "i64".to_string(),
                 is_scoped: true,
             },
         );
@@ -2241,6 +3171,56 @@ impl<'a> CodeGenerator<'a> {
         true
     }
 
+    fn emit_typed_print_arg(
+        &self,
+        arg_expr: &str,
+        print_fn: &str,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) {
+        let arg_trim = arg_expr.trim();
+        if Self::is_string_expr(arg_trim, scope_tree)
+            || scope_tree
+                .resolve(arg_trim)
+                .map(|b| is_string_type_hint(&b.type_hint) || b.type_hint.contains("omni_unpack"))
+                .unwrap_or(false)
+        {
+            let str_ptr = self.eval_str_ptr(arg_trim, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, str_ptr));
+            return;
+        }
+
+        let tv = self.eval_typed(arg_trim, ir, scope_tree, string_constants, temp_counter);
+        match tv.ty {
+            IrType::F64 => {
+                if print_fn == "__omni_print_str" {
+                    ir.push_str(&format!("  call void @__omni_print_float(double {})\n", tv.reg));
+                } else {
+                    let fstr = format!("%print_fstr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_float_to_str(double {})\n", fstr, tv.reg));
+                    ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, fstr));
+                }
+            }
+            IrType::Ptr => {
+                ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, tv.reg));
+            }
+            _ => {
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                if print_fn == "__omni_print_str" {
+                    ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", v64));
+                } else {
+                    let istr = format!("%print_istr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_int_to_str(i64 {})\n", istr, v64));
+                    ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, istr));
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_statements(
         &self,
@@ -2261,7 +3241,8 @@ impl<'a> CodeGenerator<'a> {
     ) -> anyhow::Result<bool> {
         let mut custom_return = false;
 
-        for stmt in stmts {
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
+            let is_last_stmt = stmt_idx + 1 == stmts.len();
             match stmt {
                 // 1. Variable Assignment or Scoped Declaration: `x = 5`, `count := 0`
                 Statement::Assign {
@@ -2345,18 +3326,12 @@ impl<'a> CodeGenerator<'a> {
                                                 ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
                                                 ld64
                                             } else {
-                                                let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
-                                                let ext = format!("%ext_fld_{}", *temp_counter);
-                                                *temp_counter += 1;
-                                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
-                                                ext
+                                                let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                                self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                                             }
                                         } else {
-                                            let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
-                                            let ext = format!("%ext_fld_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
-                                            ext
+                                            let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                            self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                                         }
                                     } else if trimmed_expr == "root" || trimmed_expr == "head" {
                                         if let Some(self_b) = scope_tree.resolve("self") {
@@ -2375,20 +3350,32 @@ impl<'a> CodeGenerator<'a> {
                                         } else {
                                             "0".to_string()
                                         }
-                                    } else if trimmed_expr == "null" || trimmed_expr == "nil" || trimmed_expr == "None" {
+                                    } else if is_null_literal(trimmed_expr) {
                                         "0".to_string()
                                     } else if is_str_binding {
                                         let src_b = scope_tree.resolve(trimmed_expr).unwrap();
-                                        let ld64 = format!("%str_ld64_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, src_b.llvm_ptr));
-                                        ld64
+                                        if src_b.type_hint.starts_with("i8*") {
+                                            let ldp = format!("%str_ldp_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ldp, src_b.llvm_ptr));
+                                            let p64 = format!("%str_p64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", p64, ldp));
+                                            p64
+                                        } else {
+                                            let ld64 = format!("%str_ld64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, src_b.llvm_ptr));
+                                            ld64
+                                        }
                                     } else {
-                                        let val_reg = self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
-                                        let ext = format!("%ext_fld_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
-                                        ext
+                                        let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                        if tv.ty == IrType::F64 {
+                                            if let Some(ft_map) = scope_tree.class_field_types.get_mut(cls_name) {
+                                                ft_map.entry(syn_fld.to_string()).or_insert_with(|| "f64".to_string());
+                                            }
+                                        }
+                                        self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                                     };
                                     let inst_ld = format!("%inst_fld_ld_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -2406,18 +3393,28 @@ impl<'a> CodeGenerator<'a> {
                     // Struct pointer variable assignment: `current = self.root`, `current = root`, `current = current.next`, `prev = current`, `prev = None`, `current = null`
                     let is_struct_ptr_target = if scope_tree.resolve(target).map(|b| b.type_hint.starts_with("%struct.")).unwrap_or(false) {
                         true
-                    } else if target == "current" || target == "prev" || target == "node" {
+                    } else if (target == "current" || target == "prev" || target == "node") && scope_tree.class_fields.contains_key("Node") {
                         true
                     } else if scope_tree.resolve(trimmed_expr).map(|b| b.type_hint.starts_with("%struct.")).unwrap_or(false) {
                         true
-                    } else if trimmed_expr == "root" || trimmed_expr == "head" || trimmed_expr == "self.root" || trimmed_expr.ends_with(".next") {
+                    } else if (trimmed_expr == "root" || trimmed_expr == "head" || trimmed_expr == "self.root" || trimmed_expr.ends_with(".next")) && scope_tree.class_fields.contains_key("Node") {
                         true
                     } else {
                         false
                     };
 
                     if is_struct_ptr_target && !trimmed_expr.starts_with("new ") && !trimmed_expr.ends_with(')') {
-                        let struct_cls = "Node";
+                        let struct_cls = scope_tree
+                            .resolve(target)
+                            .and_then(|b| b.type_hint.strip_prefix("%struct."))
+                            .map(|s| s.trim_end_matches('*').to_string())
+                            .or_else(|| {
+                                scope_tree
+                                    .resolve(trimmed_expr)
+                                    .and_then(|b| b.type_hint.strip_prefix("%struct."))
+                                    .map(|s| s.trim_end_matches('*').to_string())
+                            })
+                            .unwrap_or_else(|| "Node".to_string());
                         let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
                             let ptr = format!("%var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
@@ -2436,7 +3433,7 @@ impl<'a> CodeGenerator<'a> {
                             scope_tree.resolve(target).unwrap().llvm_ptr.clone()
                         };
 
-                        if trimmed_expr == "null" || trimmed_expr == "nil" || trimmed_expr == "None" {
+                        if is_null_literal(trimmed_expr) {
                             ir.push_str(&format!("  store %struct.{}* null, %struct.{}** {}\n", struct_cls, struct_cls, alloca_ptr));
                         } else if let Some(src_b) = scope_tree.resolve(trimmed_expr) {
                             if src_b.type_hint.starts_with("%struct.") {
@@ -2444,7 +3441,15 @@ impl<'a> CodeGenerator<'a> {
                                 let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
-                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ld_inst, struct_cls, alloca_ptr));
+                                let store_inst = if s_cls == struct_cls {
+                                    ld_inst
+                                } else {
+                                    let bc = format!("%inst_bc_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = bitcast %struct.{}* {} to %struct.{}*\n", bc, s_cls, ld_inst, struct_cls));
+                                    bc
+                                };
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, store_inst, struct_cls, alloca_ptr));
                             }
                         } else if trimmed_expr.contains('.') {
                             let parts: Vec<&str> = trimmed_expr.split('.').collect();
@@ -2492,13 +3497,27 @@ impl<'a> CodeGenerator<'a> {
                         continue;
                     }
 
-                    // Class / Struct Constructor Call: `c = Counter(10)` or `u = new User(...)`
+                    // Class / Struct Constructor Call: `c = Counter(10)`, `u = new User(...)`, or Rust `h = Adler32::new()`
                     let ctor_candidate_expr = trimmed_expr.strip_prefix("new ").unwrap_or(trimmed_expr).trim();
                     if let Some(open) = ctor_candidate_expr.find('(') {
                         if ctor_candidate_expr.ends_with(')') {
                             let cls_cand = ctor_candidate_expr[..open].trim();
-                            if scope_tree.class_fields.contains_key(cls_cand) {
-                                let cls_name = cls_cand;
+                            let (cls_name_opt, assoc_ctor_method) = if scope_tree.class_fields.contains_key(cls_cand) {
+                                (Some(cls_cand), "__init__")
+                            } else if let Some((base_cls, assoc_m)) = cls_cand.split_once("::") {
+                                let base_cls = base_cls.trim();
+                                let assoc_m = assoc_m.trim();
+                                if scope_tree.class_fields.contains_key(base_cls)
+                                    && (assoc_m == "new" || assoc_m == "default" || assoc_m.starts_with("from_"))
+                                {
+                                    (Some(base_cls), assoc_m)
+                                } else {
+                                    (None, "__init__")
+                                }
+                            } else {
+                                (None, "__init__")
+                            };
+                            if let Some(cls_name) = cls_name_opt {
                                 let f_count = scope_tree.class_fields.get(cls_name).map(|m| m.len()).unwrap_or(1);
                                 let alloc_bytes = (f_count * 8).max(8);
 
@@ -2519,70 +3538,42 @@ impl<'a> CodeGenerator<'a> {
 
                                 let mut arg_regs = Vec::new();
                                 for a in &raw_args {
-                                    let a_trim = a.trim();
-                                    if (a_trim.starts_with('"') && a_trim.ends_with('"'))
-                                        || (a_trim.starts_with('\'') && a_trim.ends_with('\''))
-                                    {
-                                        let text = &a_trim[1..a_trim.len() - 1];
-                                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
-                                            let str_ptr = format!("%ctor_str_lit_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!(
-                                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
-                                                str_ptr, len, len, const_name
-                                            ));
-                                            let str_i64 = format!("%ctor_str_i64_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", str_i64, str_ptr));
-                                            arg_regs.push(str_i64);
-                                            continue;
-                                        }
-                                    }
-                                    if Self::is_string_expr(a_trim, scope_tree) {
-                                        let str_ptr = self.eval_str_ptr(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                        let str_i64 = format!("%ctor_str_i64_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", str_i64, str_ptr));
-                                        arg_regs.push(str_i64);
-                                        continue;
-                                    }
-                                    if let Some(b) = scope_tree.resolve(a_trim) {
-                                        if is_64bit_type_hint(&b.type_hint) {
-                                            let ld_ptr = format!("%ctor_ptr_ld_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = load i64, i64* {}\n", ld_ptr, b.llvm_ptr));
-                                            arg_regs.push(ld_ptr);
-                                            continue;
-                                        }
-                                    }
-                                    let r = self.eval_val(a_trim, ir, scope_tree, string_constants, temp_counter);
-                                    let ext = format!("%init_ext_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                    arg_regs.push(ext);
+                                    let a_clean = Self::strip_kwarg_prefix(a);
+                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                 }
-                                while arg_regs.len() < 3 {
+                                while arg_regs.len() < 5 {
                                     arg_regs.push("0".to_string());
                                 }
 
-                                let def_cls = scope_tree.resolve_defining_class(cls_name, "__init__");
+                                let def_cls = scope_tree.resolve_defining_class(cls_name, assoc_ctor_method);
                                 let init_ret = format!("%init_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
-                                    "  {} = call i32 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                    init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                    init_ret, def_cls, assoc_ctor_method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                 ));
 
-                                let target_ptr = format!("%var_{}_{}", target, *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca %struct.{}*\n", target_ptr, cls_name));
+                                let expected_th = format!("%struct.{}*", cls_name);
+                                let target_ptr = if let Some(eb) = (!*is_scoped_decl)
+                                    .then(|| scope_tree.resolve(target))
+                                    .flatten()
+                                    .filter(|b| b.type_hint == expected_th)
+                                {
+                                    eb.llvm_ptr.clone()
+                                } else {
+                                    let tp = format!("%var_{}_{}", target, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca %struct.{}*\n", tp, cls_name));
+                                    scope_tree.insert(target.clone(), SymbolBinding {
+                                        name: target.clone(),
+                                        llvm_ptr: tp.clone(),
+                                        type_hint: expected_th,
+                                        is_scoped: true,
+                                    });
+                                    tp
+                                };
                                 ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls_name, inst_alloc, cls_name, target_ptr));
-                                scope_tree.insert(target.clone(), SymbolBinding {
-                                    name: target.clone(),
-                                    llvm_ptr: target_ptr,
-                                    type_hint: format!("%struct.{}*", cls_name),
-                                    is_scoped: true,
-                                });
                                 continue;
                             }
                         }
@@ -2604,14 +3595,17 @@ impl<'a> CodeGenerator<'a> {
                                     if let Some((f_name, f_val)) = fp_trim.split_once(':') {
                                         let fn_clean = f_name.trim();
                                         if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fn_clean)) {
-                                            let val_reg = self.eval_val(f_val.trim(), ir, scope_tree, string_constants, temp_counter);
-                                            let ext = format!("%ext_init_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
+                                            let ftv = self.eval_typed(f_val.trim(), ir, scope_tree, string_constants, temp_counter);
+                                            if ftv.ty == IrType::F64 {
+                                                if let Some(ft_map) = scope_tree.class_field_types.get_mut(cls_name) {
+                                                    ft_map.entry(fn_clean.to_string()).or_insert_with(|| "f64".to_string());
+                                                }
+                                            }
+                                            let bits = self.coerce_to_raw_i64_bits(ftv, ir, temp_counter);
                                             let gep = format!("%init_gep_{}", *temp_counter);
                                             *temp_counter += 1;
                                             ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_alloc, f_idx));
-                                            ir.push_str(&format!("  store i64 {}, i64* {}\n", ext, gep));
+                                            ir.push_str(&format!("  store i64 {}, i64* {}\n", bits, gep));
                                         }
                                     }
                                 }
@@ -2648,11 +3642,9 @@ impl<'a> CodeGenerator<'a> {
                         ir.push_str(&format!("  {} = getelementptr inbounds %enum.{}, %enum.{}* {}, i32 0, i32 1\n", payload_gep, e_name, e_name, inst_alloc));
 
                         if let Some(payload_expr) = payload_val {
-                            let val_reg = self.eval_val(&payload_expr, ir, scope_tree, string_constants, temp_counter);
-                            let ext = format!("%payload_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val_reg));
-                            ir.push_str(&format!("  store i64 {}, i64* {}\n", ext, payload_gep));
+                            let ptv = self.eval_typed(&payload_expr, ir, scope_tree, string_constants, temp_counter);
+                            let pbits = self.coerce_to_raw_i64_bits(ptv, ir, temp_counter);
+                            ir.push_str(&format!("  store i64 {}, i64* {}\n", pbits, payload_gep));
                         } else {
                             ir.push_str(&format!("  store i64 0, i64* {}\n", payload_gep));
                         }
@@ -2724,7 +3716,7 @@ impl<'a> CodeGenerator<'a> {
 
                     // Method returning slice instance: `linkedlist.asList()`
                     if trimmed_expr.ends_with(".asList()") || trimmed_expr.ends_with(".toList()") {
-                        self.eval_val(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                        let _ = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
                         let slice_ptr = format!("%slice_ptr_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
@@ -2787,6 +3779,40 @@ impl<'a> CodeGenerator<'a> {
                     };
 
                     if is_foreign_call && !is_c_ecosystem_call {
+                        let target_ptr = if !*is_scoped_decl {
+                            if let Some(eb) = scope_tree.resolve(target).filter(|b| b.type_hint == "i64") {
+                                eb.llvm_ptr.clone()
+                            } else {
+                                let p = format!("%var_{}_{}", target, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i64\n", p));
+                                scope_tree.insert(
+                                    target.clone(),
+                                    SymbolBinding {
+                                        name: target.clone(),
+                                        llvm_ptr: p.clone(),
+                                        type_hint: "i64".to_string(),
+                                        is_scoped: *is_scoped_decl,
+                                    },
+                                );
+                                p
+                            }
+                        } else {
+                            let p = format!("%var_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca i64\n", p));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: p.clone(),
+                                    type_hint: "i64".to_string(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                            p
+                        };
+
                         let active_symbols: Vec<SsaVariable> = scope_tree
                             .active_bindings()
                             .into_iter()
@@ -2797,23 +3823,10 @@ impl<'a> CodeGenerator<'a> {
                             })
                             .collect();
 
-                        let target_ptr = format!("%var_{}_{}", target, *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca i32\n", target_ptr));
-                        scope_tree.insert(
-                            target.clone(),
-                            SymbolBinding {
-                                name: target.clone(),
-                                llvm_ptr: target_ptr.clone(),
-                                type_hint: "i32".to_string(),
-                                is_scoped: *is_scoped_decl,
-                            },
-                        );
-
                         let envelope = SsaContextEnvelope {
                             target_abi: host_target_triple().to_string(),
                             enclosing_fn: fn_name.to_string(),
-                            return_type: "i32".to_string(),
+                            return_type: if fn_name == "main" { "i32".to_string() } else { "i64".to_string() },
                             next_ssa_idx: *temp_counter,
                             active_symbols,
                             struct_definitions: struct_defs.to_vec(),
@@ -2822,7 +3835,7 @@ impl<'a> CodeGenerator<'a> {
                             anchor_id: Some(*lbl_counter),
                             physical_source: Some(format!("{} = {}", target, trimmed_expr)),
                             concurrency_mode: None,
-                            yield_expectation: Some(format!("store scalar result to {}", target_ptr)),
+                            yield_expectation: Some(format!("store 64-bit scalar result to {}", target_ptr)),
                             action_directive: Some("LOWER_ASSIGNMENT".to_string()),
                             ecosystem_context: ecosystem_context.map(|s| s.to_string()),
                             lifetime_context: None,
@@ -2840,27 +3853,39 @@ impl<'a> CodeGenerator<'a> {
                             ir.push('\n');
                         }
 
-                        if !body.contains(&format!("* {}", target_ptr)) && !body.contains(&format!("*{}", target_ptr)) {
-                            // Find last `%reg = ` in body and store to target_ptr
-                            if let Some(last_eq) = body.rfind('=') {
-                                if let Some(pct) = body[..last_eq].rfind('%') {
-                                    let reg = body[pct..last_eq].trim();
-                                    let line_after_eq = &body[last_eq + 1..];
-                                    let first_nl = line_after_eq.find('\n').unwrap_or(line_after_eq.len());
-                                    let rhs = line_after_eq[..first_nl].trim();
+                        let exec_lines: Vec<&str> = body
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty() && !l.starts_with(';'))
+                            .collect();
+                        let already_stored = exec_lines.iter().any(|l| {
+                            l.starts_with("store ")
+                                && (l.contains(&format!("* {}", target_ptr)) || l.contains(&format!("*{}", target_ptr)))
+                        });
+
+                        if !already_stored {
+                            if let Some(last_assign) = exec_lines.iter().rev().find(|l| l.starts_with('%') && l.contains('=')) {
+                                if let Some(eq_pos) = last_assign.find('=') {
+                                    let reg = last_assign[..eq_pos].trim();
+                                    let rhs = last_assign[eq_pos + 1..].trim();
                                     let head = rhs.split('(').next().unwrap_or(rhs);
                                     if rhs.starts_with("call i8*") || rhs.starts_with("load i8*") || head.contains("i8*") || rhs.starts_with("inttoptr") || rhs.starts_with("getelementptr") {
-                                        let cast_reg = format!("%ptr_to_i32_{}", *temp_counter);
+                                        let cast_reg = format!("%ptr_to_i64_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_reg, reg));
-                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_reg, target_ptr));
+                                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_reg, reg));
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", cast_reg, target_ptr));
                                     } else if (rhs.starts_with("call i64") || rhs.starts_with("load i64") || head.contains("i64")) && !rhs.contains("to i32") {
-                                        let trunc_reg = format!("%trunc_{}", *temp_counter);
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", reg, target_ptr));
+                                    } else if rhs.starts_with("call double") || rhs.starts_with("load double") || head.contains("double") {
+                                        let fbits = format!("%f_to_i64_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", trunc_reg, reg));
-                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", trunc_reg, target_ptr));
+                                        ir.push_str(&format!("  {} = fptosi double {} to i64\n", fbits, reg));
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", fbits, target_ptr));
                                     } else {
-                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", reg, target_ptr));
+                                        let sext_reg = format!("%sext_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", sext_reg, reg));
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", sext_reg, target_ptr));
                                     }
                                 }
                             }
@@ -2868,11 +3893,11 @@ impl<'a> CodeGenerator<'a> {
                         continue;
                     }
 
-                    let existing_binding = scope_tree.resolve(trimmed_expr).cloned();
+                    let existing_src_binding = scope_tree.resolve(trimmed_expr).cloned();
 
-                    if let Some(src) = existing_binding.filter(|b| b.type_hint.starts_with("i8*")) {
-                        // Preserving collection/channel reference semantics (no truncating to scalar int!)
-                        let ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                    if let Some(src) = existing_src_binding.filter(|b| b.type_hint.starts_with("i8*")) {
+                        // Preserving collection/channel/string reference semantics (zero truncation)
+                        let ptr = if *is_scoped_decl || scope_tree.resolve(target).filter(|b| b.type_hint.starts_with("i8*")).is_none() {
                             let p = format!("%col_ref_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca i8*\n", p));
@@ -2900,7 +3925,7 @@ impl<'a> CodeGenerator<'a> {
                         || (trimmed_expr.starts_with('"') && trimmed_expr.ends_with('"'))
                         || (trimmed_expr.starts_with('\'') && trimmed_expr.ends_with('\''))
                     {
-                        let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                        let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).filter(|b| b.type_hint.starts_with("i8*")).is_none() {
                             let ptr = format!("%str_var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca i8*\n", ptr));
@@ -2922,31 +3947,7 @@ impl<'a> CodeGenerator<'a> {
                         ir.push_str(&format!("  store i8* {}, i8** {}\n", str_val, alloca_ptr));
                     } else {
                         let is_fn_ref = !trimmed_expr.contains('(') && trimmed_expr.rsplit('.').next().map(|s| scope_tree.known_functions.contains(s.trim())).unwrap_or(false);
-                        let existing_ptr_binding = if !*is_scoped_decl {
-                            scope_tree
-                                .resolve(target)
-                                .filter(|b| b.type_hint.starts_with("i8*"))
-                                .map(|b| b.llvm_ptr.clone())
-                        } else {
-                            None
-                        };
-
-                        if let Some(ptr_slot) = existing_ptr_binding {
-                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            let tramp = format!("%assign_tramp_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
-                            let is_null = format!("%assign_is_null_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
-                            let fallback = format!("%assign_fallback_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback, val));
-                            let final_ptr = format!("%assign_ptr_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", final_ptr, is_null, fallback, tramp));
-                            ir.push_str(&format!("  store i8* {}, i8** {}\n", final_ptr, ptr_slot));
-                        } else if is_fn_ref {
+                        if is_fn_ref && scope_tree.resolve(trimmed_expr).is_none() {
                             let ptr = format!("%fn_var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca i8*\n", ptr));
@@ -2959,32 +3960,130 @@ impl<'a> CodeGenerator<'a> {
                                     is_scoped: *is_scoped_decl,
                                 },
                             );
-                            let _ = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            let tramp = format!("%fn_tramp_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
-                            ir.push_str(&format!("  store i8* {}, i8** {}\n", tramp, ptr));
+                            let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                            let fptr = self.coerce_to_ptr(tv, ir, temp_counter);
+                            ir.push_str(&format!("  store i8* {}, i8** {}\n", fptr, ptr));
+                            continue;
+                        }
+
+                        ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                        let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                        let existing_target = if !*is_scoped_decl {
+                            scope_tree.resolve(target).cloned()
                         } else {
-                            let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
+                            None
+                        };
+
+                        match tv.ty {
+                            IrType::F64 => {
+                                let alloca_ptr = if let Some(eb) = existing_target.filter(|b| b.type_hint == "double") {
+                                    eb.llvm_ptr
+                                } else {
+                                    let ptr = format!("%flt_var_{}_{}", target, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca double\n", ptr));
+                                    scope_tree.insert(
+                                        target.clone(),
+                                        SymbolBinding {
+                                            name: target.clone(),
+                                            llvm_ptr: ptr.clone(),
+                                            type_hint: "double".to_string(),
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    ptr
+                                };
+                                ir.push_str(&format!("  store double {}, double* {}\n", tv.reg, alloca_ptr));
+                            }
+                            IrType::StructPtr(ref cls) => {
+                                let expected_th = format!("%struct.{}*", cls);
+                                let alloca_ptr = if let Some(eb) = existing_target.filter(|b| b.type_hint == expected_th) {
+                                    eb.llvm_ptr
+                                } else {
+                                    let ptr = format!("%sptr_var_{}_{}", target, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca %struct.{}*\n", ptr, cls));
+                                    scope_tree.insert(
+                                        target.clone(),
+                                        SymbolBinding {
+                                            name: target.clone(),
+                                            llvm_ptr: ptr.clone(),
+                                            type_hint: expected_th,
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    ptr
+                                };
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, tv.reg, cls, alloca_ptr));
+                            }
+                            IrType::Ptr => {
+                                let alloca_ptr = if let Some(eb) = existing_target.filter(|b| b.type_hint.starts_with("i8*")) {
+                                    eb.llvm_ptr
+                                } else {
+                                    let ptr = format!("%ptr_var_{}_{}", target, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                                    scope_tree.insert(
+                                        target.clone(),
+                                        SymbolBinding {
+                                            name: target.clone(),
+                                            llvm_ptr: ptr.clone(),
+                                            type_hint: "i8* (string)".to_string(),
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    ptr
+                                };
+                                ir.push_str(&format!("  store i8* {}, i8** {}\n", tv.reg, alloca_ptr));
+                            }
+                            IrType::I64 | IrType::I32 | IrType::I1 => {
+                                if let Some(eb) = existing_target {
+                                    if eb.type_hint == "double" {
+                                        let fv = self.coerce_to_f64(tv, ir, temp_counter);
+                                        ir.push_str(&format!("  store double {}, double* {}\n", fv, eb.llvm_ptr));
+                                        continue;
+                                    } else if eb.type_hint.starts_with("i8*") {
+                                        let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                                        let tramp = format!("%assign_tramp_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                                        let is_null = format!("%assign_is_null_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
+                                        let fallback = format!("%assign_fallback_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", fallback, v64));
+                                        let final_ptr = format!("%assign_ptr_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", final_ptr, is_null, fallback, tramp));
+                                        ir.push_str(&format!("  store i8* {}, i8** {}\n", final_ptr, eb.llvm_ptr));
+                                        continue;
+                                    } else if eb.type_hint == "i32" {
+                                        let v32 = self.coerce_to_i32(tv, ir, temp_counter);
+                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", v32, eb.llvm_ptr));
+                                        continue;
+                                    } else if eb.type_hint == "i64" {
+                                        let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", v64, eb.llvm_ptr));
+                                        continue;
+                                    }
+                                }
+
+                                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
                                 let ptr = format!("%var_{}_{}", target, *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                                ir.push_str(&format!("  {} = alloca i64\n", ptr));
                                 scope_tree.insert(
                                     target.clone(),
                                     SymbolBinding {
                                         name: target.clone(),
                                         llvm_ptr: ptr.clone(),
-                                        type_hint: "i32".to_string(),
+                                        type_hint: "i64".to_string(),
                                         is_scoped: *is_scoped_decl,
                                     },
                                 );
-                                ptr
-                            } else {
-                                scope_tree.resolve(target).unwrap().llvm_ptr.clone()
-                            };
-
-                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            ir.push_str(&format!("  store i32 {}, i32* {}\n", val, alloca_ptr));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", v64, ptr));
+                            }
                         }
                     }
                 }
@@ -3032,22 +4131,19 @@ impl<'a> CodeGenerator<'a> {
                                     let p_val64 = format!("%arm_{}_pval64_{}", arm_idx, *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = load i64, i64* {}\n", p_val64, p_gep));
-                                    let p_val32 = format!("%arm_{}_pval32_{}", arm_idx, *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", p_val32, p_val64));
                                     let p_var_ptr = format!("%var_{}_{}", bind_var, *temp_counter);
                                     *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = alloca i32\n", p_var_ptr));
-                                    ir.push_str(&format!("  store i32 {}, i32* {}\n", p_val32, p_var_ptr));
+                                    ir.push_str(&format!("  {} = alloca i64\n", p_var_ptr));
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", p_val64, p_var_ptr));
                                     scope_tree.insert(bind_var.clone(), SymbolBinding {
                                         name: bind_var,
                                         llvm_ptr: p_var_ptr,
-                                        type_hint: "i32".to_string(),
+                                        type_hint: "i64".to_string(),
                                         is_scoped: true,
                                     });
                                 }
 
-                                self.lower_statements(
+                                let arm_ret = self.lower_statements(
                                     &arm.body,
                                     ir,
                                     scope_tree,
@@ -3063,7 +4159,9 @@ impl<'a> CodeGenerator<'a> {
                                     import_chain,
                                     dynamic_declarations,
                                 )?;
-                                ir.push_str(&format!("  br label %{}\n", exit_lbl));
+                                if !arm_ret {
+                                    ir.push_str(&format!("  br label %{}\n", exit_lbl));
+                                }
                             }
 
                             ir.push_str(&format!("\n{}:\n  br label %{}\n", default_lbl, exit_lbl));
@@ -3122,8 +4220,8 @@ impl<'a> CodeGenerator<'a> {
                     )?;
                     if !then_ret {
                         Self::emit_cleanups(ir, &deferred_frees[then_snapshot..], temp_counter, "Then Branch Exit");
-                        deferred_frees.truncate(then_snapshot);
                     }
+                    deferred_frees.truncate(then_snapshot);
                     scope_tree.exit_scope();
                     if !then_ret {
                         ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
@@ -3152,8 +4250,8 @@ impl<'a> CodeGenerator<'a> {
                         )?;
                         if !else_ret {
                             Self::emit_cleanups(ir, &deferred_frees[else_snapshot..], temp_counter, "Else Branch Exit");
-                            deferred_frees.truncate(else_snapshot);
                         }
+                        deferred_frees.truncate(else_snapshot);
                         scope_tree.exit_scope();
                         if !else_ret {
                             ir.push_str(&format!("  br label %{}\n\n", merge_lbl));
@@ -3185,6 +4283,7 @@ impl<'a> CodeGenerator<'a> {
                     scope_tree.enter_scope();
                     scope_tree.loop_exit_labels.push(exit_lbl.clone());
                     scope_tree.loop_cond_labels.push(cond_lbl.clone());
+                    scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
                     let while_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
@@ -3204,10 +4303,11 @@ impl<'a> CodeGenerator<'a> {
                     )?;
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
+                    scope_tree.loop_entry_try_depths.pop();
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[while_snapshot..], temp_counter, "While Iteration Exit");
-                        deferred_frees.truncate(while_snapshot);
                     }
+                    deferred_frees.truncate(while_snapshot);
                     scope_tree.exit_scope();
                     if !body_ret {
                         ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
@@ -3216,7 +4316,7 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("{}:\n", exit_lbl));
                 }
 
-                // 4. For Loop
+                // 4. For Loop (64-bit counter)
                 Statement::ForLoop { var, count, body } => {
                     let id = *lbl_counter;
                     *lbl_counter += 1;
@@ -3229,7 +4329,8 @@ impl<'a> CodeGenerator<'a> {
                     let (start_val, limit_expr) = if let Some((s, e)) = count.split_once("..") {
                         let s_clean = s.trim();
                         let e_clean = e.trim();
-                        let s_val = self.eval_val(s_clean, ir, scope_tree, string_constants, temp_counter);
+                        let stv = self.eval_typed(s_clean, ir, scope_tree, string_constants, temp_counter);
+                        let s_val = self.coerce_to_i64(stv, ir, temp_counter);
                         (s_val, e_clean)
                     } else {
                         ("0".to_string(), count.as_str())
@@ -3237,8 +4338,8 @@ impl<'a> CodeGenerator<'a> {
 
                     let idx_ptr = format!("%var_{}_{}", var, *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = alloca i32\n", idx_ptr));
-                    ir.push_str(&format!("  store i32 {}, i32* {}\n", start_val, idx_ptr));
+                    ir.push_str(&format!("  {} = alloca i64\n", idx_ptr));
+                    ir.push_str(&format!("  store i64 {}, i64* {}\n", start_val, idx_ptr));
 
                     scope_tree.enter_scope();
                     scope_tree.insert(
@@ -3246,7 +4347,7 @@ impl<'a> CodeGenerator<'a> {
                         SymbolBinding {
                             name: var.clone(),
                             llvm_ptr: idx_ptr.clone(),
-                            type_hint: "i32".to_string(),
+                            type_hint: "i64".to_string(),
                             is_scoped: true,
                         },
                     );
@@ -3255,12 +4356,13 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("{}:\n", cond_lbl));
 
                     let curr_val = format!("%curr_{}", id);
-                    ir.push_str(&format!("  {} = load i32, i32* {}\n", curr_val, idx_ptr));
+                    ir.push_str(&format!("  {} = load i64, i64* {}\n", curr_val, idx_ptr));
 
-                    let count_limit = self.eval_val(limit_expr, ir, scope_tree, string_constants, temp_counter);
+                    let ltv = self.eval_typed(limit_expr, ir, scope_tree, string_constants, temp_counter);
+                    let count_limit = self.coerce_to_i64(ltv, ir, temp_counter);
                     let cmp_var = format!("%cmp_{}", id);
                     ir.push_str(&format!(
-                        "  {} = icmp slt i32 {}, {}\n",
+                        "  {} = icmp slt i64 {}, {}\n",
                         cmp_var, curr_val, count_limit
                     ));
                     ir.push_str(&format!(
@@ -3271,6 +4373,7 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("{}:\n", body_lbl));
                     scope_tree.loop_exit_labels.push(exit_lbl.clone());
                     scope_tree.loop_cond_labels.push(inc_lbl.clone());
+                    scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
                     let for_snapshot = deferred_frees.len();
                     let body_ret = self.lower_statements(
                         body,
@@ -3290,20 +4393,21 @@ impl<'a> CodeGenerator<'a> {
                     )?;
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
+                    scope_tree.loop_entry_try_depths.pop();
                     if !body_ret {
                         Self::emit_cleanups(ir, &deferred_frees[for_snapshot..], temp_counter, "For Iteration Exit");
-                        deferred_frees.truncate(for_snapshot);
                         ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
                     }
+                    deferred_frees.truncate(for_snapshot);
 
                     ir.push_str(&format!("{}:\n", inc_lbl));
                     let load_for_inc = format!("%curr_inc_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = load i32, i32* {}\n", load_for_inc, idx_ptr));
+                    ir.push_str(&format!("  {} = load i64, i64* {}\n", load_for_inc, idx_ptr));
                     let next_val = format!("%next_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = add i32 {}, 1\n", next_val, load_for_inc));
-                    ir.push_str(&format!("  store i32 {}, i32* {}\n", next_val, idx_ptr));
+                    ir.push_str(&format!("  {} = add i64 {}, 1\n", next_val, load_for_inc));
+                    ir.push_str(&format!("  store i64 {}, i64* {}\n", next_val, idx_ptr));
 
                     scope_tree.exit_scope();
 
@@ -3336,7 +4440,7 @@ impl<'a> CodeGenerator<'a> {
                         } else {
                             clean_var.to_string()
                         };
-                        self.eval_val(&call_target, ir, scope_tree, string_constants, temp_counter);
+                        let _ = self.eval_typed(&call_target, ir, scope_tree, string_constants, temp_counter);
                         let slice_ptr = format!("%slice_print_ptr_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
@@ -3399,22 +4503,30 @@ impl<'a> CodeGenerator<'a> {
                             ));
                             ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
                         }
-                        let val = self.eval_val(arg_expr, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                        ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
+                        self.emit_typed_print_arg(arg_expr, "__omni_print_str", ir, scope_tree, string_constants, temp_counter);
                         continue;
                     }
 
                     if top_args.len() > 1 && !trimmed.contains("{}") {
                         let first_arg = top_args[0].trim();
                         if (first_arg.starts_with('"') || first_arg.starts_with('\''))
-                            && (first_arg.contains("%d") || first_arg.contains("%i") || first_arg.contains("%s") || first_arg.contains("%ld"))
+                            && (first_arg.contains("%d") || first_arg.contains("%i") || first_arg.contains("%s") || first_arg.contains("%ld") || first_arg.contains("%f"))
                         {
                             let fmt_ptr = self.eval_str_ptr(first_arg, ir, scope_tree, string_constants, temp_counter);
-                            let val = self.eval_val(top_args[1].trim(), ir, scope_tree, string_constants, temp_counter);
-                            ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, i32 {})\n", fmt_ptr, val));
+                            let rhs_tv = self.eval_typed(top_args[1].trim(), ir, scope_tree, string_constants, temp_counter);
+                            if first_arg.contains("%f") {
+                                let fv = self.coerce_to_f64(rhs_tv, ir, temp_counter);
+                                ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, double {})\n", fmt_ptr, fv));
+                            } else if first_arg.contains("%s") {
+                                let pv = self.coerce_to_ptr(rhs_tv, ir, temp_counter);
+                                ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, i8* {})\n", fmt_ptr, pv));
+                            } else if first_arg.contains("%ld") {
+                                let iv = self.coerce_to_i64(rhs_tv, ir, temp_counter);
+                                ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, i64 {})\n", fmt_ptr, iv));
+                            } else {
+                                let iv32 = self.coerce_to_i32(rhs_tv, ir, temp_counter);
+                                ir.push_str(&format!("  call i32 (i8*, ...) @printf(i8* {}, i32 {})\n", fmt_ptr, iv32));
+                            }
                             continue;
                         }
 
@@ -3427,44 +4539,18 @@ impl<'a> CodeGenerator<'a> {
                                 "__omni_print_str_inline"
                             };
 
-                            if arg_trim.contains('?') {
-                                if let Some((cond_part, rest)) = arg_trim.split_once('?') {
-                                    if let Some((then_part, else_part)) = rest.split_once(':') {
-                                        let cond_clean = cond_part.trim().trim_start_matches('(').trim_end_matches(')').trim();
-                                        let cond_val = if cond_clean.contains("==") || cond_clean.contains("!=") || cond_clean.contains("<") || cond_clean.contains(">") {
-                                            self.eval_cond(cond_clean, ir, scope_tree, string_constants, temp_counter)
-                                        } else {
-                                            let r = self.eval_val(cond_clean, ir, scope_tree, string_constants, temp_counter);
-                                            let cmp = format!("%tern_cmp_{}", *temp_counter);
-                                            *temp_counter += 1;
-                                            ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp, r));
-                                            cmp
-                                        };
-                                        let then_str = self.eval_str_ptr(then_part.trim(), ir, scope_tree, string_constants, temp_counter);
-                                        let else_str = self.eval_str_ptr(else_part.trim(), ir, scope_tree, string_constants, temp_counter);
-                                        let sel_str = format!("%tern_str_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, cond_val, then_str, else_str));
-                                        ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, sel_str));
-                                        continue;
-                                    }
-                                }
+                            if let Some((cond_part, then_part, else_part)) = split_ternary_expr(arg_trim) {
+                                let cond_val = self.eval_cond(cond_part, ir, scope_tree, string_constants, temp_counter);
+                                let then_str = self.eval_str_ptr(then_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                                let else_str = self.eval_str_ptr(else_part.trim(), ir, scope_tree, string_constants, temp_counter);
+                                let sel_str = format!("%tern_str_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", sel_str, cond_val, then_str, else_str));
+                                ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, sel_str));
+                                continue;
                             }
 
-                            if Self::is_string_expr(arg_trim, scope_tree)
-                                || arg_trim.starts_with('"')
-                                || arg_trim.starts_with('\'')
-                                || scope_tree.resolve(arg_trim).map(|b| b.type_hint.starts_with("i8*")).unwrap_or(false)
-                            {
-                                let str_ptr = self.eval_str_ptr(arg_trim, ir, scope_tree, string_constants, temp_counter);
-                                ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, str_ptr));
-                            } else {
-                                let val = self.eval_val(arg_trim, ir, scope_tree, string_constants, temp_counter);
-                                let val_64 = format!("%ext_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                                ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
-                            }
+                            self.emit_typed_print_arg(arg_trim, print_fn, ir, scope_tree, string_constants, temp_counter);
                         }
                         continue;
                     }
@@ -3487,25 +4573,11 @@ impl<'a> CodeGenerator<'a> {
                                 ));
                                 ir.push_str(&format!("  call void @__omni_print_str(i8* {})\n", str_ptr));
                             }
-                            let val = self.eval_val(arg_expr, ir, scope_tree, string_constants, temp_counter);
-                            let val_64 = format!("%ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                            ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
+                            self.emit_typed_print_arg(arg_expr, "__omni_print_str", ir, scope_tree, string_constants, temp_counter);
                         }
-                    } else if Self::is_string_expr(single_arg, scope_tree)
-                        || scope_tree.resolve(single_arg).map(|b| b.type_hint.starts_with("i8*")).unwrap_or(false)
-                    {
-                        let str_ptr = self.eval_str_ptr(single_arg, ir, scope_tree, string_constants, temp_counter);
-                        let print_fn = if is_inline_end { "__omni_print_str_raw" } else { "__omni_print_str" };
-                        ir.push_str(&format!("  call void @{}(i8* {})\n", print_fn, str_ptr));
                     } else {
-                        // Print integer / expression value via @__omni_print_int
-                        let val = self.eval_val(single_arg, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
-                        ir.push_str(&format!("  call void @__omni_print_int(i64 {})\n", val_64));
+                        let print_fn = if is_inline_end { "__omni_print_str_raw" } else { "__omni_print_str" };
+                        self.emit_typed_print_arg(single_arg, print_fn, ir, scope_tree, string_constants, temp_counter);
                     }
                 }
 
@@ -3542,9 +4614,10 @@ impl<'a> CodeGenerator<'a> {
                     _ => {}
                 },
 
-                // 7. Return Statement
+                // 7. Return Statement (64-bit `i64` / Tuple Slice / `@main` `i32` Exit Code)
                 Statement::Return { expr } => {
-                    let ret_val = if let Some(e) = expr {
+                    let ret_is_i32 = fn_name == "main";
+                    let ret_val_i64 = if let Some(e) = expr {
                         let trimmed_e = e.trim();
                         let unwrapped_e = if trimmed_e.starts_with('(') && trimmed_e.ends_with(')') {
                             let inner = &trimmed_e[1..trimmed_e.len() - 1];
@@ -3572,72 +4645,79 @@ impl<'a> CodeGenerator<'a> {
                             ));
                             for part in &tuple_parts {
                                 let p_trim = part.trim();
-                                ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
-                                let v_32 = self.eval_val(p_trim, ir, scope_tree, string_constants, temp_counter);
-                                let tramp = format!("%ret_tup_tramp_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
-                                let is_null = format!("%ret_tup_null_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
-                                let tramp_i64 = format!("%ret_tup_ptr64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", tramp_i64, tramp));
-                                let val_i64 = format!("%ret_tup_val64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_i64, v_32));
-                                let elem_i64 = format!("%ret_tup_elem64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!(
-                                    "  {} = select i1 {}, i64 {}, i64 {}\n",
-                                    elem_i64, is_null, val_i64, tramp_i64
-                                ));
+                                let elem_i64 = if is_null_literal(p_trim) {
+                                    "0".to_string()
+                                } else {
+                                    let tv = self.eval_typed(p_trim, ir, scope_tree, string_constants, temp_counter);
+                                    self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
+                                };
                                 ir.push_str(&format!(
                                     "  call void @__omni_slice_append(i8* {}, i64 {})\n",
                                     tup_slice, elem_i64
                                 ));
                             }
                             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", tup_slice));
-                            let cast_i32 = format!("%ret_tup_i32_{}", *temp_counter);
+                            let cast_i64 = format!("%ret_tup_i64_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, tup_slice));
-                            cast_i32
+                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_i64, tup_slice));
+                            cast_i64
                         } else if let Some(b) = scope_tree.resolve(trimmed_e) {
-                            if b.type_hint.contains("omni_slice") || b.type_hint.contains("omni_map") || b.type_hint.starts_with("i8*") {
-                                // Don't free the returned resource in deferred_frees!
+                            if b.type_hint.contains("omni_slice")
+                                || b.type_hint.contains("omni_map")
+                                || b.type_hint.contains("omni_chan")
+                                || b.type_hint.starts_with("i8*")
+                            {
+                                // Preserve returned heap handle across RAII cleanups
                                 deferred_frees.retain(|op| match op {
-                                    CleanupOp::DestroySlice(p) | CleanupOp::DestroyMap(p) | CleanupOp::DestroyChan(p) => p != &b.llvm_ptr,
+                                    CleanupOp::DestroySlice(p)
+                                    | CleanupOp::DestroyMap(p)
+                                    | CleanupOp::DestroyChan(p) => p != &b.llvm_ptr,
                                     _ => true,
                                 });
                                 let loaded = format!("%ret_ptr_ld_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", loaded));
-                                let cast_i32 = format!("%ret_ptr_i32_{}", *temp_counter);
+                                let cast_i64 = format!("%ret_ptr_i64_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, loaded));
-                                cast_i32
+                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_i64, loaded));
+                                cast_i64
+                            } else if b.type_hint.starts_with("%struct.") {
+                                let tv = self.eval_typed(trimmed_e, ir, scope_tree, string_constants, temp_counter);
+                                let p8 = self.coerce_to_ptr(tv.clone(), ir, temp_counter);
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p8));
+                                self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                             } else {
-                                self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
+                                let tv = self.eval_typed(e, ir, scope_tree, string_constants, temp_counter);
+                                self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                             }
-                        } else if Self::is_string_expr(trimmed_e, scope_tree) {
-                            let s_ptr = self.eval_str_ptr(trimmed_e, ir, scope_tree, string_constants, temp_counter);
-                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", s_ptr));
-                            let cast_i32 = format!("%ret_str_i32_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = ptrtoint i8* {} to i32\n", cast_i32, s_ptr));
-                            cast_i32
                         } else {
-                            self.eval_val(e, ir, scope_tree, string_constants, temp_counter)
+                            let tv = self.eval_typed(e, ir, scope_tree, string_constants, temp_counter);
+                            if matches!(tv.ty, IrType::Ptr | IrType::StructPtr(_)) {
+                                let p8 = self.coerce_to_ptr(tv.clone(), ir, temp_counter);
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p8));
+                            }
+                            self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                         }
                     } else {
                         "0".to_string()
                     };
 
-                    // Execute any active cleanups before returning
+                    // Execute active cleanups (including popping any active `jmp_buf` try frames)
                     Self::emit_cleanups(ir, deferred_frees, temp_counter, "Return");
 
-                    ir.push_str(&format!("  ret i32 {}\n", ret_val));
+                    if ret_is_i32 {
+                        if let Ok(n64) = ret_val_i64.parse::<i64>() {
+                            ir.push_str(&format!("  ret i32 {}\n", n64 as i32));
+                        } else {
+                            let ret_i32 = format!("%ret_main_i32_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = trunc i64 {} to i32\n", ret_i32, ret_val_i64));
+                            ir.push_str(&format!("  ret i32 {}\n", ret_i32));
+                        }
+                    } else {
+                        ir.push_str(&format!("  ret i64 {}\n", ret_val_i64));
+                    }
                     custom_return = true;
                     break;
                 }
@@ -3682,10 +4762,8 @@ impl<'a> CodeGenerator<'a> {
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", ch_loaded, binding.llvm_ptr));
 
-                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            let val_64 = format!("%val_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
 
                             let send_ok = format!("%send_ok_{}", *temp_counter);
                             *temp_counter += 1;
@@ -3695,11 +4773,11 @@ impl<'a> CodeGenerator<'a> {
                             ));
                         } else {
                             let send_expr = format!("{}.send({})", channel, expr);
-                            self.eval_val(&send_expr, ir, scope_tree, string_constants, temp_counter);
+                            let _ = self.eval_typed(&send_expr, ir, scope_tree, string_constants, temp_counter);
                         }
                     } else {
                         let send_expr = format!("{}.send({})", channel, expr);
-                        self.eval_val(&send_expr, ir, scope_tree, string_constants, temp_counter);
+                        let _ = self.eval_typed(&send_expr, ir, scope_tree, string_constants, temp_counter);
                     }
                 }
 
@@ -3720,30 +4798,36 @@ impl<'a> CodeGenerator<'a> {
                             recv_64, ch_loaded
                         ));
 
-                        let recv_32 = format!("%recv_32_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", recv_32, recv_64));
-
                         if let Some(ref var_name) = target {
-                            let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(var_name).is_none() {
+                            let existing = if !*is_scoped_decl {
+                                scope_tree.resolve(var_name).cloned()
+                            } else {
+                                None
+                            };
+                            if let Some(eb) = existing {
+                                if eb.type_hint == "i32" {
+                                    let recv_32 = format!("%recv_32_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", recv_32, recv_64));
+                                    ir.push_str(&format!("  store i32 {}, i32* {}\n", recv_32, eb.llvm_ptr));
+                                } else {
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", recv_64, eb.llvm_ptr));
+                                }
+                            } else {
                                 let ptr = format!("%var_{}_{}", var_name, *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca i32\n", ptr));
+                                ir.push_str(&format!("  {} = alloca i64\n", ptr));
                                 scope_tree.insert(
                                     var_name.clone(),
                                     SymbolBinding {
                                         name: var_name.clone(),
                                         llvm_ptr: ptr.clone(),
-                                        type_hint: "i32".to_string(),
+                                        type_hint: "i64".to_string(),
                                         is_scoped: *is_scoped_decl,
                                     },
                                 );
-                                ptr
-                            } else {
-                                scope_tree.resolve(var_name).unwrap().llvm_ptr.clone()
-                            };
-
-                            ir.push_str(&format!("  store i32 {}, i32* {}\n", recv_32, alloca_ptr));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", recv_64, ptr));
+                            }
                         }
                     }
                 }
@@ -3813,20 +4897,17 @@ impl<'a> CodeGenerator<'a> {
                                 let elem_val = format!("%comp_elem_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", elem_val, src_ld, curr_idx));
-                                let elem_32 = format!("%comp_elem_32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_32, elem_val));
 
                                 let param_ptr = format!("%var_{}_{}", var_name, *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca i32\n", param_ptr));
-                                ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_32, param_ptr));
+                                ir.push_str(&format!("  {} = alloca i64\n", param_ptr));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_val, param_ptr));
                                 scope_tree.insert(
                                     var_name.to_string(),
                                     SymbolBinding {
                                         name: var_name.to_string(),
                                         llvm_ptr: param_ptr,
-                                        type_hint: "i32".to_string(),
+                                        type_hint: "i64".to_string(),
                                         is_scoped: true,
                                     },
                                 );
@@ -3840,10 +4921,8 @@ impl<'a> CodeGenerator<'a> {
                                 }
 
                                 ir.push_str(&format!("{}:\n", append_lbl));
-                                let mapped_val = self.eval_val(map_expr, ir, scope_tree, string_constants, temp_counter);
-                                let mapped_64 = format!("%comp_map_ext_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", mapped_64, mapped_val));
+                                let mapped_tv = self.eval_typed(map_expr, ir, scope_tree, string_constants, temp_counter);
+                                let mapped_64 = self.coerce_to_raw_i64_bits(mapped_tv, ir, temp_counter);
                                 ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", slice_res, mapped_64));
                                 ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
 
@@ -3860,19 +4939,8 @@ impl<'a> CodeGenerator<'a> {
                     } else {
                         for elem in elements {
                             let elem_trim = elem.trim();
-                            let val_64 = if Self::is_string_expr(elem_trim, scope_tree) || elem_trim.starts_with('"') || elem_trim.starts_with('\'') {
-                                let str_ptr = self.eval_str_ptr(elem_trim, ir, scope_tree, string_constants, temp_counter);
-                                let ptr_64 = format!("%elem_ptr64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", ptr_64, str_ptr));
-                                ptr_64
-                            } else {
-                                let val = self.eval_val(elem_trim, ir, scope_tree, string_constants, temp_counter);
-                                let ext = format!("%elem_ext_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, val));
-                                ext
-                            };
+                            let elem_tv = self.eval_typed(elem_trim, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = self.coerce_to_raw_i64_bits(elem_tv, ir, temp_counter);
                             ir.push_str(&format!(
                                 "  call void @__omni_slice_append(i8* {}, i64 {})\n",
                                 slice_res, val_64
@@ -3895,34 +4963,31 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 Statement::ListAppend { target, expr } => {
-                    if let Some(binding) = scope_tree.resolve(target) {
+                    if let Some(binding) = scope_tree.resolve(target).cloned() {
                         if binding.type_hint.starts_with("%struct.") {
                             let cls_name = binding.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            let def_cls = scope_tree.resolve_defining_class(cls_name, "add");
                             let inst_ld = format!("%inst_call_ld_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, binding.llvm_ptr));
                             let raw_inst = format!("%raw_call_inst_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
-                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            let val_64 = format!("%app_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
                             let ret_reg = format!("%method_ret_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
-                                "  {} = call i32 @__omni_method_{}_add(i8* {}, i64 {}, i64 0, i64 0)\n",
-                                ret_reg, cls_name, raw_inst, val_64
+                                "  {} = call i64 @__omni_method_{}_add(i8* {}, i64 {}, i64 0, i64 0, i64 0, i64 0)\n",
+                                ret_reg, def_cls, raw_inst, val_64
                             ));
                         } else {
                             let slice_loaded = format!("%slice_load_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", slice_loaded, binding.llvm_ptr));
 
-                            let val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
-                            let val_64 = format!("%app_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                            let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                            let val_64 = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
                             ir.push_str(&format!(
                                 "  call void @__omni_slice_append(i8* {}, i64 {})\n",
                                 slice_loaded, val_64
@@ -3937,15 +5002,13 @@ impl<'a> CodeGenerator<'a> {
                     index_expr,
                     val_expr,
                 } => {
-                    if let Some(binding) = scope_tree.resolve(target) {
+                    if let Some(binding) = scope_tree.resolve(target).cloned() {
                         let col_loaded = format!("%col_load_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i8*, i8** {}\n", col_loaded, binding.llvm_ptr));
 
-                        let val = self.eval_val(val_expr, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%val_ext_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                        let vtv = self.eval_typed(val_expr, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
                         if binding.type_hint.contains("omni_map") {
                             let trimmed_idx = index_expr.trim();
@@ -3965,11 +5028,15 @@ impl<'a> CodeGenerator<'a> {
                                         col_loaded, str_ptr, val_64
                                     ));
                                 }
+                            } else if Self::is_string_expr(trimmed_idx, scope_tree) {
+                                let str_ptr = self.eval_str_ptr(trimmed_idx, ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!(
+                                    "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
+                                    col_loaded, str_ptr, val_64
+                                ));
                             } else {
-                                let idx_val = self.eval_val(index_expr, ir, scope_tree, string_constants, temp_counter);
-                                let idx_64 = format!("%idx_ext_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                                let idx_tv = self.eval_typed(index_expr, ir, scope_tree, string_constants, temp_counter);
+                                let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
                                 ir.push_str(&format!(
                                     "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
                                     col_loaded, idx_64, val_64
@@ -3977,10 +5044,8 @@ impl<'a> CodeGenerator<'a> {
                             }
                         } else {
                             // Default to slice
-                            let idx_val = self.eval_val(index_expr, ir, scope_tree, string_constants, temp_counter);
-                            let idx_64 = format!("%idx_ext_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", idx_64, idx_val));
+                            let idx_tv = self.eval_typed(index_expr, ir, scope_tree, string_constants, temp_counter);
+                            let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
                             ir.push_str(&format!(
                                 "  call void @__omni_slice_set(i8* {}, i64 {}, i64 {})\n",
                                 col_loaded, idx_64, val_64
@@ -4009,10 +5074,8 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  store i8* {}, i8** {}\n", map_res, ptr));
 
                     for (k, v) in entries {
-                        let val = self.eval_val(v, ir, scope_tree, string_constants, temp_counter);
-                        let val_64 = format!("%map_val_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", val_64, val));
+                        let vtv = self.eval_typed(v, ir, scope_tree, string_constants, temp_counter);
+                        let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
                         if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
                             let str_ptr = format!("%str_ptr_{}", *temp_counter);
@@ -4046,45 +5109,58 @@ impl<'a> CodeGenerator<'a> {
                 Statement::GoSpawn { call_expr, idiom: _ } => {
                     let parts: Vec<&str> = call_expr.splitn(2, '(').collect();
                     let target_fn = parts[0].trim();
-                    let raw_arg = parts.get(1).map(|s| s.trim_end_matches(')').trim()).unwrap_or("");
-
-                    let arg_reg = if !raw_arg.is_empty() {
-                        if let Some(binding) = scope_tree.resolve(raw_arg) {
-                            if binding.type_hint == "i32" {
-                                let loaded = format!("%arg_i32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = load i32, i32* {}\n", loaded, binding.llvm_ptr));
-                                let ext = format!("%arg_i64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext, loaded));
-                                let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, ext));
-                                ptr_cast
-                            } else {
-                                let loaded = format!("%arg_load_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, binding.llvm_ptr));
-                                loaded
-                            }
-                        } else if let Ok(val) = raw_arg.parse::<i32>() {
-                            let ptr_cast = format!("%arg_ptr_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, val));
-                            ptr_cast
-                        } else {
-                            "null".to_string()
-                        }
+                    let raw_arg_str = parts.get(1).map(|s| s.trim_end_matches(')').trim()).unwrap_or("");
+                    let spawn_args: Vec<String> = if raw_arg_str.is_empty() {
+                        Vec::new()
                     } else {
-                        "null".to_string()
+                        omni_parser::OmniParser::split_respecting_quotes(raw_arg_str, ',')
                     };
 
-                    ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
-                    ir.push_str(&format!(
-                        "  call void @__omni_go_spawn(void (i8*)* @__omni_trampoline_{}, i8* {})\n",
-                        target_fn, arg_reg
-                    ));
-                    ir.push_str("  ; <<< [End Go Spawn]\n");
+                    if spawn_args.len() >= 2 {
+                        // Multi-argument goroutine spawn: heap-pack up to 6 `i64` slots (48 bytes) for `@__omni_trampoline_pack_<fn>`.
+                        let pack_raw = format!("%spawn_pack_raw_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i8* @malloc(i64 48)\n", pack_raw));
+                        let pack_i64 = format!("%spawn_pack_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = bitcast i8* {} to i64*\n", pack_i64, pack_raw));
+
+                        for slot in 0..6usize {
+                            let val_i64 = if let Some(arg_s) = spawn_args.get(slot) {
+                                let a_trim = Self::strip_kwarg_prefix(arg_s.trim());
+                                let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
+                                self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
+                            } else {
+                                "0".to_string()
+                            };
+                            let slot_ptr = format!("%spawn_slot_{}_{}", slot, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = getelementptr inbounds i64, i64* {}, i64 {}\n", slot_ptr, pack_i64, slot));
+                            ir.push_str(&format!("  store i64 {}, i64* {}\n", val_i64, slot_ptr));
+                        }
+
+                        ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
+                        ir.push_str(&format!(
+                            "  call void @__omni_go_spawn(void (i8*)* @__omni_trampoline_pack_{}, i8* {})\n",
+                            target_fn, pack_raw
+                        ));
+                        ir.push_str("  ; <<< [End Go Spawn]\n");
+                    } else {
+                        let raw_arg = spawn_args.first().map(|s| s.trim()).unwrap_or("");
+                        let arg_reg = if !raw_arg.is_empty() {
+                            let tv = self.eval_typed(raw_arg, ir, scope_tree, string_constants, temp_counter);
+                            self.coerce_to_ptr(tv, ir, temp_counter)
+                        } else {
+                            "null".to_string()
+                        };
+
+                        ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
+                        ir.push_str(&format!(
+                            "  call void @__omni_go_spawn(void (i8*)* @__omni_trampoline_{}, i8* {})\n",
+                            target_fn, arg_reg
+                        ));
+                        ir.push_str("  ; <<< [End Go Spawn]\n");
+                    }
                 }
 
                 // 9. Source-Anchored Interpretive Block
@@ -4106,10 +5182,11 @@ impl<'a> CodeGenerator<'a> {
                         })
                         .collect();
 
+                    let env_ret = if fn_name == "main" { "i32".to_string() } else { "i64".to_string() };
                     let envelope = SsaContextEnvelope {
                         target_abi: host_target_triple().to_string(),
                         enclosing_fn: fn_name.to_string(),
-                        return_type: "i32".to_string(),
+                        return_type: env_ret.clone(),
                         next_ssa_idx: *temp_counter,
                         active_symbols,
                         struct_definitions: struct_defs.to_vec(),
@@ -4118,7 +5195,7 @@ impl<'a> CodeGenerator<'a> {
                         anchor_id: Some(*anchor_id),
                         physical_source: Some(physical_source.clone()),
                         concurrency_mode: None,
-                        yield_expectation: Some("i32".to_string()),
+                        yield_expectation: Some(env_ret),
                         action_directive: Some("SYNTHESIZE_ANONYMOUS_BLOCK".to_string()),
                         ecosystem_context: ecosystem_context.map(|s| s.to_string()),
                         lifetime_context: None,
@@ -4166,14 +5243,6 @@ impl<'a> CodeGenerator<'a> {
                         })
                         .collect();
 
-                    let clean_instruction = instruction
-                        .trim_start_matches("intent")
-                        .trim_start_matches(':')
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string();
-
                     let idiom_hint = if clean_instruction.contains(".append(") {
                         Some("PythonListTransform".to_string())
                     } else {
@@ -4183,7 +5252,7 @@ impl<'a> CodeGenerator<'a> {
                     let envelope = SsaContextEnvelope {
                         target_abi: host_target_triple().to_string(),
                         enclosing_fn: fn_name.to_string(),
-                        return_type: "i32".to_string(),
+                        return_type: if fn_name == "main" { "i32".to_string() } else { "i64".to_string() },
                         next_ssa_idx: *temp_counter,
                         active_symbols,
                         struct_definitions: struct_defs.to_vec(),
@@ -4221,6 +5290,10 @@ impl<'a> CodeGenerator<'a> {
                     let trimmed_code = code.trim().trim_end_matches(';').trim();
                     if trimmed_code == "break" {
                         if let Some(exit_lbl) = scope_tree.loop_exit_labels.last().cloned() {
+                            let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
+                            for _ in entry_depth..scope_tree.active_try_depth {
+                                ir.push_str("  call void @__omni_try_pop()\n");
+                            }
                             ir.push_str(&format!("  br label %{}\n", exit_lbl));
                             custom_return = true;
                             break;
@@ -4229,6 +5302,10 @@ impl<'a> CodeGenerator<'a> {
                     }
                     if trimmed_code == "continue" {
                         if let Some(cond_lbl) = scope_tree.loop_cond_labels.last().cloned() {
+                            let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
+                            for _ in entry_depth..scope_tree.active_try_depth {
+                                ir.push_str("  call void @__omni_try_pop()\n");
+                            }
                             ir.push_str(&format!("  br label %{}\n", cond_lbl));
                             custom_return = true;
                             break;
@@ -4254,13 +5331,34 @@ impl<'a> CodeGenerator<'a> {
                         continue;
                     }
 
-                    if trimmed_code.starts_with("raise ") || trimmed_code.starts_with("throw ") || trimmed_code == "raise" {
-                        if fn_name == "main" {
-                            ir.push_str("  call void @exit(i32 1)\n");
+                    // Stack-unwinding `raise` / `throw` via `_Thread_local` `setjmp`/`longjmp`
+                    if let Some((exc_type_opt, msg_opt)) = Self::parse_raise_or_throw(trimmed_code) {
+                        if exc_type_opt.is_none() && msg_opt.is_none() {
+                            ir.push_str("  call void @__omni_rethrow()\n");
                             ir.push_str("  unreachable\n");
                         } else {
-                            Self::emit_cleanups(ir, deferred_frees, temp_counter, "Raise Fallback");
-                            ir.push_str("  ret i32 0\n");
+                            let ty_name = exc_type_opt.as_deref().unwrap_or("Exception");
+                            let ty_ptr = if let Some((cn, clen)) = Self::find_string_constant(string_constants, ty_name) {
+                                let p = format!("%exc_ty_ptr_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                    p, clen, clen, cn
+                                ));
+                                p
+                            } else {
+                                self.eval_str_ptr("\"Exception\"", ir, scope_tree, string_constants, temp_counter)
+                            };
+                            let msg_ptr = if let Some(ref m_expr) = msg_opt {
+                                self.eval_str_ptr(m_expr, ir, scope_tree, string_constants, temp_counter)
+                            } else {
+                                self.eval_str_ptr("\"\"", ir, scope_tree, string_constants, temp_counter)
+                            };
+                            ir.push_str(&format!(
+                                "  call void @__omni_throw(i64 1, i8* {}, i8* {})\n",
+                                ty_ptr, msg_ptr
+                            ));
+                            ir.push_str("  unreachable\n");
                         }
                         custom_return = true;
                         break;
@@ -4284,7 +5382,64 @@ impl<'a> CodeGenerator<'a> {
                         break;
                     }
 
+                    if trimmed_code == "Self::default()" {
+                        if let Some(self_b) = scope_tree.resolve("self").cloned() {
+                            if self_b.type_hint.starts_with("%struct.") {
+                                let cls_name = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                let self_ld = format!("%self_def_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", self_ld, cls_name, cls_name, self_b.llvm_ptr));
+                                let self_i8 = format!("%self_def_i8_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", self_i8, cls_name, self_ld));
+                                let def_ret = format!("%self_def_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = call i64 @__omni_method_{}_default(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                                    def_ret, cls_name, self_i8
+                                ));
+                                Self::emit_cleanups(ir, deferred_frees, temp_counter, "Self Default Return");
+                                ir.push_str(&format!("  ret i64 {}\n", def_ret));
+                                custom_return = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Rust inline struct literal in `default` / constructor method (`Adler32 { a: 1, b: 0 }`)
+                    if let (Some(open_b), true) = (trimmed_code.find('{'), trimmed_code.ends_with('}')) {
+                        let lit_cls = trimmed_code[..open_b].trim();
+                        if let Some(self_b) = scope_tree.resolve("self").cloned() {
+                            let cur_cls = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            if (lit_cls == cur_cls || lit_cls == "Self") && scope_tree.class_fields.contains_key(cur_cls) {
+                                let inner_fields = &trimmed_code[open_b + 1..trimmed_code.len() - 1];
+                                for entry in omni_parser::OmniParser::split_respecting_quotes(inner_fields, ',') {
+                                    if let Some((f_name, f_expr)) = entry.split_once(':') {
+                                        let f_name = f_name.trim();
+                                        let f_expr = f_expr.trim();
+                                        if let Some(&f_idx) = scope_tree.class_fields.get(cur_cls).and_then(|m| m.get(f_name)) {
+                                            let ftv = self.eval_typed(f_expr, ir, scope_tree, string_constants, temp_counter);
+                                            let fv64 = self.coerce_to_raw_i64_bits(ftv, ir, temp_counter);
+                                            let inst_ld = format!("%lit_self_ld_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cur_cls, cur_cls, self_b.llvm_ptr));
+                                            let gep = format!("%lit_gep_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cur_cls, cur_cls, inst_ld, f_idx));
+                                            ir.push_str(&format!("  store i64 {}, i64* {}\n", fv64, gep));
+                                        }
+                                    }
+                                }
+                                Self::emit_cleanups(ir, deferred_frees, temp_counter, "Struct Literal Return");
+                                ir.push_str("  ret i64 0\n");
+                                custom_return = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // Direct method invocation on known object instance: `obj.method(args...)` or base class `Base.method(...)`
+                    let is_rust_tail_expr = is_last_stmt && fn_name != "main" && !code.trim().ends_with(';');
                     if let Some(open) = trimmed_code.find('(') {
                         if trimmed_code.ends_with(')') {
                             let target = trimmed_code[..open].trim();
@@ -4297,32 +5452,36 @@ impl<'a> CodeGenerator<'a> {
                                         || method == "close" || method == "recv" || method == "start" || method == "terminate"
                                         || trimmed_code.contains("Thread(") || trimmed_code.contains("Process(")
                                     {
-                                        self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                        let _ = self.eval_typed(trimmed_code, ir, scope_tree, string_constants, temp_counter);
                                         continue;
                                     }
-                                    if let Some(b) = scope_tree.resolve(rec) {
-                                        if b.type_hint.starts_with("%struct.") || b.type_hint.contains("omni_") {
-                                            self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                    if !is_rust_tail_expr {
+                                        if scope_tree.resolve(rec).is_some() || scope_tree.class_fields.contains_key(rec) {
+                                            let _ = self.eval_typed(trimmed_code, ir, scope_tree, string_constants, temp_counter);
                                             continue;
                                         }
-                                    } else if scope_tree.class_fields.contains_key(rec) {
-                                        self.eval_val(trimmed_code, ir, scope_tree, string_constants, temp_counter);
-                                        continue;
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Implicit return expression in non-main functions (e.g. Rust block `(value ^ salt) + 7`)
+                    // Implicit return expression in non-main functions (e.g. Rust block `(value ^ salt) + 7` or `h.checksum()`)
                     if fn_name != "main" && !code.trim().ends_with(';') {
                         if Self::split_binary_expr(code).is_some()
                             || scope_tree.resolve(code).is_some()
-                            || code.trim().parse::<i32>().is_ok()
+                            || parse_polyglot_i64(code).is_some()
+                            || parse_polyglot_f64(code).is_some()
+                            || (is_last_stmt && trimmed_code.ends_with(')') && trimmed_code.contains('('))
                         {
-                            let ret_val = self.eval_val(code, ir, scope_tree, string_constants, temp_counter);
+                            let rtv = self.eval_typed(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                            if matches!(rtv.ty, IrType::Ptr | IrType::StructPtr(_)) {
+                                let p8 = self.coerce_to_ptr(rtv.clone(), ir, temp_counter);
+                                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p8));
+                            }
+                            let ret_val = self.coerce_to_raw_i64_bits(rtv, ir, temp_counter);
                             Self::emit_cleanups(ir, deferred_frees, temp_counter, "Implicit Return");
-                            ir.push_str(&format!("  ret i32 {}\n", ret_val));
+                            ir.push_str(&format!("  ret i64 {}\n", ret_val));
                             custom_return = true;
                             break;
                         }
@@ -4338,10 +5497,11 @@ impl<'a> CodeGenerator<'a> {
                         })
                         .collect();
 
+                    let env_ret = if fn_name == "main" { "i32".to_string() } else { "i64".to_string() };
                     let envelope = SsaContextEnvelope {
                         target_abi: host_target_triple().to_string(),
                         enclosing_fn: fn_name.to_string(),
-                        return_type: "i32".to_string(),
+                        return_type: env_ret.clone(),
                         next_ssa_idx: *temp_counter,
                         active_symbols,
                         struct_definitions: struct_defs.to_vec(),
@@ -4350,7 +5510,7 @@ impl<'a> CodeGenerator<'a> {
                         anchor_id: Some(*lbl_counter),
                         physical_source: Some(code.clone()),
                         concurrency_mode: None,
-                        yield_expectation: Some("i32".to_string()),
+                        yield_expectation: Some(env_ret),
                         action_directive: Some("LOWER_POLYGLOT_SYNTAX".to_string()),
                         ecosystem_context: ecosystem_context.map(|s| s.to_string()),
                         lifetime_context: None,
@@ -4401,28 +5561,27 @@ impl<'a> CodeGenerator<'a> {
 
                                 let mut arg_regs = Vec::new();
                                 for a in &raw_args {
-                                    let r = self.eval_val(a.trim(), ir, scope_tree, string_constants, temp_counter);
-                                    let ext = format!("%with_init_ext_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = sext i32 {} to i64\n", ext, r));
-                                    arg_regs.push(ext);
+                                    let atv = self.eval_typed(Self::strip_kwarg_prefix(a.trim()), ir, scope_tree, string_constants, temp_counter);
+                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                 }
-                                while arg_regs.len() < 3 {
+                                while arg_regs.len() < 5 {
                                     arg_regs.push("0".to_string());
                                 }
 
+                                let def_init = scope_tree.resolve_defining_class(&cls_name, "__init__");
                                 let init_ret = format!("%with_init_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
-                                    "  {} = call i32 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {})\n",
-                                    init_ret, cls_name, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2]
+                                    "  {} = call i64 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                    init_ret, def_init, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                 ));
 
+                                let def_enter = scope_tree.resolve_defining_class(&cls_name, "__enter__");
                                 let enter_ret = format!("%with_enter_ret_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!(
-                                    "  {} = call i32 @__omni_method_{}___enter__(i8* {}, i64 0, i64 0, i64 0)\n",
-                                    enter_ret, cls_name, raw_inst
+                                    "  {} = call i64 @__omni_method_{}___enter__(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                                    enter_ret, def_enter, raw_inst
                                 ));
 
                                 if let Some(ref t) = var_alias {
@@ -4462,11 +5621,12 @@ impl<'a> CodeGenerator<'a> {
                     )?;
 
                     if let (Some(cls_name), Some(raw_inst)) = (resource_cls, resource_raw) {
+                        let def_exit = scope_tree.resolve_defining_class(&cls_name, "__exit__");
                         let exit_ret = format!("%with_exit_ret_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!(
-                            "  {} = call i32 @__omni_method_{}___exit__(i8* {}, i64 0, i64 0, i64 0)\n",
-                            exit_ret, cls_name, raw_inst
+                            "  {} = call i64 @__omni_method_{}___exit__(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                            exit_ret, def_exit, raw_inst
                         ));
                     }
                 }
@@ -4474,7 +5634,7 @@ impl<'a> CodeGenerator<'a> {
                 // 13. Annotation / Decorator Binding
                 Statement::AnnotationBinding { .. } => {}
 
-                // 14. Tuple Unpack
+                // 14. Type-Safe Polyglot Tuple Unpack (`q, err := safe_div(...)`, `pub_k, priv_k = rsa.newkeys(...)`)
                 Statement::TupleUnpack { targets, expr, is_scoped_decl } => {
                     let expr_trim = expr.trim();
                     let unwrapped_rhs = if expr_trim.starts_with('(') && expr_trim.ends_with(')') {
@@ -4493,16 +5653,23 @@ impl<'a> CodeGenerator<'a> {
                         expr_trim
                     };
                     let rhs_tuple_parts = omni_parser::OmniParser::split_respecting_quotes(unwrapped_rhs, ',');
+                    let is_inline_tuple = rhs_tuple_parts.len() == targets.len() && rhs_tuple_parts.len() > 1;
 
-                    let rhs_ptr_opt = if rhs_tuple_parts.len() == targets.len() && rhs_tuple_parts.len() > 1 {
-                        None
-                    } else if let Some(b) = scope_tree.resolve(expr) {
+                    let (rhs_ptr_opt, pre_evaluated_rhs): (Option<String>, Option<Vec<TypedValue>>) = if is_inline_tuple {
+                        let mut vals = Vec::with_capacity(targets.len());
+                        for idx in 0..targets.len() {
+                            let p_trim = rhs_tuple_parts[idx].trim();
+                            let tv = self.eval_typed(p_trim, ir, scope_tree, string_constants, temp_counter);
+                            vals.push(tv);
+                        }
+                        (None, Some(vals))
+                    } else if let Some(b) = scope_tree.resolve(expr_trim) {
                         let tl = b.type_hint.to_lowercase();
                         if b.type_hint.contains("omni_slice") || b.type_hint.starts_with("i8*") {
                             let ld = format!("%unpack_src_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
-                            Some(ld)
+                            (Some(ld), None)
                         } else if tl.contains("tuple") || tl.contains("slice") || tl.contains("list") || tl == "i64" {
                             let ld = format!("%unpack_src_i64_{}", *temp_counter);
                             *temp_counter += 1;
@@ -4510,71 +5677,106 @@ impl<'a> CodeGenerator<'a> {
                             let ptr = format!("%unpack_src_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr, ld));
-                            Some(ptr)
+                            (Some(ptr), None)
                         } else {
                             ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
-                            let rhs_val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                            let rhs_tv = self.eval_typed(expr_trim, ir, scope_tree, string_constants, temp_counter);
                             let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
                             let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
-                            let fallback_ptr = format!("%unpack_fallback_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback_ptr, rhs_val));
+                            let fallback_ptr = self.coerce_to_ptr(rhs_tv, ir, temp_counter);
                             let ptr = format!("%unpack_src_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", ptr, tramp_is_null, fallback_ptr, tramp_ptr));
-                            Some(ptr)
+                            (Some(ptr), None)
                         }
                     } else {
                         ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
-                        let rhs_val = self.eval_val(expr, ir, scope_tree, string_constants, temp_counter);
+                        let rhs_tv = self.eval_typed(expr_trim, ir, scope_tree, string_constants, temp_counter);
                         let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
                         let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
-                        let fallback_ptr = format!("%unpack_fallback_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = inttoptr i32 {} to i8*\n", fallback_ptr, rhs_val));
+                        let fallback_ptr = self.coerce_to_ptr(rhs_tv, ir, temp_counter);
                         let ptr = format!("%unpack_src_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = select i1 {}, i8* {}, i8* {}\n", ptr, tramp_is_null, fallback_ptr, tramp_ptr));
-                        Some(ptr)
+                        (Some(ptr), None)
                     };
 
-                    let pre_evaluated_rhs: Option<Vec<String>> = if rhs_ptr_opt.is_none() {
-                        let mut vals = Vec::with_capacity(targets.len());
-                        for idx in 0..targets.len() {
-                            let v32 = self.eval_val(rhs_tuple_parts[idx].trim(), ir, scope_tree, string_constants, temp_counter);
-                            let ev = format!("%unpack_lit_{}_{}", idx, *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = sext i32 {} to i64\n", ev, v32));
-                            vals.push(ev);
+                    // Resolve per-slot `IrType` from inline tuple expressions, intrinsics, or `fn_tuple_return_types`
+                    let callee_tuple_types: Option<Vec<IrType>> = if pre_evaluated_rhs.is_some() {
+                        None
+                    } else if expr_trim.contains(".accept(") {
+                        Some(vec![IrType::I64, IrType::Ptr])
+                    } else if expr_trim.contains("newkeys(") {
+                        if scope_tree.class_fields.contains_key("PublicKey")
+                            && scope_tree.class_fields.contains_key("PrivateKey")
+                        {
+                            Some(vec![
+                                IrType::StructPtr("PublicKey".to_string()),
+                                IrType::StructPtr("PrivateKey".to_string()),
+                            ])
+                        } else {
+                            Some(vec![IrType::Ptr, IrType::Ptr])
                         }
-                        Some(vals)
+                    } else if let Some(open) = expr_trim.find('(') {
+                        let raw_callee = expr_trim[..open].trim();
+                        let fn_ident = raw_callee.rsplit('.').next().unwrap_or(raw_callee).trim();
+                        scope_tree
+                            .fn_tuple_return_types
+                            .get(raw_callee)
+                            .or_else(|| scope_tree.fn_tuple_return_types.get(fn_ident))
+                            .cloned()
                     } else {
                         None
                     };
 
                     for (idx, target) in targets.iter().enumerate() {
-                        let elem_val = if let Some(ref rhs_ptr) = rhs_ptr_opt {
+                        let target_trim = target.trim();
+                        if target_trim == "_" || target_trim.is_empty() {
+                            continue;
+                        }
+
+                        let (elem_bits_i64, slot_ty): (String, IrType) = if let Some(ref pre_vals) = pre_evaluated_rhs {
+                            let tv = pre_vals[idx].clone();
+                            let ty = tv.ty.clone();
+                            let bits = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
+                            (bits, ty)
+                        } else {
+                            let rhs_ptr = rhs_ptr_opt.as_ref().unwrap();
                             let ev = format!("%unpack_elem_{}_{}", idx, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
                                 "  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n",
                                 ev, rhs_ptr, idx
                             ));
-                            ev
-                        } else {
-                            pre_evaluated_rhs.as_ref().unwrap()[idx].clone()
+                            let inferred_ty = callee_tuple_types
+                                .as_ref()
+                                .and_then(|v| v.get(idx).cloned())
+                                .unwrap_or_else(|| {
+                                    let tl = target_trim.to_lowercase();
+                                    if tl == "err"
+                                        || tl == "error"
+                                        || tl == "addr"
+                                        || tl.ends_with("_err")
+                                        || tl.ends_with("_error")
+                                    {
+                                        IrType::Ptr
+                                    } else {
+                                        IrType::I64
+                                    }
+                                });
+                            (ev, inferred_ty)
                         };
 
-                        if target.contains('.') {
-                            let parts: Vec<&str> = target.split('.').collect();
+                        if target_trim.contains('.') {
+                            let parts: Vec<&str> = target_trim.split('.').collect();
                             let rec = parts[0].trim();
                             let fld = parts[1].trim();
                             if let Some(b) = scope_tree.resolve(rec) {
@@ -4587,56 +5789,176 @@ impl<'a> CodeGenerator<'a> {
                                     let gep = format!("%fld_gep_{}", *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep, cls_name, cls_name, inst_ld, f_idx));
-                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_val, gep));
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_bits_i64, gep));
                                     continue;
                                 }
                             }
                         }
 
-                        let elem_ptr = format!("%unpack_ptr_{}_{}", idx, *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!(
-                            "  {} = inttoptr i64 {} to i8*\n",
-                            elem_ptr, elem_val
-                        ));
                         let existing_binding = if !*is_scoped_decl {
-                            scope_tree.resolve(target).cloned()
+                            scope_tree.resolve(target_trim).cloned()
                         } else {
                             None
                         };
-                        if let Some(ref eb) = existing_binding {
-                            if eb.type_hint == "i32" {
-                                let elem_i32 = format!("%unpack_i32_{}_{}", idx, *temp_counter);
+
+                        match slot_ty {
+                            IrType::F64 => {
+                                let fval = format!("%unpack_f64_{}_{}", idx, *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_i32, elem_val));
-                                ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_i32, eb.llvm_ptr));
-                                continue;
+                                ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, elem_bits_i64));
+                                let target_ptr = if let Some(ep) = existing_binding
+                                    .filter(|b| is_float_type_hint(&b.type_hint))
+                                    .map(|b| b.llvm_ptr)
+                                {
+                                    ep
+                                } else {
+                                    let tp = format!("%fvar_{}_{}", target_trim, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca double\n", tp));
+                                    scope_tree.insert(
+                                        target_trim.to_string(),
+                                        SymbolBinding {
+                                            name: target_trim.to_string(),
+                                            llvm_ptr: tp.clone(),
+                                            type_hint: "double".to_string(),
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    tp
+                                };
+                                ir.push_str(&format!("  store double {}, double* {}\n", fval, target_ptr));
+                            }
+                            IrType::StructPtr(cls) => {
+                                let sptr = format!("%unpack_sptr_{}_{}", idx, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = inttoptr i64 {} to %struct.{}*\n",
+                                    sptr, elem_bits_i64, cls
+                                ));
+                                let expected_th = format!("%struct.{}*", cls);
+                                let target_ptr = if let Some(ep) = existing_binding
+                                    .filter(|b| b.type_hint == expected_th)
+                                    .map(|b| b.llvm_ptr)
+                                {
+                                    ep
+                                } else {
+                                    let tp = format!("%svar_{}_{}", target_trim, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca %struct.{}*\n", tp, cls));
+                                    scope_tree.insert(
+                                        target_trim.to_string(),
+                                        SymbolBinding {
+                                            name: target_trim.to_string(),
+                                            llvm_ptr: tp.clone(),
+                                            type_hint: expected_th,
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    tp
+                                };
+                                ir.push_str(&format!(
+                                    "  store %struct.{}* {}, %struct.{}** {}\n",
+                                    cls, sptr, cls, target_ptr
+                                ));
+                            }
+                            IrType::Ptr => {
+                                let elem_ptr = format!("%unpack_ptr_{}_{}", idx, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = inttoptr i64 {} to i8*\n",
+                                    elem_ptr, elem_bits_i64
+                                ));
+                                let target_ptr = if let Some(ep) = existing_binding
+                                    .filter(|b| b.type_hint.starts_with("i8*"))
+                                    .map(|b| b.llvm_ptr)
+                                {
+                                    ep
+                                } else {
+                                    let tp = format!("%ptr_{}_{}", target_trim, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca i8*\n", tp));
+                                    scope_tree.insert(
+                                        target_trim.to_string(),
+                                        SymbolBinding {
+                                            name: target_trim.to_string(),
+                                            llvm_ptr: tp.clone(),
+                                            type_hint: "i8* (string)".to_string(),
+                                            is_scoped: *is_scoped_decl,
+                                        },
+                                    );
+                                    tp
+                                };
+                                ir.push_str(&format!("  store i8* {}, i8** {}\n", elem_ptr, target_ptr));
+                            }
+                            _ => {
+                                if let Some(ref eb) = existing_binding {
+                                    if eb.type_hint == "i32" {
+                                        let elem_i32 = format!("%unpack_i32_{}_{}", idx, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = trunc i64 {} to i32\n", elem_i32, elem_bits_i64));
+                                        ir.push_str(&format!("  store i32 {}, i32* {}\n", elem_i32, eb.llvm_ptr));
+                                        continue;
+                                    } else if eb.type_hint == "i64" {
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_bits_i64, eb.llvm_ptr));
+                                        continue;
+                                    }
+                                }
+                                let tp = format!("%ivar_{}_{}", target_trim, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i64\n", tp));
+                                scope_tree.insert(
+                                    target_trim.to_string(),
+                                    SymbolBinding {
+                                        name: target_trim.to_string(),
+                                        llvm_ptr: tp.clone(),
+                                        type_hint: "i64".to_string(),
+                                        is_scoped: *is_scoped_decl,
+                                    },
+                                );
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_bits_i64, tp));
                             }
                         }
-                        let target_ptr = if let Some(ep) = existing_binding.filter(|b| b.type_hint.starts_with("i8*")).map(|b| b.llvm_ptr) {
-                            ep
-                        } else {
-                            let tp = format!("%ptr_{}_{}", target, *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = alloca i8*\n", tp));
-                            scope_tree.insert(
-                                target.clone(),
-                                SymbolBinding {
-                                    name: target.clone(),
-                                    llvm_ptr: tp.clone(),
-                                    type_hint: "i8* (omni_unpack)".to_string(),
-                                    is_scoped: *is_scoped_decl,
-                                },
-                            );
-                            tp
-                        };
-                        ir.push_str(&format!("  store i8* {}, i8** {}\n", elem_ptr, target_ptr));
                     }
                 }
 
-                // 15. Try / Catch / Except / Finally
-                Statement::TryCatch { try_block, catch_clauses: _, finally_block } => {
-                    self.lower_statements(
+                // 15. Stack-Unwinding `try / catch / except / finally` via `_setjmp` / `longjmp`
+                Statement::TryCatch {
+                    try_block,
+                    catch_clauses,
+                    finally_block,
+                } => {
+                    let try_id = *lbl_counter;
+                    *lbl_counter += 1;
+
+                    let try_body_lbl = format!("try_body_{}", try_id);
+                    let catch_disp_lbl = format!("catch_disp_{}", try_id);
+                    let finally_lbl = format!("try_finally_{}", try_id);
+                    let unhandled_lbl = format!("try_unhandled_{}", try_id);
+                    let end_lbl = format!("try_end_{}", try_id);
+
+                    let jb_reg = format!("%jb_frame_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_try_push()\n", jb_reg));
+
+                    let sj_reg = format!("%sj_res_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i32 @_setjmp(i8* {}) returns_twice\n", sj_reg, jb_reg));
+
+                    let is_zero = format!("%sj_ok_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_zero, sj_reg));
+                    ir.push_str(&format!(
+                        "  br i1 {}, label %{}, label %{}\n\n",
+                        is_zero, try_body_lbl, catch_disp_lbl
+                    ));
+
+                    // --- Try Body ---
+                    ir.push_str(&format!("{}:\n", try_body_lbl));
+                    let try_cleanup_mark = deferred_frees.len();
+                    deferred_frees.push(CleanupOp::PopTryFrame);
+                    scope_tree.active_try_depth += 1;
+
+                    let try_terminated = self.lower_statements(
                         try_block,
                         ir,
                         scope_tree,
@@ -4652,8 +5974,111 @@ impl<'a> CodeGenerator<'a> {
                         import_chain,
                         dynamic_declarations,
                     )?;
+
+                    scope_tree.active_try_depth -= 1;
+                    if !try_terminated {
+                        // Pop `PopTryFrame` + any inner try-scoped resources on normal completion
+                        Self::emit_cleanups(ir, &deferred_frees[try_cleanup_mark..], temp_counter, "Try Normal Exit");
+                        ir.push_str(&format!("  br label %{}\n\n", finally_lbl));
+                    }
+                    deferred_frees.truncate(try_cleanup_mark);
+
+                    // --- Catch Dispatch (`longjmp` already popped the `OmniTryFrame` in C runtime) ---
+                    ir.push_str(&format!("{}:\n", catch_disp_lbl));
+                    if catch_clauses.is_empty() {
+                        ir.push_str(&format!("  br label %{}\n\n", unhandled_lbl));
+                    } else {
+                        for (c_idx, clause) in catch_clauses.iter().enumerate() {
+                            let match_body_lbl = format!("catch_body_{}_{}", try_id, c_idx);
+                            let next_check_lbl = if c_idx + 1 < catch_clauses.len() {
+                                format!("catch_check_{}_{}", try_id, c_idx + 1)
+                            } else {
+                                unhandled_lbl.clone()
+                            };
+
+                            if let Some(ref exc_ty) = clause.exception_type {
+                                let ty_ptr = if let Some((cn, clen)) = Self::find_string_constant(string_constants, exc_ty.trim()) {
+                                    let p = format!("%catch_ty_{}_{}", try_id, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                        p, clen, clen, cn
+                                    ));
+                                    p
+                                } else {
+                                    "null".to_string()
+                                };
+                                let m_i32 = format!("%catch_m32_{}_{}", try_id, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i32 @__omni_catch_matches(i8* {})\n", m_i32, ty_ptr));
+                                let m_ok = format!("%catch_mok_{}_{}", try_id, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", m_ok, m_i32));
+                                ir.push_str(&format!(
+                                    "  br i1 {}, label %{}, label %{}\n\n",
+                                    m_ok, match_body_lbl, next_check_lbl
+                                ));
+                            } else {
+                                ir.push_str(&format!("  br label %{}\n\n", match_body_lbl));
+                            }
+
+                            ir.push_str(&format!("{}:\n", match_body_lbl));
+                            scope_tree.enter_scope();
+                            if let Some(ref vname) = clause.var_name {
+                                let msg_reg = format!("%catch_msg_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = call i8* @__omni_catch_msg()\n", msg_reg));
+                                let v_ptr = format!("%err_var_{}_{}", vname, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i8*\n", v_ptr));
+                                ir.push_str(&format!("  store i8* {}, i8** {}\n", msg_reg, v_ptr));
+                                scope_tree.insert(
+                                    vname.clone(),
+                                    SymbolBinding {
+                                        name: vname.clone(),
+                                        llvm_ptr: v_ptr,
+                                        type_hint: "i8* (string)".to_string(),
+                                        is_scoped: true,
+                                    },
+                                );
+                            }
+
+                            let catch_mark = deferred_frees.len();
+                            let catch_ret = self.lower_statements(
+                                &clause.body,
+                                ir,
+                                scope_tree,
+                                deferred_frees,
+                                string_constants,
+                                cur_str_idx,
+                                lbl_counter,
+                                temp_counter,
+                                fn_name,
+                                struct_defs,
+                                temp,
+                                ecosystem_context,
+                                import_chain,
+                                dynamic_declarations,
+                            )?;
+                            scope_tree.exit_scope();
+                            if !catch_ret {
+                                Self::emit_cleanups(ir, &deferred_frees[catch_mark..], temp_counter, "Catch Exit");
+                                ir.push_str(&format!("  br label %{}\n\n", finally_lbl));
+                            }
+                            deferred_frees.truncate(catch_mark);
+
+                            if c_idx + 1 < catch_clauses.len() {
+                                ir.push_str(&format!("{}:\n", next_check_lbl));
+                            }
+                        }
+                    }
+
+                    // --- Unhandled Exception Path (run `finally` if present, then `@__omni_rethrow`) ---
+                    ir.push_str(&format!("{}:\n", unhandled_lbl));
                     if let Some(ref fin) = finally_block {
-                        self.lower_statements(
+                        scope_tree.enter_scope();
+                        let fin_mark = deferred_frees.len();
+                        let fin_ret = self.lower_statements(
                             fin,
                             ir,
                             scope_tree,
@@ -4669,7 +6094,48 @@ impl<'a> CodeGenerator<'a> {
                             import_chain,
                             dynamic_declarations,
                         )?;
+                        scope_tree.exit_scope();
+                        if !fin_ret {
+                            Self::emit_cleanups(ir, &deferred_frees[fin_mark..], temp_counter, "Finally Unhandled Exit");
+                            ir.push_str("  call void @__omni_rethrow()\n");
+                            ir.push_str("  unreachable\n\n");
+                        }
+                        deferred_frees.truncate(fin_mark);
+                    } else {
+                        ir.push_str("  call void @__omni_rethrow()\n");
+                        ir.push_str("  unreachable\n\n");
                     }
+
+                    // --- Normal / Handled `finally` Path ---
+                    ir.push_str(&format!("{}:\n", finally_lbl));
+                    if let Some(ref fin) = finally_block {
+                        scope_tree.enter_scope();
+                        let fin_mark = deferred_frees.len();
+                        let fin_ret = self.lower_statements(
+                            fin,
+                            ir,
+                            scope_tree,
+                            deferred_frees,
+                            string_constants,
+                            cur_str_idx,
+                            lbl_counter,
+                            temp_counter,
+                            fn_name,
+                            struct_defs,
+                            temp,
+                            ecosystem_context,
+                            import_chain,
+                            dynamic_declarations,
+                        )?;
+                        scope_tree.exit_scope();
+                        deferred_frees.truncate(fin_mark);
+                        if fin_ret {
+                            custom_return = true;
+                            break;
+                        }
+                    }
+                    ir.push_str(&format!("  br label %{}\n\n", end_lbl));
+                    ir.push_str(&format!("{}:\n", end_lbl));
                 }
             }
         }
@@ -4707,17 +6173,295 @@ impl<'a> CodeGenerator<'a> {
         out
     }
 
-    fn parse_default_i32(def_opt: &Option<String>) -> Option<i32> {
+    fn parse_default_i64(def_opt: &Option<String>) -> Option<i64> {
         let d = def_opt.as_ref()?.trim();
         if d == "True" || d == "true" {
             Some(1)
-        } else if d == "False" || d == "false" || d == "None" || d == "null" {
+        } else if d == "False" || d == "false" || is_null_literal(d) {
             Some(0)
         } else if d.contains("DEFAULT_EXPONENT") {
             Some(65537)
         } else {
-            d.parse::<i32>().ok()
+            parse_polyglot_i64(d)
         }
+    }
+
+    fn infer_expr_return_ir_type(
+        expr: &str,
+        class_fields: &HashMap<String, HashMap<String, usize>>,
+    ) -> Option<IrType> {
+        let e = expr.trim();
+        if e.is_empty() || is_null_literal(e) {
+            return None;
+        }
+        if (e.starts_with('"') && e.ends_with('"'))
+            || (e.starts_with('\'') && e.ends_with('\''))
+            || e.starts_with("f\"")
+            || e.starts_with("f'")
+            || e.starts_with("errors.New(")
+            || e.starts_with("fmt.Errorf(")
+            || STRING_CAST_PREFIXES.iter().any(|p| e.starts_with(p) && e.ends_with(')'))
+        {
+            return Some(IrType::Ptr);
+        }
+        if parse_polyglot_f64(e).is_some()
+            || FLOAT_CAST_PREFIXES.iter().any(|p| e.starts_with(p) && e.ends_with(')'))
+        {
+            return Some(IrType::F64);
+        }
+        if let Some(open) = e.find('(') {
+            if e.ends_with(')') {
+                let head = e[..open].trim().trim_start_matches("new ").trim();
+                if class_fields.contains_key(head) {
+                    return Some(IrType::StructPtr(head.to_string()));
+                }
+            }
+        }
+        Some(IrType::I64)
+    }
+
+    fn infer_return_signature_recursive(
+        stmts: &[Statement],
+        class_fields: &HashMap<String, HashMap<String, usize>>,
+        scalar_acc: &mut Option<IrType>,
+        tuple_acc: &mut Option<Vec<Option<IrType>>>,
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Return { expr: Some(e) } => {
+                    let trimmed_e = e.trim();
+                    let unwrapped = if trimmed_e.starts_with('(') && trimmed_e.ends_with(')') {
+                        let inner = &trimmed_e[1..trimmed_e.len() - 1];
+                        let mut d = 0i32;
+                        let mut balanced = true;
+                        for c in inner.chars() {
+                            if c == '(' { d += 1; }
+                            else if c == ')' {
+                                d -= 1;
+                                if d < 0 { balanced = false; break; }
+                            }
+                        }
+                        if balanced && d == 0 { inner.trim() } else { trimmed_e }
+                    } else {
+                        trimmed_e
+                    };
+                    let parts = omni_parser::OmniParser::split_respecting_quotes(unwrapped, ',');
+                    if parts.len() > 1 {
+                        let slots = tuple_acc.get_or_insert_with(|| vec![None; parts.len()]);
+                        for (idx, p) in parts.iter().enumerate() {
+                            if idx >= slots.len() {
+                                break;
+                            }
+                            if let Some(inferred) = Self::infer_expr_return_ir_type(p, class_fields) {
+                                if slots[idx].is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
+                                    slots[idx] = Some(inferred);
+                                }
+                            }
+                        }
+                    } else if let Some(inferred) = Self::infer_expr_return_ir_type(unwrapped, class_fields) {
+                        if scalar_acc.is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
+                            *scalar_acc = Some(inferred);
+                        }
+                    }
+                }
+                Statement::If { then_branch, else_branch, .. } => {
+                    Self::infer_return_signature_recursive(then_branch, class_fields, scalar_acc, tuple_acc);
+                    if let Some(eb) = else_branch {
+                        Self::infer_return_signature_recursive(eb, class_fields, scalar_acc, tuple_acc);
+                    }
+                }
+                Statement::WhileLoop { body, .. }
+                | Statement::ForLoop { body, .. }
+                | Statement::WithContext { body, .. } => {
+                    Self::infer_return_signature_recursive(body, class_fields, scalar_acc, tuple_acc);
+                }
+                Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    Self::infer_return_signature_recursive(try_block, class_fields, scalar_acc, tuple_acc);
+                    for c in catch_clauses {
+                        Self::infer_return_signature_recursive(&c.body, class_fields, scalar_acc, tuple_acc);
+                    }
+                    if let Some(fb) = finally_block {
+                        Self::infer_return_signature_recursive(fb, class_fields, scalar_acc, tuple_acc);
+                    }
+                }
+                Statement::Match { arms, .. } => {
+                    for arm in arms {
+                        Self::infer_return_signature_recursive(&arm.body, class_fields, scalar_acc, tuple_acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn bind_abi_param_i64(
+        functions_ir: &mut String,
+        scope_tree: &mut ScopeTree,
+        temp_counter: &mut usize,
+        param: &omni_parser::ParamDef,
+        reg_src: &str,
+        class_fields_map: &HashMap<String, HashMap<String, usize>>,
+    ) {
+        let p_name_lower = param.name.to_lowercase();
+        let clean_th = param
+            .type_hint
+            .as_deref()
+            .map(|th| th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim());
+
+        if let Some(th) = clean_th {
+            if is_float_type_hint(th) {
+                let fp = format!("%param_f64_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fp, reg_src));
+                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = alloca double\n", ptr));
+                functions_ir.push_str(&format!("  store double {}, double* {}\n", fp, ptr));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: "double".to_string(),
+                        is_scoped: true,
+                    },
+                );
+                return;
+            }
+            if class_fields_map.contains_key(th) {
+                let sp = format!("%param_sp_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", sp, reg_src, th));
+                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = alloca %struct.{}*\n", ptr, th));
+                functions_ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", th, sp, th, ptr));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: format!("%struct.{}*", th),
+                        is_scoped: true,
+                    },
+                );
+                return;
+            }
+            if is_string_type_hint(th) || th == "str" {
+                let sp = format!("%param_strp_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sp, reg_src));
+                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                functions_ir.push_str(&format!("  store i8* {}, i8** {}\n", sp, ptr));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: "i8* (string)".to_string(),
+                        is_scoped: true,
+                    },
+                );
+                return;
+            }
+        }
+
+        let is_chan = param.type_hint.as_deref().map(|th| th.contains("chan")).unwrap_or(false)
+            || p_name_lower == "ch"
+            || p_name_lower == "chan"
+            || p_name_lower.starts_with("chan_")
+            || p_name_lower.ends_with("_chan")
+            || p_name_lower.starts_with("ch_");
+        let is_slice = param.type_hint.as_deref().map(|th| th.contains("slice") || th.contains("list")).unwrap_or(false)
+            || p_name_lower == "slice"
+            || p_name_lower == "items"
+            || p_name_lower == "arr"
+            || p_name_lower == "list"
+            || p_name_lower.starts_with("items_")
+            || p_name_lower.starts_with("arr_")
+            || p_name_lower.starts_with("slice_")
+            || p_name_lower.ends_with("_arr")
+            || p_name_lower.ends_with("_slice")
+            || p_name_lower.ends_with("_list");
+        let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
+            || p_name_lower == "map"
+            || p_name_lower == "dict"
+            || p_name_lower.starts_with("map_")
+            || p_name_lower.starts_with("dict_")
+            || p_name_lower.ends_with("_map")
+            || p_name_lower.ends_with("_dict");
+        let is_callable = param
+            .type_hint
+            .as_deref()
+            .map(|th| th.to_lowercase().contains("callable") || th.contains("fn"))
+            .unwrap_or(false)
+            || p_name_lower.ends_with("_func")
+            || p_name_lower.ends_with("_fn")
+            || p_name_lower == "callback";
+
+        if is_chan || is_slice || is_map || is_callable {
+            let ptr_cast = format!("%ptr_cast_{}_{}", param.name, *temp_counter);
+            *temp_counter += 1;
+            functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, reg_src));
+            let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+            *temp_counter += 1;
+            functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+            functions_ir.push_str(&format!("  store i8* {}, i8** {}\n", ptr_cast, ptr));
+            let type_hint = if is_map {
+                "i8* (omni_map)".to_string()
+            } else if is_slice {
+                "i8* (omni_slice)".to_string()
+            } else if is_callable {
+                "i8* (omni_fn)".to_string()
+            } else {
+                "i8* (omni_chan)".to_string()
+            };
+            scope_tree.insert(
+                param.name.clone(),
+                SymbolBinding {
+                    name: param.name.clone(),
+                    llvm_ptr: ptr,
+                    type_hint,
+                    is_scoped: true,
+                },
+            );
+            return;
+        }
+
+        let val_i64 = if let Some(def_val) = Self::parse_default_i64(&param.default_val) {
+            if def_val != 0 {
+                let is_z = format!("%param_isz_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_z, reg_src));
+                let sel = format!("%param_i64_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!(
+                    "  {} = select i1 {}, i64 {}, i64 {}\n",
+                    sel, is_z, def_val, reg_src
+                ));
+                sel
+            } else {
+                reg_src.to_string()
+            }
+        } else {
+            reg_src.to_string()
+        };
+
+        let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+        *temp_counter += 1;
+        functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
+        functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", val_i64, ptr));
+        scope_tree.insert(
+            param.name.clone(),
+            SymbolBinding {
+                name: param.name.clone(),
+                llvm_ptr: ptr,
+                type_hint: "i64".to_string(),
+                is_scoped: true,
+            },
+        );
     }
 
     /// Generate unified LLVM IR text from OmniModule
@@ -4725,7 +6469,11 @@ impl<'a> CodeGenerator<'a> {
         let mut string_constants: Vec<(String, String, usize)> = Vec::new();
         let mut str_counter = 0;
 
-        // Pre-scan statements for print("...") recursively to extract string constants
+        // Always intern empty string & default "Exception" so exception lowering always has fallback GEP constants
+        Self::intern_string(&mut string_constants, &mut str_counter, "");
+        Self::intern_string(&mut string_constants, &mut str_counter, "Exception");
+
+        // Pre-scan statements recursively to extract string & exception constants
         for func in &module.functions {
             self.scan_strings_recursive(&func.body, &mut string_constants, &mut str_counter);
         }
@@ -4807,29 +6555,6 @@ impl<'a> CodeGenerator<'a> {
             result
         }
 
-        let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
-        for cls in &module.structs_and_classes {
-            for m in &cls.methods {
-                method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
-            }
-        }
-        for cls in &module.structs_and_classes {
-            let mut queue = cls.base_classes.clone();
-            let mut seen_bases = HashSet::new();
-            while let Some(b) = queue.pop() {
-                if seen_bases.insert(b.clone()) {
-                    if let Some(base_cls) = class_map.get(&b) {
-                        for m in &base_cls.methods {
-                            method_defining_map.entry((cls.name.clone(), m.name.clone())).or_insert(b.clone());
-                        }
-                        for bb in &base_cls.base_classes {
-                            queue.push(bb.clone());
-                        }
-                    }
-                }
-            }
-        }
-
         let mut class_fields_map: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let mut class_field_types_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut struct_defs = Vec::new();
@@ -4865,6 +6590,46 @@ impl<'a> CodeGenerator<'a> {
             struct_defs.push(s_def);
         }
 
+        let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
+        let mut method_return_types_map: HashMap<(String, String), IrType> = HashMap::new();
+        for cls in &module.structs_and_classes {
+            for m in &cls.methods {
+                method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
+                let m_ret = if let Some(ref rt) = m.return_type {
+                    classify_type_token(rt, &class_fields_map)
+                } else {
+                    let mut sc = None;
+                    let mut tp = None;
+                    Self::infer_return_signature_recursive(&m.body, &class_fields_map, &mut sc, &mut tp);
+                    if tp.is_some() {
+                        IrType::Ptr
+                    } else {
+                        sc.unwrap_or(IrType::I64)
+                    }
+                };
+                method_return_types_map.insert((cls.name.clone(), m.name.clone()), m_ret);
+            }
+        }
+        for cls in &module.structs_and_classes {
+            let mut queue = cls.base_classes.clone();
+            let mut seen_bases = HashSet::new();
+            while let Some(b) = queue.pop() {
+                if seen_bases.insert(b.clone()) {
+                    if let Some(base_cls) = class_map.get(&b) {
+                        for m in &base_cls.methods {
+                            method_defining_map.entry((cls.name.clone(), m.name.clone())).or_insert(b.clone());
+                            if let Some(base_rt) = method_return_types_map.get(&(b.clone(), m.name.clone())).cloned() {
+                                method_return_types_map.entry((cls.name.clone(), m.name.clone())).or_insert(base_rt);
+                            }
+                        }
+                        for bb in &base_cls.base_classes {
+                            queue.push(bb.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // 1-B. Enums -> Tagged Union Types & Variant Maps
         let mut enum_variants_map: HashMap<String, (String, usize)> = HashMap::new();
         for e in &module.enums {
@@ -4880,10 +6645,39 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 2. Functions & Methods Shared State
+        // 2. Functions & Return Type Lattice
         let mut known_functions_set = HashSet::new();
+        let mut fn_return_types_map: HashMap<String, IrType> = HashMap::new();
+        let mut fn_tuple_return_types_map: HashMap<String, Vec<IrType>> = HashMap::new();
+
         for f in &module.functions {
             known_functions_set.insert(f.name.clone());
+            if f.name == "main" {
+                fn_return_types_map.insert(f.name.clone(), IrType::I32);
+                continue;
+            }
+            if let Some(ref rt) = f.return_type {
+                if let Some(tup) = parse_tuple_return_types(rt, &class_fields_map) {
+                    fn_tuple_return_types_map.insert(f.name.clone(), tup);
+                    fn_return_types_map.insert(f.name.clone(), IrType::Ptr);
+                    continue;
+                }
+                fn_return_types_map.insert(f.name.clone(), classify_type_token(rt, &class_fields_map));
+            } else {
+                let mut sc = None;
+                let mut tp = None;
+                Self::infer_return_signature_recursive(&f.body, &class_fields_map, &mut sc, &mut tp);
+                if let Some(slots) = tp {
+                    let resolved: Vec<IrType> = slots
+                        .into_iter()
+                        .map(|o| o.unwrap_or(IrType::I64))
+                        .collect();
+                    fn_tuple_return_types_map.insert(f.name.clone(), resolved);
+                    fn_return_types_map.insert(f.name.clone(), IrType::Ptr);
+                } else if let Some(s_ty) = sc {
+                    fn_return_types_map.insert(f.name.clone(), s_ty);
+                }
+            }
         }
 
         let mut functions_ir = String::new();
@@ -4917,7 +6711,10 @@ impl<'a> CodeGenerator<'a> {
             for cls in &module.structs_and_classes {
                 for m in &cls.methods {
                     let qualified = format!("{}.{}", cls.name, m.name);
-                    if reachable_symbols.contains(&m.name) || reachable_symbols.contains(&qualified) || (m.name == "__init__" && reachable_symbols.contains(&cls.name)) {
+                    if reachable_symbols.contains(&m.name)
+                        || reachable_symbols.contains(&qualified)
+                        || (m.name == "__init__" && reachable_symbols.contains(&cls.name))
+                    {
                         let before_len = reachable_symbols.len();
                         Self::harvest_called_symbols(&m.body, &mut reachable_symbols);
                         if reachable_symbols.len() > before_len {
@@ -4928,7 +6725,7 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 1-C. Struct & Class Inherent Methods (@__omni_method_<cls>_<method>)
+        // 1-C. Struct & Class Inherent Methods (`i64 @__omni_method_<cls>_<method>(i8*, i64 x 5)`)
         for cls in &module.structs_and_classes {
             for method in &cls.methods {
                 let qualified = format!("{}.{}", cls.name, method.name);
@@ -4938,7 +6735,7 @@ impl<'a> CodeGenerator<'a> {
 
                 if !is_reachable {
                     functions_ir.push_str(&format!(
-                        "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
                         cls.name, method.name
                     ));
                     continue;
@@ -4950,7 +6747,7 @@ impl<'a> CodeGenerator<'a> {
                 let method_saved_temp = temp_counter;
 
                 functions_ir.push_str(&format!(
-                    "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n",
+                    "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n",
                     cls.name, method.name
                 ));
 
@@ -4960,6 +6757,9 @@ impl<'a> CodeGenerator<'a> {
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
                 scope_tree.method_defining_class = method_defining_map.clone();
+                scope_tree.fn_return_types = fn_return_types_map.clone();
+                scope_tree.fn_tuple_return_types = fn_tuple_return_types_map.clone();
+                scope_tree.method_return_types = method_return_types_map.clone();
                 let mut deferred_frees: Vec<CleanupOp> = Vec::new();
 
                 let self_ptr = format!("%self_ptr_{}", temp_counter);
@@ -5000,58 +6800,24 @@ impl<'a> CodeGenerator<'a> {
                     0
                 };
                 for (p_idx, param) in method.params.iter().skip(skip_count).enumerate() {
+                    if p_idx >= 5 {
+                        break;
+                    }
                     let reg_src = match p_idx {
                         0 => "%len",
                         1 => "%arg2",
-                        _ => "%arg3",
+                        2 => "%arg3",
+                        3 => "%arg4",
+                        _ => "%arg5",
                     };
-                    let is_64bit = param
-                        .type_hint
-                        .as_deref()
-                        .map(is_64bit_type_hint)
-                        .unwrap_or(false);
-                    if is_64bit {
-                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
-                        functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", reg_src, ptr));
-                        let th = param.type_hint.clone().unwrap_or_else(|| "i64".to_string());
-                        scope_tree.insert(param.name.clone(), SymbolBinding {
-                            name: param.name.clone(),
-                            llvm_ptr: ptr,
-                            type_hint: th,
-                            is_scoped: true,
-                        });
-                    } else {
-                        let raw_i32 = format!("%param_raw32_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", raw_i32, reg_src));
-                        let cast_i32 = if let Some(def_val) = Self::parse_default_i32(&param.default_val) {
-                            if def_val != 0 {
-                                let is_z = format!("%param_isz_{}_{}", param.name, temp_counter);
-                                temp_counter += 1;
-                                functions_ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_z, raw_i32));
-                                let sel = format!("%param_i32_{}_{}", param.name, temp_counter);
-                                temp_counter += 1;
-                                functions_ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", sel, is_z, def_val, raw_i32));
-                                sel
-                            } else {
-                                raw_i32
-                            }
-                        } else {
-                            raw_i32
-                        };
-                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
-                        scope_tree.insert(param.name.clone(), SymbolBinding {
-                            name: param.name.clone(),
-                            llvm_ptr: ptr,
-                            type_hint: "i32".to_string(),
-                            is_scoped: true,
-                        });
-                    }
+                    Self::bind_abi_param_i64(
+                        &mut functions_ir,
+                        &mut scope_tree,
+                        &mut temp_counter,
+                        param,
+                        reg_src,
+                        &class_fields_map,
+                    );
                 }
 
                 let lower_res = self.lower_statements(
@@ -5075,7 +6841,7 @@ impl<'a> CodeGenerator<'a> {
                     Ok(custom_ret) => {
                         if !custom_ret {
                             Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Method Exit");
-                            functions_ir.push_str("  ret i32 0\n");
+                            functions_ir.push_str("  ret i64 0\n");
                         }
                         functions_ir.push_str("}\n\n");
                         let hoisted = Self::hoist_allocas(&functions_ir[method_start_len..]);
@@ -5087,14 +6853,12 @@ impl<'a> CodeGenerator<'a> {
                         if is_reachable {
                             return Err(e);
                         } else {
-                            // Dead Code Elimination: method is unreachable from entrypoints and un-lowered.
-                            // Prune and emit a zero stub.
                             functions_ir.truncate(method_start_len);
                             cur_str_idx = method_saved_str_idx;
                             lbl_counter = method_saved_lbl;
                             temp_counter = method_saved_temp;
                             functions_ir.push_str(&format!(
-                                "define i32 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                                "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
                                 cls.name, method.name
                             ));
                         }
@@ -5103,8 +6867,7 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 2. Functions (namespaced as @__omni_fn_<name>)
-
+        // 2. Functions (namespaced as `i64 @__omni_fn_<name>(i64 x 6)` or `i32 @__omni_fn_main(i8*, i64)`)
         for func in &module.functions {
             let is_reachable = reachable_symbols.contains(&func.name);
             let func_start_len = functions_ir.len();
@@ -5120,8 +6883,8 @@ impl<'a> CodeGenerator<'a> {
                     );
                 } else {
                     functions_ir.push_str(&format!(
-                        "define i32 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  %r = trunc i64 %arg0 to i32\n  ret i32 %r\n}}\n\ndefine void @__omni_trampoline_{}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i32 @__omni_fn_{}(i64 %raw_int, i64 0, i64 0, i64 0)\n  ret void\n}}\n\n",
-                        func.name, func.name, func.name
+                        "define i64 @__omni_fn_{0}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 %arg0\n}}\n\ndefine void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int, i64 0, i64 0, i64 0, i64 0, i64 0)\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n  %p0 = getelementptr inbounds i64, i64* %p64, i64 0\n  %a0 = load i64, i64* %p0\n  %p1 = getelementptr inbounds i64, i64* %p64, i64 1\n  %a1 = load i64, i64* %p1\n  %p2 = getelementptr inbounds i64, i64* %p64, i64 2\n  %a2 = load i64, i64* %p2\n  %p3 = getelementptr inbounds i64, i64* %p64, i64 3\n  %a3 = load i64, i64* %p3\n  %p4 = getelementptr inbounds i64, i64* %p64, i64 4\n  %a4 = load i64, i64* %p4\n  %p5 = getelementptr inbounds i64, i64* %p64, i64 5\n  %a5 = load i64, i64* %p5\n  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n  ret void\n}}\n\n",
+                        func.name
                     ));
                 }
                 continue;
@@ -5134,7 +6897,7 @@ impl<'a> CodeGenerator<'a> {
                 );
             } else {
                 functions_ir.push_str(&format!(
-                    "define i32 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n",
+                    "define i64 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n",
                     func.name
                 ));
             }
@@ -5145,9 +6908,12 @@ impl<'a> CodeGenerator<'a> {
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
             scope_tree.method_defining_class = method_defining_map.clone();
+            scope_tree.fn_return_types = fn_return_types_map.clone();
+            scope_tree.fn_tuple_return_types = fn_tuple_return_types_map.clone();
+            scope_tree.method_return_types = method_return_types_map.clone();
             let mut deferred_frees: Vec<CleanupOp> = Vec::new();
 
-            // Bind function parameters with ABI and type awareness
+            // Bind function parameters with 64-bit / float / pointer ABI awareness
             if func.name == "main" {
                 for (i, param) in func.params.iter().enumerate() {
                     let p_name_lower = param.name.to_lowercase();
@@ -5158,7 +6924,7 @@ impl<'a> CodeGenerator<'a> {
                         || p_name_lower.starts_with("items_") || p_name_lower.starts_with("arr_") || p_name_lower.starts_with("slice_") || p_name_lower.ends_with("_arr") || p_name_lower.ends_with("_slice") || p_name_lower.ends_with("_list");
                     let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
                         || p_name_lower == "map" || p_name_lower == "dict" || p_name_lower.starts_with("map_") || p_name_lower.starts_with("dict_") || p_name_lower.ends_with("_map") || p_name_lower.ends_with("_dict");
-                    let is_int = param.type_hint.as_deref().map(|th| th == "int" || th == "i32" || th == "i64").unwrap_or(false)
+                    let is_int = param.type_hint.as_deref().map(|th| th == "int" || th == "i32" || th == "i64" || th == "int64").unwrap_or(false)
                         || (!is_chan && !is_slice && !is_map && (p_name_lower == "val" || p_name_lower == "num" || p_name_lower == "count" || p_name_lower == "idx" || p_name_lower == "n" || p_name_lower == "x" || p_name_lower == "y" || p_name_lower == "z"));
 
                     if i == 0 {
@@ -5166,19 +6932,16 @@ impl<'a> CodeGenerator<'a> {
                             let cast_i64 = format!("%param_int64_{}_{}", param.name, temp_counter);
                             temp_counter += 1;
                             functions_ir.push_str(&format!("  {} = ptrtoint i8* %data to i64\n", cast_i64));
-                            let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
-                            temp_counter += 1;
-                            functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", cast_i32, cast_i64));
                             let ptr = format!("%param_{}_{}", param.name, temp_counter);
                             temp_counter += 1;
-                            functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                            functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                            functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
+                            functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", cast_i64, ptr));
                             scope_tree.insert(
                                 param.name.clone(),
                                 SymbolBinding {
                                     name: param.name.clone(),
                                     llvm_ptr: ptr,
-                                    type_hint: "i32".to_string(),
+                                    type_hint: "i64".to_string(),
                                     is_scoped: true,
                                 },
                             );
@@ -5205,19 +6968,16 @@ impl<'a> CodeGenerator<'a> {
                             );
                         }
                     } else if i == 1 {
-                        let cast_i32 = format!("%param_i32_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = trunc i64 %len to i32\n", cast_i32));
                         let ptr = format!("%param_{}_{}", param.name, temp_counter);
                         temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
+                        functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
+                        functions_ir.push_str(&format!("  store i64 %len, i64* {}\n", ptr));
                         scope_tree.insert(
                             param.name.clone(),
                             SymbolBinding {
                                 name: param.name.clone(),
                                 llvm_ptr: ptr,
-                                type_hint: "i32".to_string(),
+                                type_hint: "i64".to_string(),
                                 is_scoped: true,
                             },
                         );
@@ -5225,78 +6985,18 @@ impl<'a> CodeGenerator<'a> {
                 }
             } else {
                 for (i, param) in func.params.iter().enumerate() {
-                    if i >= 4 { break; }
-                    let arg_src = format!("%arg{}", i);
-                    let p_name_lower = param.name.to_lowercase();
-                    let is_chan = param.type_hint.as_deref().map(|th| th.contains("chan")).unwrap_or(false)
-                        || p_name_lower == "ch" || p_name_lower == "chan" || p_name_lower.starts_with("chan_") || p_name_lower.ends_with("_chan") || p_name_lower.starts_with("ch_");
-                    let is_slice = param.type_hint.as_deref().map(|th| th.contains("slice") || th.contains("list")).unwrap_or(false)
-                        || p_name_lower == "slice" || p_name_lower == "items" || p_name_lower == "arr" || p_name_lower == "list"
-                        || p_name_lower.starts_with("items_") || p_name_lower.starts_with("arr_") || p_name_lower.starts_with("slice_") || p_name_lower.ends_with("_arr") || p_name_lower.ends_with("_slice") || p_name_lower.ends_with("_list");
-                    let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
-                        || p_name_lower == "map" || p_name_lower == "dict" || p_name_lower.starts_with("map_") || p_name_lower.starts_with("dict_") || p_name_lower.ends_with("_map") || p_name_lower.ends_with("_dict");
-                    let is_callable = param.type_hint.as_deref().map(|th| th.to_lowercase().contains("callable") || th.contains("fn")).unwrap_or(false)
-                        || p_name_lower.ends_with("_func") || p_name_lower.ends_with("_fn") || p_name_lower == "callback";
-
-                    if is_chan || is_slice || is_map || is_callable {
-                        let ptr_cast = format!("%ptr_cast_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, arg_src));
-                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
-                        functions_ir.push_str(&format!("  store i8* {}, i8** {}\n", ptr_cast, ptr));
-                        let type_hint = if is_map {
-                            "i8* (omni_map)".to_string()
-                        } else if is_slice {
-                            "i8* (omni_slice)".to_string()
-                        } else if is_callable {
-                            "i8* (omni_fn)".to_string()
-                        } else {
-                            "i8* (omni_chan)".to_string()
-                        };
-                        scope_tree.insert(
-                            param.name.clone(),
-                            SymbolBinding {
-                                name: param.name.clone(),
-                                llvm_ptr: ptr,
-                                type_hint,
-                                is_scoped: true,
-                            },
-                        );
-                    } else {
-                        let raw_i32 = format!("%param_raw32_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = trunc i64 {} to i32\n", raw_i32, arg_src));
-                        let cast_i32 = if let Some(def_val) = Self::parse_default_i32(&param.default_val) {
-                            if def_val != 0 {
-                                let is_z = format!("%param_isz_{}_{}", param.name, temp_counter);
-                                temp_counter += 1;
-                                functions_ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_z, raw_i32));
-                                let sel = format!("%param_i32_{}_{}", param.name, temp_counter);
-                                temp_counter += 1;
-                                functions_ir.push_str(&format!("  {} = select i1 {}, i32 {}, i32 {}\n", sel, is_z, def_val, raw_i32));
-                                sel
-                            } else {
-                                raw_i32
-                            }
-                        } else {
-                            raw_i32
-                        };
-                        let ptr = format!("%param_{}_{}", param.name, temp_counter);
-                        temp_counter += 1;
-                        functions_ir.push_str(&format!("  {} = alloca i32\n", ptr));
-                        functions_ir.push_str(&format!("  store i32 {}, i32* {}\n", cast_i32, ptr));
-                        scope_tree.insert(
-                            param.name.clone(),
-                            SymbolBinding {
-                                name: param.name.clone(),
-                                llvm_ptr: ptr,
-                                type_hint: "i32".to_string(),
-                                is_scoped: true,
-                            },
-                        );
+                    if i >= 6 {
+                        break;
                     }
+                    let arg_src = format!("%arg{}", i);
+                    Self::bind_abi_param_i64(
+                        &mut functions_ir,
+                        &mut scope_tree,
+                        &mut temp_counter,
+                        param,
+                        &arg_src,
+                        &class_fields_map,
+                    );
                 }
             }
 
@@ -5321,7 +7021,11 @@ impl<'a> CodeGenerator<'a> {
                 Ok(custom_ret) => {
                     if !custom_ret {
                         Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Function Exit");
-                        functions_ir.push_str("  ret i32 0\n");
+                        if func.name == "main" {
+                            functions_ir.push_str("  ret i32 0\n");
+                        } else {
+                            functions_ir.push_str("  ret i64 0\n");
+                        }
                     }
                     functions_ir.push_str("}\n\n");
                     let hoisted = Self::hoist_allocas(&functions_ir[func_start_len..]);
@@ -5338,7 +7042,7 @@ impl<'a> CodeGenerator<'a> {
                         lbl_counter = func_saved_lbl;
                         temp_counter = func_saved_temp;
                         functions_ir.push_str(&format!(
-                            "define i32 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                            "define i64 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
                             func.name
                         ));
                     }
@@ -5353,8 +7057,8 @@ impl<'a> CodeGenerator<'a> {
                 ));
             } else {
                 functions_ir.push_str(&format!(
-                    "define void @__omni_trampoline_{}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i32 @__omni_fn_{}(i64 %raw_int, i64 0, i64 0, i64 0)\n  ret void\n}}\n\n",
-                    func.name, func.name
+                    "define void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int, i64 0, i64 0, i64 0, i64 0, i64 0)\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n  %p0 = getelementptr inbounds i64, i64* %p64, i64 0\n  %a0 = load i64, i64* %p0\n  %p1 = getelementptr inbounds i64, i64* %p64, i64 1\n  %a1 = load i64, i64* %p1\n  %p2 = getelementptr inbounds i64, i64* %p64, i64 2\n  %a2 = load i64, i64* %p2\n  %p3 = getelementptr inbounds i64, i64* %p64, i64 3\n  %a3 = load i64, i64* %p3\n  %p4 = getelementptr inbounds i64, i64* %p64, i64 4\n  %a4 = load i64, i64* %p4\n  %p5 = getelementptr inbounds i64, i64* %p64, i64 5\n  %a5 = load i64, i64* %p5\n  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n  ret void\n}}\n\n",
+                    func.name
                 ));
             }
         }
@@ -5364,15 +7068,6 @@ impl<'a> CodeGenerator<'a> {
         let call_c_re = Regex::new(r#"call\s+[a-zA-Z0-9_*]+\s+@([a-zA-Z0-9_]+)\("#).unwrap();
         let mut missing_omni_stubs = Vec::new();
         let mut seen_called = HashSet::new();
-        let native_c_libs: HashSet<&str> = [
-            "compressBound", "compress", "uncompress", "crc32", "adler32",
-            "sqlite3_open", "sqlite3_close", "sqlite3_exec", "sqlite3_errmsg",
-            "abs", "labs", "atoi", "atol", "strlen", "strcpy", "strncpy", "strcat",
-            "strncmp", "strchr", "strstr", "memcpy", "memmove", "memset", "memcmp",
-            "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
-            "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
-            "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
-        ].into_iter().collect();
 
         for cap in call_c_re.captures_iter(&functions_ir) {
             let sym = cap[1].to_string();
@@ -5380,20 +7075,25 @@ impl<'a> CodeGenerator<'a> {
                 continue;
             }
             if sym.starts_with("__omni_method_") {
-                if !functions_ir.contains(&format!("define i32 @{}(", sym)) {
+                if !functions_ir.contains(&format!("define i64 @{}(", sym))
+                    && !functions_ir.contains(&format!("define i32 @{}(", sym))
+                {
                     missing_omni_stubs.push(format!(
-                        "define i32 @{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        "define i64 @{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
                         sym
                     ));
                 }
             } else if sym.starts_with("__omni_fn_") {
-                if !functions_ir.contains(&format!("define i32 @{}(", sym)) {
+                if !functions_ir.contains(&format!("define i64 @{}(", sym))
+                    && !functions_ir.contains(&format!("define i32 @{}(", sym))
+                {
                     missing_omni_stubs.push(format!(
-                        "define i32 @{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3) {{\nentry:\n  ret i32 0\n}}\n\n",
+                        "define i64 @{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
                         sym
                     ));
                 }
             } else if !sym.starts_with("__omni_")
+                && sym != "_setjmp"
                 && sym != "malloc"
                 && sym != "free"
                 && sym != "printf"
@@ -5402,43 +7102,42 @@ impl<'a> CodeGenerator<'a> {
                 && sym != "exit"
                 && sym != "strcmp"
                 && sym != "fast_hash_block"
-                && !runtime_headers.contains(&format!("@{}", sym))
+                && !runtime_headers.contains(&format!("@{}(", sym))
                 && !known_functions_set.contains(&sym)
+                && !functions_ir.contains(&format!("define i64 @{}(", sym))
                 && !functions_ir.contains(&format!("define i32 @{}(", sym))
             {
-                if native_c_libs.contains(sym.as_str()) {
+                if NATIVE_C_LIB_I64_FNS.contains(&sym.as_str()) {
+                    dynamic_declarations.insert(format!("declare i64 @{}(...)", sym));
+                } else if NATIVE_C_LIB_FNS.contains(&sym.as_str()) {
                     dynamic_declarations.insert(format!("declare i32 @{}(...)", sym));
                 } else if sym == "not" {
                     missing_omni_stubs.push(
-                        "define weak i32 @not(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp eq i64 %a0, 0\n  %r = zext i1 %c to i32\n  ret i32 %r\n}\n\n".to_string()
+                        "define weak i64 @not(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %c = icmp eq i64 %a0, 0\n  %r = zext i1 %c to i64\n  ret i64 %r\n}\n\n".to_string()
                     );
                 } else if sym == "is_acceptable" || sym == "is_prime" || sym == "miller_rabin_primality_testing" {
                     missing_omni_stubs.push(
-                        format!("define weak i32 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {{\nentry:\n  ret i32 1\n}}\n\n", sym)
+                        format!("define weak i64 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {{\nentry:\n  ret i64 1\n}}\n\n", sym)
                     );
                 } else if sym == "pow" {
                     missing_omni_stubs.push(
-                        "define weak i32 @pow(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  ret i32 1\n}\n\n".to_string()
+                        "define weak i64 @pow(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  ret i64 1\n}\n\n".to_string()
                     );
                 } else if sym == "max" {
                     missing_omni_stubs.push(
-                        "define weak i32 @max(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp sgt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  %r = trunc i64 %s to i32\n  ret i32 %r\n}\n\n".to_string()
+                        "define weak i64 @max(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %c = icmp sgt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  ret i64 %s\n}\n\n".to_string()
                     );
                 } else if sym == "min" {
                     missing_omni_stubs.push(
-                        "define weak i32 @min(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %c = icmp slt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  %r = trunc i64 %s to i32\n  ret i32 %r\n}\n\n".to_string()
+                        "define weak i64 @min(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %c = icmp slt i64 %a0, %a1\n  %s = select i1 %c, i64 %a0, i64 %a1\n  ret i64 %s\n}\n\n".to_string()
                     );
                 } else if sym == "divmod" {
                     missing_omni_stubs.push(
-                        "define weak i32 @divmod(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %z = icmp eq i64 %a1, 0\n  %d = select i1 %z, i64 1, i64 %a1\n  %q = sdiv i64 %a0, %d\n  %m = srem i64 %a0, %d\n  %s = call i8* @__omni_slice_create(i64 2)\n  call void @__omni_slice_append(i8* %s, i64 %q)\n  call void @__omni_slice_append(i8* %s, i64 %m)\n  call void @__omni_c_return_ptr(i8* %s)\n  %r = ptrtoint i8* %s to i32\n  ret i32 %r\n}\n\n".to_string()
-                    );
-                } else if sym == "is_acceptable" {
-                    missing_omni_stubs.push(
-                        "define weak i32 @is_acceptable(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {\nentry:\n  %neq = icmp ne i64 %a0, %a1\n  %r = zext i1 %neq to i32\n  ret i32 %r\n}\n\n".to_string()
+                        "define weak i64 @divmod(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %z = icmp eq i64 %a1, 0\n  %d = select i1 %z, i64 1, i64 %a1\n  %q = sdiv i64 %a0, %d\n  %m = srem i64 %a0, %d\n  %s = call i8* @__omni_slice_create(i64 2)\n  call void @__omni_slice_append(i8* %s, i64 %q)\n  call void @__omni_slice_append(i8* %s, i64 %m)\n  call void @__omni_c_return_ptr(i8* %s)\n  %r = ptrtoint i8* %s to i64\n  ret i64 %r\n}\n\n".to_string()
                     );
                 } else {
                     missing_omni_stubs.push(format!(
-                        "define weak i32 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3) {{\nentry:\n  %r = trunc i64 %a0 to i32\n  ret i32 %r\n}}\n\n",
+                        "define weak i64 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {{\nentry:\n  ret i64 %a0\n}}\n\n",
                         sym
                     ));
                 }
@@ -5502,7 +7201,7 @@ impl<'a> CodeGenerator<'a> {
             ir.push_str("  ret i32 %exit_code\n");
         } else if let Some(f) = module.functions.first() {
             ir.push_str(&format!(
-                "  %res = call i32 @__omni_fn_{}(i64 0, i64 0, i64 0, i64 0)\n",
+                "  %res = call i64 @__omni_fn_{}(i64 0, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
                 f.name
             ));
             ir.push_str("  call void @__omni_thread_join_all()\n");
@@ -5584,5 +7283,63 @@ def main():
 
         let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
         verifier.verify_ir(&ir).expect("LLVM IR verification failed for channels and spawn");
+    }
+
+    #[test]
+    fn test_codegen_64bit_floats_unwind_and_multi_returns_verify() {
+        let src = r#"
+fn add_huge(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+fn circle_area(r: f64) -> f64 {
+    return 3.14159 * r * r
+}
+
+func safe_div(a int64, b int64) (int64, error) {
+    if b == 0 {
+        return 0, errors.New("div_zero")
+    }
+    return a / b, nil
+}
+
+def boom(x):
+    if x < 0:
+        raise ValueError("bad_input")
+    return x
+
+def main():
+    huge = add_huge(5_000_000_000, 2_500_000_000)
+    area = circle_area(2.0)
+    print(huge, area)
+    try:
+        y = boom(-1)
+    except ValueError as err:
+        print(err)
+    finally:
+        print("done")
+    q, e := safe_div(100, 5)
+    if e == nil:
+        print(q)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("backbone_codegen_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        assert!(ir.contains("define i64 @__omni_fn_add_huge("));
+        assert!(ir.contains("fmul double"));
+        assert!(ir.contains("@__omni_print_float"));
+        assert!(ir.contains("@__omni_try_push"));
+        assert!(ir.contains("@_setjmp"));
+        assert!(ir.contains("@__omni_throw"));
+        assert!(ir.contains("@__omni_catch_matches"));
+
+        let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        verifier
+            .verify_ir(&ir)
+            .expect("LLVM IR verification failed for 64-bit, double, setjmp unwind, and multi-return");
     }
 }

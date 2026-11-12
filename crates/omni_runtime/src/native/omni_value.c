@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <setjmp.h>
+
+#ifdef _MSC_VER
+#define OMNI_TLS __declspec(thread)
+#else
+#define OMNI_TLS _Thread_local
+#endif
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -233,6 +240,46 @@ char* __omni_int_to_str(int64_t v) {
     if (!buf) return "";
     snprintf(buf, 32, "%lld", (long long)v);
     return buf;
+}
+
+static void omni_format_f64(double v, char* buf, size_t cap) {
+    if (v == 0.0) v = 0.0; // canonicalize -0.0 -> 0.0
+    snprintf(buf, cap, "%.12g", v);
+    bool is_fin = (v == v) && ((v - v) == 0.0);
+    if (is_fin && !strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')) {
+        size_t len = strlen(buf);
+        if (len + 3 < cap) {
+            buf[len] = '.';
+            buf[len + 1] = '0';
+            buf[len + 2] = '\0';
+        }
+    }
+}
+
+char* __omni_float_to_str(double v) {
+    char* buf = (char*)malloc(48);
+    if (!buf) return "0.0";
+    omni_format_f64(v, buf, 48);
+    return buf;
+}
+
+void __omni_print_float(double v) {
+    char buf[48];
+    omni_format_f64(v, buf, sizeof(buf));
+    printf("%s\n", buf);
+    fflush(stdout);
+}
+
+double __omni_c_str_to_f64(const char* s) {
+    if (!s) return 0.0;
+    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'') s++;
+    return strtod(s, NULL);
+}
+
+int64_t __omni_c_str_to_i64(const char* s) {
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'') s++;
+    return (int64_t)strtoll(s, NULL, 0);
 }
 
 void __omni_sleep_s(int64_t seconds) {
@@ -465,9 +512,90 @@ int32_t __omni_c_to_int(const char* s) {
 #include <arpa/inet.h>
 #endif
 
-static const char* g_omni_returned_str = "";
-static void* g_omni_returned_ptr = NULL;
+static OMNI_TLS const char* g_omni_returned_str = "";
+static OMNI_TLS void* g_omni_returned_ptr = NULL;
 static int g_omni_accept_count = 0;
+
+// ============================================================================
+// Thread-Local Stack-Unwinding Exception Runtime (setjmp / longjmp)
+// ============================================================================
+#define OMNI_MAX_TRY_DEPTH 64
+
+typedef struct {
+    jmp_buf env;
+} OmniTryFrame;
+
+static OMNI_TLS OmniTryFrame g_omni_try_stack[OMNI_MAX_TRY_DEPTH];
+static OMNI_TLS int32_t g_omni_try_depth = 0;
+static OMNI_TLS int64_t g_omni_last_exc_code = 0;
+static OMNI_TLS const char* g_omni_last_exc_type = "Exception";
+static OMNI_TLS const char* g_omni_last_exc_msg = "";
+
+void* __omni_try_push(void) {
+    if (g_omni_try_depth >= OMNI_MAX_TRY_DEPTH) {
+        fprintf(stderr, "OmniRuntime Fatal: try/catch nesting exceeded %d frames\n", OMNI_MAX_TRY_DEPTH);
+        exit(1);
+    }
+    OmniTryFrame* frame = &g_omni_try_stack[g_omni_try_depth++];
+    return (void*)&frame->env;
+}
+
+void __omni_try_pop(void) {
+    if (g_omni_try_depth > 0) {
+        g_omni_try_depth--;
+    }
+}
+
+void __omni_throw(int64_t code, const char* exc_type, const char* msg) {
+    g_omni_last_exc_code = code != 0 ? code : 1;
+    g_omni_last_exc_type = (exc_type && *exc_type) ? exc_type : "Exception";
+    g_omni_last_exc_msg = msg ? msg : "";
+    if (g_omni_try_depth > 0) {
+        g_omni_try_depth--;
+        longjmp(g_omni_try_stack[g_omni_try_depth].env, 1);
+    }
+    fprintf(stderr, "Uncaught %s: %s\n", g_omni_last_exc_type, g_omni_last_exc_msg);
+    fflush(stderr);
+    exit((int)(g_omni_last_exc_code & 0xFF ? (g_omni_last_exc_code & 0xFF) : 1));
+}
+
+void __omni_rethrow(void) {
+    __omni_throw(g_omni_last_exc_code, g_omni_last_exc_type, g_omni_last_exc_msg);
+}
+
+const char* __omni_catch_msg(void) {
+    return g_omni_last_exc_msg ? g_omni_last_exc_msg : "";
+}
+
+const char* __omni_catch_type(void) {
+    return g_omni_last_exc_type ? g_omni_last_exc_type : "Exception";
+}
+
+int64_t __omni_catch_code(void) {
+    return g_omni_last_exc_code;
+}
+
+bool __omni_catch_matches(const char* expected_type) {
+    if (!expected_type || !*expected_type) return true;
+    if (strcmp(expected_type, "Exception") == 0 ||
+        strcmp(expected_type, "BaseException") == 0 ||
+        strcmp(expected_type, "Error") == 0 ||
+        strcmp(expected_type, "RuntimeError") == 0 ||
+        strcmp(expected_type, "RuntimeException") == 0 ||
+        strcmp(expected_type, "Throwable") == 0 ||
+        strcmp(expected_type, "std::exception") == 0 ||
+        strcmp(expected_type, "any") == 0 ||
+        strcmp(expected_type, "_") == 0) {
+        return true;
+    }
+    const char* actual = g_omni_last_exc_type ? g_omni_last_exc_type : "Exception";
+    if (strcmp(actual, expected_type) == 0) return true;
+    const char* actual_tail = strrchr(actual, '.');
+    actual_tail = actual_tail ? actual_tail + 1 : actual;
+    const char* exp_tail = strrchr(expected_type, '.');
+    exp_tail = exp_tail ? exp_tail + 1 : expected_type;
+    return strcmp(actual_tail, exp_tail) == 0;
+}
 
 void __omni_c_return_str(const char* s) {
     g_omni_returned_str = s ? s : "";

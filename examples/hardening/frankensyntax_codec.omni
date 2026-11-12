@@ -1,0 +1,89 @@
+// Hardening Target 1: FrankenSyntax Codec
+// Mixes Rust structs/lifetimes, C loops/hex/compound-ops, Lua `function..then..end` + `~=`,
+// Python `with` RAII context managers + comprehensions + floor-div + negative indexing,
+// Ruby postfix `if`, and 3 live ecosystems: PyPI (`varint`), npm (`crc-32`), and C (`zlib`).
+
+import 'python' varint
+import 'node' crc-32 as crc32
+import 'c' zlib
+
+#[repr(C)]
+struct FrameSeed {
+    magic: i32,
+    version: i32,
+}
+
+fn fold_bits<'a>(seed: i32, steps: i32) -> i32 {
+    int acc = seed ^ 0x5A;
+    for (int i = 0; i < steps; ++i) {
+        acc = (acc << 1) ^ (i + 3);
+        acc += (i & 1);
+    }
+    return acc;
+}
+
+function lua_zig_zag(n)
+    --[[ Lua block comment inside function body ]]
+    if n ~= 0 then
+        if n < 0 then
+            return (0 - n) * 2 - 1
+        else
+            return n * 2
+        end
+    end
+    return 0
+end
+
+class CodecSession:
+    def __init__(self, tag: int):
+        self.tag = tag
+        self.opened = 0
+
+    def __enter__(self):
+        self.opened = 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.opened = 0
+        return 0
+
+    def mix(self, val: int) -> int:
+        return (val // 2) + self.tag
+
+def main() -> int:
+    raw = [1, 2, 3, 4, 5, 6]
+    tripled = [x * 3 for x in raw if x > 2]
+    last_item = tripled[-1]
+
+    folded = fold_bits(0x10, 4)
+    zz = lua_zig_zag(-7)
+
+    v_bytes = varint.encode(300)
+    c_hash = crc32.str("omni-frame")
+    z_bound = zlib.compressBound(256)
+
+    session_score = 0
+    with CodecSession(9) as sess:
+        session_score = sess.mix(last_item + zz)
+
+    bonus = 0
+    bonus = 25 if z_bound > 256
+
+    // Sanity check deterministic core math:
+    // raw > 2 => [3, 4, 5, 6] * 3 => [9, 12, 15, 18] => last_item = 18
+    // zz = lua_zig_zag(-7) = 13
+    // session_score = ((18 + 13) // 2) + 9 = 15 + 9 = 24
+    // folded = fold_bits(16, 4):
+    //   acc0 = 16 ^ 90 = 74
+    //   i=0: (74<<1)^3 + 0 = 148^3 = 151
+    //   i=1: (151<<1)^4 + 1 = 302^4 + 1 = 298 + 1 = 299
+    //   i=2: (299<<1)^5 + 0 = 598^5 = 595
+    //   i=3: (595<<1)^6 + 1 = 1190^6 + 1 = 1184 + 1 = 1185
+    // bonus = 25 (compressBound(256) > 256 in libz)
+    deterministic_core = last_item + zz + session_score + folded + bonus
+    print("FrankenSyntax core: " + str(deterministic_core))
+    if v_bytes != 0:
+        print("polyglot deps resolved: varint + crc32 + zlib")
+    if c_hash != 0:
+        print("crc32 non-zero ok")
+    return 0

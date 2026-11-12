@@ -1,0 +1,77 @@
+// Hardening Target 2: Babel Mesh Pipeline
+// Mixes Go goroutines + MPMC channels + `:=` short declarations, Java/C# inheritance + `@Override` + ternary,
+// JS/TS arrow functions + typed params, polyglot hash maps, and Go (`xxhash`) + Rust (`adler`) packages.
+
+import 'go' github.com/cespare/xxhash as xxhash
+import 'rust' adler
+
+public class BaseStage {
+    int base_offset;
+
+    public BaseStage(int offset) {
+        this.base_offset = offset;
+    }
+
+    public int base_bias() {
+        return this.base_offset;
+    }
+}
+
+public class TelemetryStage extends BaseStage {
+    int weight;
+
+    public TelemetryStage(int weight) {
+        this.base_offset = 10;
+        this.weight = weight;
+    }
+
+    @Override
+    public int transform(int sample) {
+        int scaled = sample * this.weight + this.base_offset;
+        int clamped = scaled > 50 ? scaled - 10 : scaled + 10;
+        return clamped;
+    }
+}
+
+const bump_metric = (x: number): number => x * 2 + 5;
+
+func producer(ch chan int, seed int) {
+    v1 := seed + 4
+    v2 := v1 * 2
+    ch <- v1
+    ch <- v2
+}
+
+func main() int {
+    ch := make(chan int, 4)
+    go producer(ch, 6)
+
+    a := <-ch
+    b := <-ch
+
+    stage := TelemetryStage(3)
+    t_a := stage.transform(a)
+    t_b := stage.transform(b)
+
+    routing = {
+        "alpha": 11,
+        "beta": 29
+    }
+    routing["gamma"] = bump_metric(7)
+
+    xx := xxhash.Sum64String("babel-mesh")
+    ad := adler.adler32_slice("mesh-payload")
+
+    // Math trace:
+    // producer(ch, 6): a = 10, b = 20
+    // stage(3):
+    //   t_a: 10*3 + 10 = 40 (<=50 => +10 => 50)
+    //   t_b: 20*3 + 10 = 70 (>50  => -10 => 60)
+    // routing["alpha"] = 11, routing["beta"] = 29, routing["gamma"] = 7*2 + 5 = 19
+    // sum = 50 + 60 + 11 + 29 + 19 = 169
+    total := t_a + t_b + routing["alpha"] + routing["beta"] + routing["gamma"]
+    print("Babel mesh total: " + str(total))
+    if xx != 0 or ad != 0:
+        print("go+rust packages linked")
+    return 0
+}

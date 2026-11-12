@@ -13,8 +13,8 @@ typedef struct {
 
 OmniSlice* __omni_slice_create(size_t initial_cap);
 void __omni_slice_append(OmniSlice* slice, int64_t val);
-int64_t __omni_slice_get(OmniSlice* slice, size_t index);
-void __omni_slice_set(OmniSlice* slice, size_t index, int64_t val);
+int64_t __omni_slice_get(OmniSlice* slice, int64_t index);
+void __omni_slice_set(OmniSlice* slice, int64_t index, int64_t val);
 size_t __omni_slice_len(OmniSlice* slice);
 int64_t __omni_slice_pop(OmniSlice* slice);
 void __omni_slice_print(OmniSlice* slice);

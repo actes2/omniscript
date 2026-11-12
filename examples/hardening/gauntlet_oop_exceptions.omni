@@ -1,0 +1,74 @@
+# Hardening Target 3: Gauntlet OOP, Exceptions & Bare Autonomous Imports
+# Tests bare dialect-less imports (`import varint`, `import zlib`), mixed C/Python/Lua blocks
+# in a single module, `try / except / finally`, `while` with `break` & `continue`,
+# hex/binary literals, multi-line nested call expressions, and exotic comments near operators.
+
+import varint;
+import zlib;
+
+{- Haskell nested comment {- inner -} right before C-style struct -}
+struct Accumulator {
+    int current;
+    int limit;
+}
+
+class SafeGate:
+    def __init__(self, ceiling: int):
+        self.ceiling = ceiling
+
+    def clamp_pair(
+        self,
+        left_val: int,
+        right_val: int
+    ) -> int:
+        combined = (
+            (left_val * 2)
+            + (right_val * 3)
+        )
+        if combined > self.ceiling:
+            return self.ceiling
+        return combined
+
+fn scan_ring(limit: i32) -> i32 {
+    int idx = 0;
+    int acc = 0;
+    while idx < limit {
+        idx++;
+        if (idx & 1) == 0 {
+            continue;
+        }
+        if idx > 9 {
+            break;
+        }
+        acc = acc + (idx * 2); (* OCaml inline comment next to parenthesized mul *)
+    }
+    return acc;
+}
+
+def main() -> int:
+    gate = SafeGate(0x40) # 64
+    ring_sum = scan_ring(15)
+    # odd idx <= 9: 1, 3, 5, 7, 9 => *2 => 2 + 6 + 10 + 14 + 18 = 50
+
+    clamped = gate.clamp_pair(
+        ring_sum // 5,
+        0b1010
+    )
+    # left_val = 10, right_val = 10 => 20 + 30 = 50 (<= 64) => 50
+
+    recovered = 0
+    finalized = 0
+    try:
+        enc = varint.encode(128)
+        z_sz = zlib.compressBound(64)
+        if z_sz > 0:
+            recovered = 7
+    except Exception as err:
+        recovered = -1
+    finally:
+        finalized = 3
+
+    # total = 50 + 50 + 7 + 3 = 110
+    total = ring_sum + clamped + recovered + finalized
+    print("Gauntlet total: " + str(total))
+    return 0

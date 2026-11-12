@@ -1,0 +1,71 @@
+// Polyglot Backbone Torture: 64-bit i64 (> i32::MAX), IEEE-754 double,
+// Cross-Frame setjmp/longjmp Unwinding, and Go (int64, error) Multi-Returns.
+
+fn scale_epoch(base: i64, delta: i64) -> i64 {
+    return base + delta + 0x1_0000_0000
+}
+
+fn kinetic_energy(mass: f64, vel: i64) -> f64 {
+    return 0.5 * mass * vel * vel + 1.25e1
+}
+
+def deep_leaf(x):
+    if x < 0:
+        raise ValueError("neg_frame")
+    return x * 10
+
+def middle_frame(x):
+    return deep_leaf(x) + 999999
+
+func safe_div64(a int64, b int64) (int64, error) {
+    if b == 0 {
+        return 0, errors.New("div_by_zero")
+    }
+    return a / b, nil
+}
+
+def main():
+    score = 0
+
+    # 1. 64-bit i64 arithmetic & return across 32-bit overflow boundary
+    big := scale_epoch(5_000_000_000, 2_500_000_000)
+    print("i64_big:", big)
+    if big == 11_794_967_296:
+        score = score + 100
+
+    # 2. IEEE-754 double math, int->float promotion, scientific notation, fcmp & str(float)
+    ke = kinetic_energy(2.5, 4)
+    print("ke_str: " + str(ke))
+    if ke > 32.4 and ke < 32.6:
+        score = score + int(ke)
+
+    # 3. Cross-function stack unwinding (deep_leaf -> middle_frame -> main) + typed catch + finally
+    unwind_tag = "none"
+    fin_hits = 0
+    try:
+        unreached = middle_frame(-5)
+        score = score - 500
+    except KeyError as kerr:
+        unwind_tag = kerr
+        score = score - 250
+    except ValueError as verr:
+        unwind_tag = verr
+        if verr == "neg_frame":
+            score = score + 50
+    finally:
+        fin_hits = fin_hits + 7
+
+    print("caught:", unwind_tag)
+
+    # 4. Go (int64, error) multi-return tuple with nil & error string checks
+    q_ok, err_ok := safe_div64(9_000_000_000, 3)
+    if err_ok == nil and q_ok == 3_000_000_000:
+        score = score + 200
+
+    q_bad, err_bad := safe_div64(42, 0)
+    if err_bad != nil and err_bad == "div_by_zero" and q_bad == 0:
+        score = score + 11
+
+    total = score + fin_hits
+    print("Backbone score:", total)
+    return 0

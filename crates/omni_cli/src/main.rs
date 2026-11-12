@@ -165,10 +165,13 @@ fn synth_dataset(count: usize, output: &Path) -> anyhow::Result<()> {
     let generator = SyntheticDatasetGenerator::new()?;
     let records = generator.generate_verified_dataset(count);
     let written = SyntheticDatasetGenerator::write_jsonl(&records, output)?;
+    let imatrix_path = output.with_file_name("imatrix_calib.txt");
+    let calib_written = SyntheticDatasetGenerator::write_imatrix_calibration(&records, &imatrix_path, 300)?;
 
     println!("\n[SYNTHESIS COMPLETE]");
     println!("  -> Successfully synthesized and verified {} samples with Clang", written);
     println!("  -> Dataset saved to: {}", output.display());
+    println!("  -> Importance-matrix calibration ({} traces) saved to: {}", calib_written, imatrix_path.display());
     Ok(())
 }
 
@@ -632,12 +635,19 @@ fn compile_source(
                     }
                 }
 
+                let is_cpython_ext = |p: &std::path::Path| -> bool {
+                    let s = p.to_string_lossy();
+                    s.contains(".cpython-") || s.contains(".abi3.") || s.contains("lib-dynload")
+                };
                 for f in &walk.visited_files {
                     if !all_dependency_files.contains(f) {
                         all_dependency_files.push(f.clone());
                     }
                     let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a") && !foreign_c_files.contains(f) {
+                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a")
+                        && !is_cpython_ext(f)
+                        && !foreign_c_files.contains(f)
+                    {
                         foreign_c_files.push(f.clone());
                     }
                 }
@@ -646,7 +656,10 @@ fn compile_source(
                         all_dependency_files.push(orig.clone());
                     }
                     let ext = orig.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a") && !foreign_c_files.contains(orig) {
+                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a")
+                        && !is_cpython_ext(orig)
+                        && !foreign_c_files.contains(orig)
+                    {
                         foreign_c_files.push(orig.clone());
                     }
                 }
@@ -694,7 +707,21 @@ fn compile_source(
                         }
                     } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
                         if let Ok(src) = fs::read_to_string(vf) {
-                            let sm = parser.parse_module(&mod_name, &src);
+                            let mut sm = parser.parse_module(&mod_name, &src);
+                            if ext == "go" {
+                                // Go's compiler promotes escaping local addresses (`return &d`) to heap/arena allocations.
+                                for func in &mut sm.functions {
+                                    for op in &mut func.memory_ops {
+                                        if let omni_mem::UnifiedMemOp::EscapeScope { symbol, .. } = op {
+                                            *op = omni_mem::UnifiedMemOp::Alloc {
+                                                target: symbol.clone(),
+                                                size_bytes: "sizeof(GoEscape)".to_string(),
+                                                is_arena: true,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                             sub_mods.push(sm);
                         }
                     }
@@ -702,6 +729,10 @@ fn compile_source(
 
                 // Transitive reachability analysis across all crawled package submodules
                 let mut reach_set: std::collections::HashSet<String> = target_symbols.iter().cloned().collect();
+                let eff_alias = alias.as_deref().unwrap_or(&mod_name);
+                for ts in &target_symbols {
+                    reach_set.insert(format!("{}_{}", eff_alias, ts));
+                }
                 for word in source_content.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     if !word.is_empty() { reach_set.insert(word.to_string()); }
                 }

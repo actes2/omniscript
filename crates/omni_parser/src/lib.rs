@@ -371,6 +371,19 @@ pub fn harvest_called_symbols(stmts: &[Statement], set: &mut std::collections::H
                     if !word.is_empty() { set.insert(word.to_string()); }
                 }
             }
+            Statement::GoSpawn { call_expr, .. } => {
+                for word in call_expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
+            Statement::ChanSend { channel, expr } => {
+                for word in channel.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+                for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if !word.is_empty() { set.insert(word.to_string()); }
+                }
+            }
             _ => {}
         }
     }
@@ -484,12 +497,12 @@ impl OmniParser {
                 || first.ends_with('&');
 
             if last_is_type && !first_is_type {
-                // Go style: `base int`, `items []string`, `node *Node`
-                let raw_name = parts[..parts.len() - 1].join(" ");
-                let name: String = raw_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+                // Go style: `base int`, `ch chan int`, `items []string`, `node *Node`
+                let name: String = first.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+                let go_type = parts[1..].join(" ");
                 return ParamDef {
                     name: if name.is_empty() { "arg".to_string() } else { name },
-                    type_hint: Some(last.to_string()),
+                    type_hint: Some(go_type),
                     default_val,
                 };
             }
@@ -512,11 +525,96 @@ impl OmniParser {
         }
     }
 
+    pub fn extract_fn_return_type(header_line: &str, fn_name: &str) -> Option<String> {
+        let clean = Self::strip_trailing_comment(header_line).trim();
+        let name_idx = clean.find(fn_name)?;
+        let prefix = clean[..name_idx].trim();
+
+        // Check after balanced `(params)` first (Python/Rust `-> T`, Go `(T, error)` / `int64`, TS `: number`)
+        let after_name = &clean[name_idx + fn_name.len()..];
+        if let Some(open_p) = after_name.find('(') {
+            let mut depth = 0i32;
+            let mut in_quote: Option<char> = None;
+            let mut close_idx = None;
+            for (i, ch) in after_name[open_p..].char_indices() {
+                if let Some(q) = in_quote {
+                    if ch == q {
+                        in_quote = None;
+                    }
+                    continue;
+                }
+                if ch == '"' || ch == '\'' {
+                    in_quote = Some(ch);
+                } else if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(open_p + i);
+                        break;
+                    }
+                }
+            }
+            if let Some(ci) = close_idx {
+                let mut suffix = after_name[ci + 1..].trim();
+                while suffix.ends_with('{') || suffix.ends_with(':') || suffix.ends_with(';') {
+                    suffix = suffix[..suffix.len() - 1].trim();
+                }
+                if let Some(arrow_rest) = suffix.strip_prefix("->") {
+                    let rt = arrow_rest.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+                    if !rt.is_empty() {
+                        return Some(rt.to_string());
+                    }
+                } else if !suffix.is_empty()
+                    && !suffix.starts_with("throws ")
+                    && !suffix.starts_with("where ")
+                {
+                    return Some(suffix.to_string());
+                }
+            }
+        }
+
+        // Check C / Java / C# leading return type before `fn_name`
+        let mut p_tokens: Vec<&str> = prefix
+            .split_whitespace()
+            .filter(|t| {
+                !matches!(
+                    *t,
+                    "public"
+                        | "private"
+                        | "protected"
+                        | "internal"
+                        | "pub"
+                        | "abstract"
+                        | "virtual"
+                        | "override"
+                        | "inline"
+                        | "sealed"
+                        | "static"
+                        | "async"
+                        | "final"
+                        | "local"
+                        | "export"
+                )
+            })
+            .collect();
+        if let Some(&first) = p_tokens.first() {
+            if !matches!(first, "def" | "fn" | "func" | "function") {
+                let joined = p_tokens.drain(..).collect::<Vec<_>>().join(" ");
+                if !joined.is_empty() {
+                    return Some(joined);
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn new() -> Self {
         Self {
-            // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++
+            // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++ (including Go `(T, error)` multi-returns)
             fn_re: Regex::new(
-                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|long|float|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*(?:<[^>]*>)?\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|[a-zA-Z_0-9*&\[\]:,"' .]+)|[a-zA-Z_0-9*&\[\]:]+\s*)?(?::|\{|\;)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|i32|i64|u32|u64|long|float|float32|float64|f32|f64|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*(?:<[^>]*>)?\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|\([^)]*\)|[a-zA-Z_0-9*&\[\]:,"' .<>]+)|\([^)]*\)\s*|[a-zA-Z_0-9*&\[\]:.<>]+\s*)?(?::|\{|\;)?$"#,
             )
             .unwrap(),
             // Matches if (x > 10) {, if x > 10 {, if x > 10:
@@ -1817,17 +1915,31 @@ impl OmniParser {
                         }
 
                         let cur_indent = Self::indent_level(next_line);
-                        if cur_indent <= parent_indent && !next_trimmed.contains(':') {
+                        if cur_indent <= parent_indent {
                             break;
                         }
 
-                        let f_trim = next_trimmed.trim_end_matches(',').trim().trim_start_matches("pub ").trim();
+                        let f_trim = next_trimmed
+                            .trim_end_matches(',')
+                            .trim_end_matches(';')
+                            .trim()
+                            .trim_start_matches("pub ")
+                            .trim();
                         if let Some((f_name, f_type)) = f_trim.split_once(':') {
                             class_fields.push(FieldDef {
                                 name: f_name.trim().to_string(),
                                 type_hint: Some(f_type.trim().to_string()),
                                 default_val: None,
                             });
+                        } else {
+                            let tokens: Vec<&str> = f_trim.split_whitespace().collect();
+                            if tokens.len() >= 2 {
+                                class_fields.push(FieldDef {
+                                    name: tokens[tokens.len() - 1].to_string(),
+                                    type_hint: Some(tokens[0].to_string()),
+                                    default_val: None,
+                                });
+                            }
                         }
 
                         idx += 1;
@@ -1845,10 +1957,23 @@ impl OmniParser {
                 continue;
             }
 
-            // Inherent impl blocks: `impl Point { ... }`
-            if trimmed.starts_with("impl ") {
-                let impl_line = trimmed.trim_start_matches("impl ").trim_end_matches('{').trim();
-                let struct_name = impl_line.split_whitespace().next().unwrap_or("").to_string();
+            // Inherent & trait impl blocks: `impl Point { ... }` or `impl Default for Adler32 { ... }`
+            if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+                let impl_line = trimmed
+                    .trim_start_matches("impl")
+                    .trim_end_matches('{')
+                    .trim_end_matches(':')
+                    .trim();
+                let target_seg = if let Some((_, rhs)) = impl_line.rsplit_once(" for ") {
+                    rhs.trim()
+                } else {
+                    impl_line
+                };
+                let struct_name = target_seg
+                    .split(|c: char| c.is_whitespace() || c == '<')
+                    .find(|tok| !tok.is_empty())
+                    .unwrap_or("")
+                    .to_string();
 
                 let parent_indent = Self::indent_level(line);
                 idx += 1;
@@ -1870,12 +1995,13 @@ impl OmniParser {
                     }
 
                     let cur_indent = Self::indent_level(next_line);
-                    if cur_indent <= parent_indent && !next_trimmed.starts_with("fn ") && !next_trimmed.starts_with("pub fn ") {
+                    if cur_indent <= parent_indent {
                         break;
                     }
 
                     if let Some(caps) = self.fn_re.captures(next_trimmed) {
                         let method_name = caps[1].to_string();
+                        let method_ret_type = Self::extract_fn_return_type(next_trimmed, &method_name);
                         let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                         let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
                             .iter()
@@ -1916,7 +2042,7 @@ impl OmniParser {
                             is_method: true,
                             annotations: Vec::new(),
                             params,
-                            return_type: None,
+                            return_type: method_ret_type,
                             body,
                             memory_ops,
                         });
@@ -1993,7 +2119,7 @@ impl OmniParser {
                             break;
                         }
                         let cur_indent = Self::indent_level(next_line);
-                        if cur_indent <= parent_indent && !next_trimmed.contains(',') {
+                        if cur_indent <= parent_indent {
                             break;
                         }
                         for var_part in next_trimmed.split(',') {
@@ -2301,6 +2427,7 @@ impl OmniParser {
 
                         if let Some(caps) = self.fn_re.captures(next_trimmed) {
                             let method_name = caps[1].to_string();
+                            let method_ret_type = Self::extract_fn_return_type(next_trimmed, &method_name);
                             let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                             let mut params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
                                 .iter()
@@ -2364,7 +2491,7 @@ impl OmniParser {
                                 is_method: !is_static,
                                 annotations: ann,
                                 params,
-                                return_type: None,
+                                return_type: method_ret_type,
                                 body,
                                 memory_ops,
                             });
@@ -2441,9 +2568,45 @@ impl OmniParser {
                 }
             }
 
+            // Top-level JS/TS/C# single-expression arrow functions: `const bump = (x: number): number => x * 2 + 5`
+            if trimmed.contains("=>") && !trimmed.starts_with("match ") && !trimmed.starts_with("if ") {
+                let arrow_re = Regex::new(
+                    r#"^(?:(?:export\s+)?(?:const|let|var|auto)\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:\(([^)]*)\)|([a-zA-Z_][a-zA-Z0-9_]*))\s*(?::\s*[^=]+?)?\s*=>\s*(.+?)\s*;?$"#,
+                )
+                .unwrap();
+                if let Some(caps) = arrow_re.captures(trimmed) {
+                    let fn_name = caps[1].to_string();
+                    let raw_params = caps
+                        .get(2)
+                        .or_else(|| caps.get(3))
+                        .map(|m| m.as_str())
+                        .unwrap_or("");
+                    let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                        .iter()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|p| Self::parse_param(p))
+                        .collect();
+                    let expr_rhs = caps[4].trim().to_string();
+                    functions.push(FunctionDef {
+                        name: fn_name,
+                        is_method: false,
+                        annotations: Vec::new(),
+                        params,
+                        return_type: None,
+                        body: vec![Statement::Return { expr: Some(expr_rhs) }],
+                        memory_ops: Vec::new(),
+                    });
+                    current_decorators.clear();
+                    idx += 1;
+                    continue;
+                }
+            }
+
             // Top-level functions: `def foo():`, `fn foo() -> i32:`, `int foo() {`
             if let Some(caps) = self.fn_re.captures(trimmed) {
                 let fn_name = caps[1].to_string();
+                let fn_ret_type = Self::extract_fn_return_type(trimmed, &fn_name);
                 let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                 let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
                     .iter()
@@ -2502,7 +2665,7 @@ impl OmniParser {
                     is_method: false,
                     annotations,
                     params,
-                    return_type: None,
+                    return_type: fn_ret_type,
                     body,
                     memory_ops,
                 });
@@ -2651,8 +2814,11 @@ impl OmniParser {
                 continue;
             }
 
-            // Nested function definition inside a block: consume its indented body
-            if self.fn_re.is_match(trimmed_text) {
+            // Nested function or local class/struct definition inside a block: consume its indented body
+            if self.fn_re.is_match(trimmed_text)
+                || Self::parse_class_header(trimmed_text).is_some()
+                || trimmed_text.starts_with("struct ")
+            {
                 let (_nested_body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 i = next_i;
                 continue;
@@ -2748,9 +2914,18 @@ impl OmniParser {
                     if clause_indent != indent {
                         break;
                     }
-                    let clause_trimmed = Self::strip_trailing_comment(clause_raw).trim().to_string();
+                    let clause_trimmed = Self::strip_trailing_comment(clause_raw)
+                        .trim()
+                        .trim_start_matches('}')
+                        .trim()
+                        .to_string();
                     if clause_trimmed.starts_with("except") || clause_trimmed.starts_with("catch") {
-                        let (exc_part, inline_after) = clause_trimmed.split_once(':').unwrap_or((&clause_trimmed, ""));
+                        let is_catch_kw = clause_trimmed.starts_with("catch");
+                        let (exc_part, inline_after) = if clause_trimmed.ends_with('{') || !clause_trimmed.contains(':') {
+                            (clause_trimmed.as_str(), "")
+                        } else {
+                            clause_trimmed.split_once(':').unwrap_or((&clause_trimmed, ""))
+                        };
                         let header = exc_part
                             .trim_start_matches("except")
                             .trim_start_matches("catch")
@@ -2760,9 +2935,34 @@ impl OmniParser {
                         let (exc_type, var_name) = if header.is_empty() {
                             (None, None)
                         } else if let Some((t, v)) = header.split_once(" as ") {
-                            (Some(t.trim().to_string()), Some(v.trim().to_string()))
+                            let clean_t = t.trim().trim_matches(|c| c == '(' || c == ')').split(',').next().unwrap_or("").trim().to_string();
+                            (
+                                if clean_t.is_empty() { None } else { Some(clean_t) },
+                                Some(v.trim().to_string()),
+                            )
                         } else {
-                            (Some(header.trim().trim_matches(|c| c == '(' || c == ')').to_string()), None)
+                            let inner = header.trim().trim_matches(|c| c == '(' || c == ')').trim();
+                            if let Some((v, t)) = inner.split_once(':') {
+                                // TypeScript / Rust / Kotlin `catch (e: ValueError)`
+                                (Some(t.trim().to_string()), Some(v.trim().to_string()))
+                            } else {
+                                let toks: Vec<&str> = inner
+                                    .split_whitespace()
+                                    .filter(|w| !matches!(*w, "const" | "final" | "&"))
+                                    .collect();
+                                if toks.len() >= 2 {
+                                    // Java / C++ / C# `catch (ValueError e)` or `catch (const std::exception& e)`
+                                    let ty = toks[..toks.len() - 1].join(" ").trim_end_matches('&').trim().to_string();
+                                    let vn = toks[toks.len() - 1].trim_start_matches('&').trim().to_string();
+                                    (Some(ty), Some(vn))
+                                } else if is_catch_kw && header.starts_with('(') && inner.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) {
+                                    // JS `catch (err) {`
+                                    (None, Some(inner.to_string()))
+                                } else {
+                                    let first_ty = inner.split(',').next().unwrap_or(inner).trim();
+                                    (Some(first_ty.to_string()), None)
+                                }
+                            }
                         };
 
                         // Check if single-line except like `except: exit()` or `except: pass`
@@ -2895,6 +3095,58 @@ impl OmniParser {
                 stmts.push(Statement::ForLoop { var, count, body });
                 i = next_i;
                 continue;
+            }
+
+            // 3b. Go / general C `for` forms (`for {`, `for cond {`, `for init; cond; step {`)
+            if text == "for" || text.starts_with("for ") || text.starts_with("for(") {
+                let raw_hdr = text
+                    .trim_start_matches("for")
+                    .trim()
+                    .trim_end_matches(':')
+                    .trim_end_matches("do")
+                    .trim();
+                let hdr = if raw_hdr.starts_with('(') && raw_hdr.ends_with(')') {
+                    raw_hdr[1..raw_hdr.len() - 1].trim()
+                } else {
+                    raw_hdr
+                };
+                if hdr.is_empty() {
+                    let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                    stmts.push(Statement::WhileLoop {
+                        condition: "true".to_string(),
+                        body,
+                    });
+                    i = next_i;
+                    continue;
+                } else if hdr.contains(';') {
+                    let clauses: Vec<&str> = hdr.splitn(3, ';').collect();
+                    let init_s = clauses.first().copied().unwrap_or("").trim();
+                    let cond_s = clauses.get(1).copied().unwrap_or("").trim();
+                    let step_s = clauses.get(2).copied().unwrap_or("").trim();
+                    if !init_s.is_empty() {
+                        let init_stmts = self.parse_block(&[(indent, init_s.to_string())], fn_name, mem_norm);
+                        stmts.extend(init_stmts);
+                    }
+                    let (mut body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                    if !step_s.is_empty() {
+                        let step_stmts = self.parse_block(&[(indent + 4, step_s.to_string())], fn_name, mem_norm);
+                        body.extend(step_stmts);
+                    }
+                    stmts.push(Statement::WhileLoop {
+                        condition: if cond_s.is_empty() { "true".to_string() } else { cond_s.to_string() },
+                        body,
+                    });
+                    i = next_i;
+                    continue;
+                } else if !hdr.contains(" in ") && !hdr.contains(" of ") && !hdr.contains(":=") {
+                    let (body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                    stmts.push(Statement::WhileLoop {
+                        condition: hdr.to_string(),
+                        body,
+                    });
+                    i = next_i;
+                    continue;
+                }
             }
 
             // 4. Print
@@ -3113,8 +3365,15 @@ impl OmniParser {
             if text.contains('=') && !text.contains("==") && !text.contains("!=") && !text.contains("<=") && !text.contains(">=") && !text.starts_with("if ") {
                 let assign_op = if text.contains(":=") { ":=" } else { "=" };
                 if let Some((lhs, rhs)) = text.split_once(assign_op) {
-                    let mut lhs_clean = lhs.trim().trim_start_matches("let ").trim_start_matches("var ").trim();
-                    if lhs_clean.starts_with('(') && lhs_clean.ends_with(')') {
+                    let mut lhs_clean = lhs
+                        .trim()
+                        .trim_start_matches("let ")
+                        .trim_start_matches("var ")
+                        .trim_start_matches("const ")
+                        .trim();
+                    if (lhs_clean.starts_with('(') && lhs_clean.ends_with(')'))
+                        || (lhs_clean.starts_with('[') && lhs_clean.ends_with(']'))
+                    {
                         lhs_clean = lhs_clean[1..lhs_clean.len() - 1].trim();
                     }
                     if lhs_clean.contains(',') && !lhs_clean.contains('(') && !lhs_clean.contains('[') {

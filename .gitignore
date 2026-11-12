@@ -17,6 +17,7 @@ oenv/
 a.out
 result
 models/*.gguf
+models/*.bak
 models/*.tmp
 __pycache__/
 *.pyc

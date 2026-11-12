@@ -40,6 +40,121 @@ fn test_compile_and_execute_comment_torture() {
     );
 }
 
+fn ensure_hardening_oenv(repo_root: &std::path::Path, omnic_bin: &str) {
+    let oenv_dir = repo_root.join("examples/hardening/oenv");
+    if !oenv_dir.join("packages/python/varint-1.0.2").exists()
+        || !oenv_dir.join("packages/node/crc-32-1.2.2").exists()
+        || !oenv_dir.join("packages/rust/adler-1.0.2").exists()
+        || !oenv_dir.join("git/go/github.com/cespare/xxhash@v2.3.0").exists()
+    {
+        let reqs = repo_root.join("examples/hardening/omni.requirements");
+        let status = Command::new(omnic_bin)
+            .arg("install")
+            .arg("--oenv")
+            .arg(&oenv_dir)
+            .arg(&reqs)
+            .current_dir(repo_root)
+            .status()
+            .expect("Failed to execute omnic install for hardening oenv");
+        assert!(status.success(), "omnic install failed for hardening oenv");
+    }
+}
+
+#[test]
+fn test_compile_and_execute_polyglot_hardening_suite() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let omnic_bin = env!("CARGO_BIN_EXE_omnic");
+
+    ensure_hardening_oenv(repo_root, omnic_bin);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "examples/hardening/frankensyntax_codec.omni",
+            &[
+                "FrankenSyntax core: 1265",
+                "polyglot deps resolved: varint + crc32 + zlib",
+                "crc32 non-zero ok",
+            ],
+        ),
+        (
+            "examples/hardening/babel_mesh_pipeline.omni",
+            &[
+                "Babel mesh total: 169",
+                "go+rust packages linked",
+            ],
+        ),
+        (
+            "examples/hardening/gauntlet_oop_exceptions.omni",
+            &["Gauntlet total: 110"],
+        ),
+        (
+            "examples/hardening/backbone_64bit_float_unwind.omni",
+            &[
+                "i64_big: 11794967296",
+                "ke_str: 32.5",
+                "caught: neg_frame",
+                "Backbone score: 400",
+            ],
+        ),
+    ];
+
+    for (rel_path, expected_lines) in cases {
+        let target_file = repo_root.join(rel_path);
+        let bin_out = std::env::temp_dir().join(format!(
+            "omni_hardening_{}",
+            target_file.file_stem().unwrap().to_string_lossy()
+        ));
+        let _ = fs::remove_file(&bin_out);
+
+        let build_out = Command::new(omnic_bin)
+            .arg("build")
+            .arg(&target_file)
+            .arg("--no-cache")
+            .arg("-o")
+            .arg(&bin_out)
+            .current_dir(repo_root)
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to invoke omnic build on {}: {}", rel_path, e));
+
+        assert!(
+            build_out.status.success(),
+            "Build failed for {}!\nStdout:\n{}\nStderr:\n{}",
+            rel_path,
+            String::from_utf8_lossy(&build_out.stdout),
+            String::from_utf8_lossy(&build_out.stderr)
+        );
+
+        let run_out = Command::new(&bin_out)
+            .current_dir(repo_root)
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to execute compiled binary for {}: {}", rel_path, e));
+        let _ = fs::remove_file(&bin_out);
+
+        let stdout = String::from_utf8_lossy(&run_out.stdout);
+        let stderr = String::from_utf8_lossy(&run_out.stderr);
+        let combined = format!("{}\n{}", stdout, stderr);
+
+        assert!(
+            run_out.status.success(),
+            "Execution failed for {} (exit {:?})!\nOutput:\n{}",
+            rel_path,
+            run_out.status.code(),
+            combined
+        );
+
+        for expected in *expected_lines {
+            assert!(
+                combined.contains(expected),
+                "Missing expected '{}' in {} output:\n{}",
+                expected,
+                rel_path,
+                combined
+            );
+        }
+    }
+}
+
 #[test]
 fn test_debug_hardening_files() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));

@@ -779,7 +779,22 @@ impl DependencyDriller {
         let eco_lower = ecosystem.to_lowercase();
         if eco_lower == "polyglot" {
             let py_rep = self.crawl_python_module(base_dir, ecosystem, module, target_symbols);
-            if py_rep.resolution_source != "unresolved" {
+            let is_cpython_dynload = py_rep
+                .resolved_origin
+                .as_ref()
+                .map(|p| {
+                    let s = p.to_string_lossy();
+                    s.contains(".cpython-") || s.contains(".abi3.") || s.contains("lib-dynload")
+                })
+                .unwrap_or(false);
+            if py_rep.resolution_source != "unresolved" && !is_cpython_dynload {
+                return py_rep;
+            }
+            if is_cpython_dynload {
+                let c_rep = self.crawl_c_cpp_module(base_dir, ecosystem, module, target_symbols);
+                if c_rep.resolution_source != "unresolved" && c_rep.resolved_origin.is_some() {
+                    return c_rep;
+                }
                 return py_rep;
             }
             let js_rep = self.crawl_javascript_module(base_dir, ecosystem, module, target_symbols);
@@ -1085,39 +1100,58 @@ impl DependencyDriller {
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
 
+        // Helper: checks if a directory relative to a Go cache root matches `module` (with or without `@version`)
+        let matches_go_mod_dir = |root: &Path, dir: &Path| -> bool {
+            if let Ok(rel) = dir.strip_prefix(root) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                rel_s == module
+                    || rel_s.starts_with(&format!("{}@", module))
+                    || dir.file_name().and_then(|s| s.to_str()).map(|n| n == module || n.starts_with(&format!("{}@", module))).unwrap_or(false)
+            } else {
+                false
+            }
+        };
+        let pick_go_entry = |dir: &Path| -> Option<PathBuf> {
+            let entries = fs::read_dir(dir).ok()?;
+            let mut fallback = None;
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("go") {
+                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if !fname.ends_with("_test.go") {
+                        return Some(p);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(p);
+                    }
+                }
+            }
+            fallback
+        };
+
         // 0. Priority Tier: Local polyglot oenv (<oenv>/git/go, <oenv>/packages/go)
         if let Some(oenv) = self.effective_oenv(base_dir) {
             let oenv_go = oenv.join("git").join("go");
             if oenv_go.is_dir() {
-                for entry in WalkDir::new(&oenv_go).max_depth(4).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with(module) {
-                        if let Ok(entries) = fs::read_dir(entry.path()) {
-                            for e in entries.filter_map(|e| e.ok()) {
-                                if e.path().extension().and_then(|s| s.to_str()) == Some("go") {
-                                    entry_opt = Some((e.path(), format!("oenv-git-go ({})", module)));
-                                    break;
-                                }
-                            }
+                for entry in WalkDir::new(&oenv_go).max_depth(6).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_dir() && matches_go_mod_dir(&oenv_go, entry.path()) {
+                        if let Some(go_file) = pick_go_entry(entry.path()) {
+                            entry_opt = Some((go_file, format!("oenv-git-go ({})", module)));
+                            break;
                         }
                     }
-                    if entry_opt.is_some() { break; }
                 }
             }
             if entry_opt.is_none() {
                 let oenv_pkg_go = oenv.join("packages").join("go");
                 if oenv_pkg_go.is_dir() {
-                    for entry in WalkDir::new(&oenv_pkg_go).max_depth(4).into_iter().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with(module) {
-                            if let Ok(entries) = fs::read_dir(entry.path()) {
-                                for e in entries.filter_map(|e| e.ok()) {
-                                    if e.path().extension().and_then(|s| s.to_str()) == Some("go") {
-                                        entry_opt = Some((e.path(), format!("oenv-go ({})", module)));
-                                        break;
-                                    }
-                                }
+                    for entry in WalkDir::new(&oenv_pkg_go).max_depth(6).into_iter().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_dir() && matches_go_mod_dir(&oenv_pkg_go, entry.path()) {
+                            if let Some(go_file) = pick_go_entry(entry.path()) {
+                                entry_opt = Some((go_file, format!("oenv-go ({})", module)));
+                                break;
                             }
                         }
-                        if entry_opt.is_some() { break; }
                     }
                 }
             }
@@ -1162,18 +1196,13 @@ impl DependencyDriller {
             } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
                 let omni_go = PathBuf::from(home).join(".omnicache").join("git").join("go");
                 if omni_go.is_dir() {
-                    for entry in WalkDir::new(&omni_go).max_depth(4).into_iter().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with(module) {
-                            if let Ok(entries) = fs::read_dir(entry.path()) {
-                                for e in entries.filter_map(|e| e.ok()) {
-                                    if e.path().extension().and_then(|s| s.to_str()) == Some("go") {
-                                        entry_opt = Some((e.path(), format!("omnicache-git-go ({})", module)));
-                                        break;
-                                    }
-                                }
+                    for entry in WalkDir::new(&omni_go).max_depth(6).into_iter().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_dir() && matches_go_mod_dir(&omni_go, entry.path()) {
+                            if let Some(go_file) = pick_go_entry(entry.path()) {
+                                entry_opt = Some((go_file, format!("omnicache-git-go ({})", module)));
+                                break;
                             }
                         }
-                        if entry_opt.is_some() { break; }
                     }
                 }
             }
@@ -1187,6 +1216,20 @@ impl DependencyDriller {
         report.resolved_origin = Some(origin.clone());
         report.package_dir = origin.parent().map(|p| p.to_path_buf());
         report.resolution_source = res_src.clone();
+        if let Some(ref pkg_dir) = report.package_dir {
+            if let Ok(entries) = fs::read_dir(pkg_dir) {
+                for e in entries.filter_map(|e| e.ok()) {
+                    let p = e.path();
+                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if p.extension().and_then(|s| s.to_str()) == Some("go")
+                        && !fname.ends_with("_test.go")
+                        && !report.visited_files.contains(&p)
+                    {
+                        report.visited_files.push(p);
+                    }
+                }
+            }
+        }
         let is_workspace_local = res_src.starts_with("workspace-local");
         let _ = is_workspace_local;
 
@@ -1452,6 +1495,9 @@ impl DependencyDriller {
             for lib_dir in &[
                 "/usr/lib",
                 "/usr/lib64",
+                "/usr/lib/x86_64-linux-gnu",
+                "/usr/lib/aarch64-linux-gnu",
+                "/lib/x86_64-linux-gnu",
                 "/usr/local/lib",
                 "/opt/homebrew/lib",
             ] {
@@ -1499,8 +1545,25 @@ impl DependencyDriller {
             }
         }
 
+        let mut header_blobs = Vec::new();
+        for vf in &report.visited_files {
+            if matches!(vf.extension().and_then(|e| e.to_str()), Some("h" | "hpp" | "c" | "cpp")) {
+                if let Ok(txt) = fs::read_to_string(vf) {
+                    header_blobs.push(txt);
+                }
+            }
+        }
+
         for sym in target_symbols {
             if !report.call_traces.iter().any(|t| t.symbol == *sym) {
+                let sym_decl_re = Regex::new(&format!(r"\b{}\s*(?:\(|OF\s*\()", regex::escape(sym))).ok();
+                let declared_in_header = sym_decl_re
+                    .as_ref()
+                    .map(|re| header_blobs.iter().any(|b| re.is_match(b)))
+                    .unwrap_or(false);
+                if !declared_in_header {
+                    continue;
+                }
                 report.call_traces.push(CallDependencyTrace {
                     symbol: sym.clone(),
                     defined_at: Some(format!("{}:[C-prototype]", origin.file_name().and_then(|s| s.to_str()).unwrap_or("header.h"))),

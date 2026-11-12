@@ -307,9 +307,24 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_print_str_inline",
     "__omni_print_str_raw",
     "__omni_print_int",
+    "__omni_print_float",
     "__omni_input",
     "exit",
     "strcmp",
+    "_setjmp",
+    "__omni_str_concat",
+    "__omni_int_to_str",
+    "__omni_float_to_str",
+    "__omni_c_str_to_f64",
+    "__omni_c_str_to_i64",
+    "__omni_try_push",
+    "__omni_try_pop",
+    "__omni_throw",
+    "__omni_rethrow",
+    "__omni_catch_msg",
+    "__omni_catch_type",
+    "__omni_catch_code",
+    "__omni_catch_matches",
     "__omni_sleep_s",
     "__omni_sleep_ms",
     "__omni_random_int",
@@ -385,7 +400,19 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
 const FUZZY_STEM_MAP: &[(&[&str], &str)] = &[
     (&["msleep", "usleep", "sleep_ms"], "__omni_sleep_ms"),
     (&["sleep", "delay", "wait_s"], "__omni_sleep_s"),
+    (&["print_float", "print_f64", "print_double"], "__omni_print_float"),
     (&["print_int"], "__omni_print_int"),
+    (&["float_to_str", "f64_to_str", "ftoa"], "__omni_float_to_str"),
+    (&["int_to_str", "i64_to_str", "itoa"], "__omni_int_to_str"),
+    (&["str_concat", "concat"], "__omni_str_concat"),
+    (&["try_push"], "__omni_try_push"),
+    (&["try_pop"], "__omni_try_pop"),
+    (&["rethrow"], "__omni_rethrow"),
+    (&["throw", "raise"], "__omni_throw"),
+    (&["catch_matches"], "__omni_catch_matches"),
+    (&["catch_msg"], "__omni_catch_msg"),
+    (&["catch_type"], "__omni_catch_type"),
+    (&["catch_code"], "__omni_catch_code"),
     (&["slice_print", "list_print"], "__omni_slice_print"),
     (&["print", "puts", "println", "log"], "__omni_print_str"),
     (&["slice_append", "list_append", "vec_push", "array_push"], "__omni_slice_append"),
@@ -452,6 +479,7 @@ pub fn rectify_omni_call_line(line: &str) -> String {
             // 2. Fuzzy stem resolution if symbol starts with `__omni_` and isn't already canonical
             if sym_name.starts_with("__omni_")
                 && !sym_name.starts_with("__omni_fn_")
+                && !sym_name.starts_with("__omni_method_")
                 && !sym_name.starts_with("__omni_trampoline_")
                 && !CANONICAL_OMNI_SYMBOLS.contains(&sym_name.as_str())
             {
@@ -479,10 +507,14 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
     let mut in_fence = false;
 
     let valid_prefixes = [
-        "%", ";", "store ", "load ", "call ", "alloca ", "br ", "ret ", "icmp ",
+        "%", ";", "store ", "load ", "call ", "alloca ", "br ", "ret ", "unreachable",
+        "icmp ", "fcmp ",
         "add ", "sub ", "mul ", "udiv ", "sdiv ", "urem ", "srem ",
+        "fadd ", "fsub ", "fmul ", "fdiv ", "frem ",
         "and ", "or ", "xor ", "shl ", "lshr ", "ashr ",
-        "getelementptr ", "sext ", "trunc ", "zext ", "bitcast ", "select ", "phi ",
+        "getelementptr ", "sext ", "trunc ", "zext ", "bitcast ",
+        "sitofp ", "uitofp ", "fptosi ", "fptoui ", "fpext ", "fptrunc ",
+        "ptrtoint ", "inttoptr ", "select ", "phi ",
         "declare ",
     ];
 
@@ -495,7 +527,36 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
 
         // Strip non-ascii trailing artifacts or stop residue
         let ascii_line: String = trimmed.chars().take_while(|c| c.is_ascii()).collect();
-        let trimmed_ascii = ascii_line.trim();
+        let mut trimmed_ascii = ascii_line.trim();
+        let owned_unwrapped: String;
+
+        // Unwrap executable LLVM IR instructions if the model echoed the `; >>> [Synthesized: ...]` prefix
+        if let Some(inner) = trimmed_ascii
+            .strip_prefix("; >>> [Synthesized:")
+            .or_else(|| trimmed_ascii.strip_prefix(";[Synthesized:"))
+            .or_else(|| trimmed_ascii.strip_prefix("; [Synthesized:"))
+        {
+            let mut candidate = inner.trim();
+            if candidate.ends_with(']') && candidate.matches(']').count() > candidate.matches('[').count() {
+                candidate = candidate[..candidate.len() - 1].trim();
+            }
+            let is_valid_store = candidate.starts_with("store ")
+                && candidate.contains(',')
+                && candidate.contains('*');
+            let is_real_ir = (candidate.starts_with('%') && candidate.contains('='))
+                || is_valid_store
+                || (candidate.starts_with("call ") && candidate.contains('@'))
+                || (candidate.starts_with("declare ") && candidate.contains('@'))
+                || candidate.starts_with("ret i")
+                || candidate.starts_with("ret double")
+                || candidate.starts_with("ret void")
+                || candidate.starts_with("br ")
+                || candidate == "unreachable";
+            if is_real_ir {
+                owned_unwrapped = candidate.to_string();
+                trimmed_ascii = owned_unwrapped.as_str();
+            }
+        }
 
         // Skip chat / prompt echoes
         if trimmed_ascii.starts_with("<omni_ir_task")
@@ -694,24 +755,36 @@ impl<'a> VerifiedSynthesisEngine<'a> {
                 {
                     preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
                 } else if sym.llvm_name.starts_with("%param_") {
-                    if sym.type_hint.contains("i8*") {
+                    if sym.type_hint.starts_with("%struct.") && sym.type_hint.ends_with('*') {
+                        preamble.push_str(&format!("  {} = alloca {}\n", reg_name, sym.type_hint));
+                    } else if sym.type_hint.contains("i8*") {
                         preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
+                    } else if sym.type_hint.contains("double") {
+                        preamble.push_str(&format!("  {} = alloca double\n", reg_name));
                     } else if sym.type_hint.contains("i64") {
                         preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
                     } else {
                         preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
                     }
-                } else if sym.llvm_name.contains("_val") || sym.llvm_name.starts_with("%var_") {
-                    if sym.type_hint.contains("i8*") {
+                } else if sym.llvm_name.contains("_val") || sym.llvm_name.starts_with("%var_") || sym.llvm_name.starts_with("%f64_var_") {
+                    if sym.type_hint.starts_with("%struct.") && sym.type_hint.ends_with('*') {
+                        preamble.push_str(&format!("  {} = alloca {}\n", reg_name, sym.type_hint));
+                    } else if sym.type_hint.contains("i8*") {
                         preamble.push_str(&format!("  {} = alloca i8*\n", reg_name));
+                    } else if sym.type_hint.contains("double") {
+                        preamble.push_str(&format!("  {} = alloca double\n", reg_name));
                     } else if sym.type_hint.contains("i64") {
                         preamble.push_str(&format!("  {} = alloca i64\n", reg_name));
                     } else {
                         preamble.push_str(&format!("  {} = alloca i32\n", reg_name));
                     }
                 } else {
-                    let ty = if sym.type_hint.contains("i8*") {
+                    let ty = if sym.type_hint.starts_with("%struct.") && sym.type_hint.ends_with('*') {
+                        sym.type_hint.as_str()
+                    } else if sym.type_hint.contains("i8*") {
                         "i8*"
+                    } else if sym.type_hint.contains("double") {
+                        "double"
                     } else if sym.type_hint == "i64" {
                         "i64"
                     } else if sym.type_hint == "i1" {
@@ -851,6 +924,13 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             // Construct verification harness module with dynamic declares at module scope!
             let mut harness = String::new();
             harness.push_str(&format!("target triple = \"{}\"\n\n", omni_runtime::host_target_triple()));
+            for sd in &envelope.struct_definitions {
+                let sd_trim = sd.trim();
+                if sd_trim.starts_with("%struct.") {
+                    harness.push_str(sd_trim);
+                    harness.push('\n');
+                }
+            }
             harness.push_str(omni_runtime::runtime_llvm_declarations());
             harness.push_str("\n");
             for decl in &dyn_decls {
@@ -860,7 +940,7 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             for imp in &envelope.import_chain {
                 if let Some(fn_name) = imp.strip_prefix("__OMNI_CARVED_FN__:") {
                     if fn_name != envelope.enclosing_fn {
-                        harness.push_str(&format!("declare i32 @__omni_fn_{}(i8*, i64, i64, i64)\n", fn_name));
+                        harness.push_str(&format!("declare i64 @__omni_fn_{}(i64, i64, i64, i64, i64, i64)\n", fn_name));
                     }
                 } else if let Some(rest) = imp.strip_prefix("__OMNI_C_SYM__:") {
                     if let Some((_, c_proto)) = rest.split_once(':') {
@@ -1061,8 +1141,20 @@ impl CandleGgufEngine {
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| EngineError::InferenceFailed(format!("Failed reading GGUF content: {}", e)))?;
 
-        let tokenizer = Tokenizer::from_gguf(&content)
+        let mut tokenizer = Tokenizer::from_gguf(&content)
             .map_err(|e| EngineError::InferenceFailed(format!("Failed extracting tokenizer from GGUF: {}", e)))?;
+
+        // Ensure ChatML special tokens encode to their single control token IDs (151644 / 151645 / 151643)
+        // matching HuggingFace `AutoTokenizer` during training so `<|im_end|>` stops generation immediately.
+        let special_candidates = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
+        let added: Vec<tokenizers::AddedToken> = special_candidates
+            .iter()
+            .filter(|tok| tokenizer.token_to_id(tok).is_some())
+            .map(|tok| tokenizers::AddedToken::from(*tok, true))
+            .collect();
+        if !added.is_empty() {
+            let _ = tokenizer.add_special_tokens(added);
+        }
 
         let eos_token_id = content
             .metadata
@@ -1082,8 +1174,8 @@ impl CandleGgufEngine {
             tokenizer,
             device,
             model_path: PathBuf::from(label),
-            system_prompt: "You are OmniCoder, an autonomous polyglot compiler lowering engine. You translate polyglot statements into valid, SSA-compliant LLVM IR basic blocks. Synthesize ONLY the LLVM IR instructions for the basic block body.".to_string(),
-            sample_len: 96,
+            system_prompt: dataset_generator::DEFAULT_IR_SYSTEM_PROMPT.to_string(),
+            sample_len: 128,
             eos_token_id,
         })
     }
@@ -1344,21 +1436,44 @@ impl InferenceEngine for CandleGgufEngine {
             }
             generated_tokens.push(next_token);
 
-            // Fast early-stopping: stop immediately if instruction or delimiter completed
+            // Early-stopping on explicit ChatML / task delimiters, blank-line block termination, or basic-block terminator
             if generated_tokens.len() >= 6 && step % 2 == 0 {
                 if let Ok(curr_str) = self.tokenizer.decode(&generated_tokens, false) {
-                    if curr_str.contains("<|im_end|>") || curr_str.contains("</omni_ir_task>") {
-                        break;
-                    }
-                    let has_llvm_instr = curr_str.contains("call ")
-                        || curr_str.contains("store ")
-                        || curr_str.contains("ret ");
-                    if has_llvm_instr
-                        && (curr_str.ends_with('\n')
-                            || curr_str.contains(")\n")
-                            || curr_str.contains("\n\n"))
+                    if curr_str.contains("<|im_end|>")
+                        || curr_str.contains("</omni_ir_task>")
+                        || curr_str.contains("<|im_start|>")
                     {
                         break;
+                    }
+                    if let Some((completed_lines, _tail)) = curr_str.rsplit_once('\n') {
+                        let clean_probe = sanitize_llvm_ir(completed_lines);
+                        let has_llvm_instr = clean_probe.contains("call ")
+                            || clean_probe.contains("store ")
+                            || clean_probe.contains(" = ")
+                            || clean_probe.contains("ret ");
+                        let has_completed_terminator = clean_probe.lines().any(|l| {
+                            let t = l.trim();
+                            t.starts_with("ret ") || t == "unreachable"
+                        });
+                        let has_satisfied_store = envelope
+                            .yield_expectation
+                            .as_deref()
+                            .and_then(|ye| ye.rsplit(" to ").next())
+                            .filter(|dst| dst.starts_with('%'))
+                            .map(|dst| {
+                                clean_probe.lines().any(|l| {
+                                    let t = l.trim();
+                                    !t.starts_with(';')
+                                        && t.starts_with("store ")
+                                        && t.contains(',')
+                                        && t.contains('*')
+                                        && t.contains(dst)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if has_llvm_instr && (curr_str.contains("\n\n") || has_completed_terminator || has_satisfied_store) {
+                            break;
+                        }
                     }
                 }
             }

@@ -55,13 +55,27 @@ void __omni_print_str(const char* s);
 void __omni_print_str_inline(const char* s);
 void __omni_print_str_raw(const char* s);
 void __omni_print_int(int64_t v);
+void __omni_print_float(double v);
 char* __omni_input(const char* prompt);
 char* __omni_str_concat(const char* a, const char* b);
 char* __omni_int_to_str(int64_t v);
+char* __omni_float_to_str(double v);
+double __omni_c_str_to_f64(const char* s);
+int64_t __omni_c_str_to_i64(const char* s);
 void __omni_sleep_s(int64_t seconds);
 void __omni_sleep_ms(int64_t milliseconds);
 int64_t __omni_random_int(void);
 int64_t __omni_random_range(int64_t min, int64_t max);
+
+// Thread-Local Stack-Unwinding Exception Frame Runtime (setjmp / longjmp)
+void* __omni_try_push(void);
+void __omni_try_pop(void);
+void __omni_throw(int64_t code, const char* exc_type, const char* msg);
+void __omni_rethrow(void);
+const char* __omni_catch_msg(void);
+const char* __omni_catch_type(void);
+int64_t __omni_catch_code(void);
+bool __omni_catch_matches(const char* expected_type);
 
 // Interpretive C-Frontier Short-Circuit Intrinsics & OS Socket Syscall Primitives
 char* __omni_c_http_get(const char* url, int32_t* status_out);

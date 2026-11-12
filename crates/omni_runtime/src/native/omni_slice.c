@@ -37,15 +37,27 @@ void __omni_slice_append(OmniSlice* slice, int64_t val) {
     slice->data[slice->len++] = val;
 }
 
-int64_t __omni_slice_get(OmniSlice* slice, size_t index) {
-    if (!slice || (uintptr_t)slice < 4096 || index >= slice->len) {
+int64_t __omni_slice_get(OmniSlice* slice, int64_t index) {
+    if (!slice || (uintptr_t)slice < 4096) {
+        return 0;
+    }
+    if (index < 0) {
+        index += (int64_t)slice->len;
+    }
+    if (index < 0 || (size_t)index >= slice->len) {
         return 0;
     }
     return slice->data[index];
 }
 
-void __omni_slice_set(OmniSlice* slice, size_t index, int64_t val) {
-    if (!slice || (uintptr_t)slice < 4096 || index >= slice->len) {
+void __omni_slice_set(OmniSlice* slice, int64_t index, int64_t val) {
+    if (!slice || (uintptr_t)slice < 4096) {
+        return;
+    }
+    if (index < 0) {
+        index += (int64_t)slice->len;
+    }
+    if (index < 0 || (size_t)index >= slice->len) {
         return;
     }
     slice->data[index] = val;
