@@ -1,0 +1,60 @@
+import 'csharp' System.Security.Cryptography
+
+class Amplifier:
+    def __init__(self):
+        self.gain = 2.5
+
+    def scale(self, x):
+        return x * self.gain
+
+fn bump(v: i64) -> i64 {
+    return v + 1
+}
+
+def main():
+    # 1. Pratt precedence, right-associativity, unary binding, and multi-statement / multi-line canonicalization
+    bit_prec = 1 | 2 & 0
+    pow_mul = 2 * 3 ** 2
+    pow_assoc = 2 ** 3 ** 2
+    neg_pow = -3 ** 2
+    paren_pow = (-3) ** 2
+    bit_not = ~5
+    n = 4; dyn_pow = 3 ** n
+    dual_calls = bump(4) + bump(9)
+    multiline_sum = (10 + 20) +
+        (30 + 40)
+
+    bool_guard = 0
+    if False and (False or True):
+        bool_guard = bool_guard + 999
+    if (False and False) or True:
+        bool_guard = bool_guard + 7
+
+    # 2. Collection element-type preservation (`double`, 2D nested slices) & unannotated `self.field`
+    floats = [1.5, 2.5, 3.0]
+    f_sum = 0.0
+    for x in floats:
+        f_sum = f_sum + x
+
+    scores = {"pi": 3.25, "e": 2.75}
+    m_sum = scores["pi"] + scores["e"]
+
+    grid = [[10, 20], [30, 40]]
+    grid[1][0] = 35
+    grid_pick = grid[1][0] + grid[0][1]
+
+    amp = Amplifier()
+    scaled = amp.scale(4)
+
+    # 3. Mid-expression LLM Escalation Gate (`10 + RandomNumberGenerator.GetInt32(5, 6)` -> 15)
+    llm_mid = 10 + RandomNumberGenerator.GetInt32(5, 6)
+
+    pratt_total = bit_prec + pow_mul + pow_assoc + neg_pow + paren_pow + bit_not + dyn_pow + dual_calls + multiline_sum + bool_guard + grid_pick + llm_mid
+
+    print("pow_assoc:", pow_assoc)
+    print("f_sum:", str(f_sum))
+    print("m_sum:", str(m_sum))
+    print("scaled:", str(scaled))
+    print("llm_mid:", llm_mid)
+    print("Pratt+Types+LLM score:", pratt_total)
+    return 0

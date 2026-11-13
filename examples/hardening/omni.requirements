@@ -4,3 +4,4 @@
 'node'   crc-32 == 1.2.2
 'rust'   adler == 1.0.2
 'go'     github.com/cespare/xxhash == v2.3.0
+'java'   org.projectlombok:lombok == 1.18.36

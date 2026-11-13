@@ -14,5 +14,9 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 flate2 = "1.1.11"
+lzma-rs = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ruzstd = "0.8"
 tar = "0.4.46"
+webpki-roots = "0.26"
 zip = { version = "9.4.2", default-features = false, features = ["deflate"] }

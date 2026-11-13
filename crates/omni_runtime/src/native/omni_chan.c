@@ -3,6 +3,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+static inline void omni_mutex_init(omni_mutex_t* m) { InitializeSRWLock(m); }
+static inline void omni_mutex_lock(omni_mutex_t* m) { AcquireSRWLockExclusive(m); }
+static inline void omni_mutex_unlock(omni_mutex_t* m) { ReleaseSRWLockExclusive(m); }
+static inline void omni_mutex_destroy(omni_mutex_t* m) { (void)m; }
+static inline void omni_cond_init(omni_cond_t* c) { InitializeConditionVariable(c); }
+static inline void omni_cond_wait(omni_cond_t* c, omni_mutex_t* m) {
+    SleepConditionVariableSRW(c, m, INFINITE, 0);
+}
+static inline void omni_cond_signal(omni_cond_t* c) { WakeConditionVariable(c); }
+static inline void omni_cond_broadcast(omni_cond_t* c) { WakeAllConditionVariable(c); }
+static inline void omni_cond_destroy(omni_cond_t* c) { (void)c; }
+#else
+static inline void omni_mutex_init(omni_mutex_t* m) { pthread_mutex_init(m, NULL); }
+static inline void omni_mutex_lock(omni_mutex_t* m) { pthread_mutex_lock(m); }
+static inline void omni_mutex_unlock(omni_mutex_t* m) { pthread_mutex_unlock(m); }
+static inline void omni_mutex_destroy(omni_mutex_t* m) { pthread_mutex_destroy(m); }
+static inline void omni_cond_init(omni_cond_t* c) { pthread_cond_init(c, NULL); }
+static inline void omni_cond_wait(omni_cond_t* c, omni_mutex_t* m) { pthread_cond_wait(c, m); }
+static inline void omni_cond_signal(omni_cond_t* c) { pthread_cond_signal(c); }
+static inline void omni_cond_broadcast(omni_cond_t* c) { pthread_cond_broadcast(c); }
+static inline void omni_cond_destroy(omni_cond_t* c) { pthread_cond_destroy(c); }
+#endif
+
 OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
     if (capacity == 0) capacity = 1; // Unbuffered channels default to slot size 1
     if (elem_size == 0) elem_size = sizeof(uint64_t);
@@ -23,9 +47,9 @@ OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
     chan->count = 0;
     chan->closed = false;
 
-    pthread_mutex_init(&chan->lock, NULL);
-    pthread_cond_init(&chan->not_empty, NULL);
-    pthread_cond_init(&chan->not_full, NULL);
+    omni_mutex_init(&chan->lock);
+    omni_cond_init(&chan->not_empty);
+    omni_cond_init(&chan->not_full);
 
     return chan;
 }
@@ -33,20 +57,20 @@ OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
 bool __omni_chan_send(OmniChan* chan, const void* elem_ptr) {
     if (!chan || !elem_ptr) return false;
 
-    pthread_mutex_lock(&chan->lock);
+    omni_mutex_lock(&chan->lock);
 
     while (chan->count == chan->capacity && !chan->closed) {
         if (__omni_fiber_is_in_fiber()) {
-            pthread_mutex_unlock(&chan->lock);
+            omni_mutex_unlock(&chan->lock);
             __omni_fiber_yield();
-            pthread_mutex_lock(&chan->lock);
+            omni_mutex_lock(&chan->lock);
         } else {
-            pthread_cond_wait(&chan->not_full, &chan->lock);
+            omni_cond_wait(&chan->not_full, &chan->lock);
         }
     }
 
     if (chan->closed) {
-        pthread_mutex_unlock(&chan->lock);
+        omni_mutex_unlock(&chan->lock);
         return false;
     }
 
@@ -57,28 +81,28 @@ bool __omni_chan_send(OmniChan* chan, const void* elem_ptr) {
     chan->tail = (chan->tail + 1) % chan->capacity;
     chan->count++;
 
-    pthread_cond_signal(&chan->not_empty);
-    pthread_mutex_unlock(&chan->lock);
+    omni_cond_signal(&chan->not_empty);
+    omni_mutex_unlock(&chan->lock);
     return true;
 }
 
 bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr) {
     if (!chan || !out_elem_ptr) return false;
 
-    pthread_mutex_lock(&chan->lock);
+    omni_mutex_lock(&chan->lock);
 
     while (chan->count == 0 && !chan->closed) {
         if (__omni_fiber_is_in_fiber()) {
-            pthread_mutex_unlock(&chan->lock);
+            omni_mutex_unlock(&chan->lock);
             __omni_fiber_yield();
-            pthread_mutex_lock(&chan->lock);
+            omni_mutex_lock(&chan->lock);
         } else {
-            pthread_cond_wait(&chan->not_empty, &chan->lock);
+            omni_cond_wait(&chan->not_empty, &chan->lock);
         }
     }
 
     if (chan->count == 0 && chan->closed) {
-        pthread_mutex_unlock(&chan->lock);
+        omni_mutex_unlock(&chan->lock);
         return false; // Closed and empty
     }
 
@@ -89,8 +113,8 @@ bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr) {
     chan->head = (chan->head + 1) % chan->capacity;
     chan->count--;
 
-    pthread_cond_signal(&chan->not_full);
-    pthread_mutex_unlock(&chan->lock);
+    omni_cond_signal(&chan->not_full);
+    omni_mutex_unlock(&chan->lock);
     return true;
 }
 
@@ -110,32 +134,32 @@ int64_t __omni_chan_recv_int(OmniChan* chan) {
 
 size_t __omni_chan_len(OmniChan* chan) {
     if (!chan) return 0;
-    pthread_mutex_lock(&chan->lock);
+    omni_mutex_lock(&chan->lock);
     size_t count = chan->count;
-    pthread_mutex_unlock(&chan->lock);
+    omni_mutex_unlock(&chan->lock);
     return count;
 }
 
 void __omni_chan_close(OmniChan* chan) {
     if (!chan) return;
-    pthread_mutex_lock(&chan->lock);
+    omni_mutex_lock(&chan->lock);
     chan->closed = true;
-    pthread_cond_broadcast(&chan->not_empty);
-    pthread_cond_broadcast(&chan->not_full);
-    pthread_mutex_unlock(&chan->lock);
+    omni_cond_broadcast(&chan->not_empty);
+    omni_cond_broadcast(&chan->not_full);
+    omni_mutex_unlock(&chan->lock);
 }
 
 void __omni_chan_destroy(OmniChan* chan) {
     if (!chan) return;
-    pthread_mutex_lock(&chan->lock);
+    omni_mutex_lock(&chan->lock);
     chan->closed = true;
-    pthread_cond_broadcast(&chan->not_empty);
-    pthread_cond_broadcast(&chan->not_full);
-    pthread_mutex_unlock(&chan->lock);
+    omni_cond_broadcast(&chan->not_empty);
+    omni_cond_broadcast(&chan->not_full);
+    omni_mutex_unlock(&chan->lock);
 
-    pthread_mutex_destroy(&chan->lock);
-    pthread_cond_destroy(&chan->not_empty);
-    pthread_cond_destroy(&chan->not_full);
+    omni_mutex_destroy(&chan->lock);
+    omni_cond_destroy(&chan->not_empty);
+    omni_cond_destroy(&chan->not_full);
     if (chan->buffer) {
         free(chan->buffer);
         chan->buffer = NULL;

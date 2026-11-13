@@ -1,7 +1,8 @@
 use omni_engine::{extract_declarations_and_body, InferenceEngine, SsaContextEnvelope, SsaVariable};
 use omni_mem::UnifiedMemOp;
-use omni_parser::{OmniModule, Statement};
+use omni_parser::{ExprAst, OmniModule, OmniParser, Statement};
 use regex::Regex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// Returns the canonical target triple of the current host machine (Linux, macOS, Windows).
@@ -116,9 +117,11 @@ const NATIVE_C_LIB_FNS: &[&str] = &[
     "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
 ];
 
-// Subset of `NATIVE_C_LIB_FNS` whose C ABI return width on LP64 / 64-bit targets is `i64` (`uLong` / `size_t` / `long`).
+// Subset of `NATIVE_C_LIB_FNS` whose C ABI return width on LP64 / 64-bit targets is `i64` (`uLong` / `size_t` / `long` / pointer).
 const NATIVE_C_LIB_I64_FNS: &[&str] = &[
     "compressBound", "strlen", "atol", "labs", "time", "ftell",
+    "calloc", "realloc", "strcpy", "strncpy", "strcat", "strchr", "strstr",
+    "memcpy", "memmove", "memset", "fopen", "getenv", "sqlite3_errmsg", "fread", "fwrite",
 ];
 
 /// Classifies whether a parsed type annotation maps to IEEE-754 `double`.
@@ -388,6 +391,10 @@ pub struct ScopeTree {
     scopes: Vec<HashMap<String, SymbolBinding>>,
     pub class_fields: HashMap<String, HashMap<String, usize>>,
     pub class_field_types: HashMap<String, HashMap<String, String>>,
+    pub class_field_order: HashMap<String, Vec<(String, Option<String>, Option<String>)>>,
+    pub class_decorators: HashMap<String, Vec<String>>,
+    pub c_module_aliases: HashSet<String>,
+    pub collection_elem_types: HashMap<String, String>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
     pub method_defining_class: HashMap<(String, String), String>,
@@ -406,6 +413,10 @@ impl ScopeTree {
             scopes: vec![HashMap::new()],
             class_fields: HashMap::new(),
             class_field_types: HashMap::new(),
+            class_field_order: HashMap::new(),
+            class_decorators: HashMap::new(),
+            c_module_aliases: HashSet::new(),
+            collection_elem_types: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
             method_defining_class: HashMap::new(),
@@ -416,6 +427,86 @@ impl ScopeTree {
             loop_cond_labels: Vec::new(),
             loop_entry_try_depths: Vec::new(),
             active_try_depth: 0,
+        }
+    }
+
+    /// Structurally resolves a declared field `(field_name, field_idx, optional_type_hint)` on `cls`
+    /// matching an unresolved method name (case/underscore-normalized stem), independent of any framework.
+    pub fn match_structural_field(&self, cls: &str, method: &str) -> Option<(String, usize, Option<String>, &'static str)> {
+        let f_map = self.class_fields.get(cls)?;
+        let f_types = self.class_field_types.get(cls);
+        let norm = |s: &str| -> String {
+            s.chars()
+                .filter(|c| *c != '_')
+                .flat_map(|c| c.to_lowercase())
+                .collect()
+        };
+        let m_lower = method.to_lowercase();
+        let (kind, stem) = if let Some(rest) = method.strip_prefix("with").or_else(|| method.strip_prefix("With")) {
+            if !rest.is_empty() {
+                ("fluent_set", rest)
+            } else {
+                ("exact", method)
+            }
+        } else if let Some(rest) = method.strip_prefix("set").or_else(|| method.strip_prefix("Set")) {
+            if !rest.is_empty() {
+                ("set", rest)
+            } else {
+                ("exact", method)
+            }
+        } else if let Some(rest) = method.strip_prefix("get").or_else(|| method.strip_prefix("Get")) {
+            if !rest.is_empty() {
+                ("get", rest)
+            } else {
+                ("exact", method)
+            }
+        } else if let Some(rest) = method.strip_prefix("is") {
+            if rest.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                ("get", rest)
+            } else {
+                ("exact", method)
+            }
+        } else if m_lower.ends_with('_') {
+            ("set", method.trim_end_matches('_'))
+        } else {
+            ("exact", method)
+        };
+
+        let target_norm = norm(stem);
+        if target_norm.is_empty() {
+            return None;
+        }
+        for (fname, &fidx) in f_map {
+            if norm(fname) == target_norm {
+                let th = f_types.and_then(|m| m.get(fname)).cloned();
+                return Some((fname.clone(), fidx, th, kind));
+            }
+        }
+        None
+    }
+
+    /// Infers the LLVM `IrType` returned by an unresolved method on a decorated/annotated `%struct.<cls>`.
+    pub fn infer_structural_method_return_type(&self, cls: &str, method: &str, arity: usize) -> Option<IrType> {
+        let has_decorators = self
+            .class_decorators
+            .get(cls)
+            .map(|d| !d.is_empty())
+            .unwrap_or(false);
+        if !has_decorators {
+            return None;
+        }
+        let (_, _, th_opt, kind) = self.match_structural_field(cls, method)?;
+        match (kind, arity) {
+            ("fluent_set", 1) => Some(IrType::StructPtr(cls.to_string())),
+            ("get" | "exact", 0) => {
+                if let Some(ref th) = th_opt {
+                    Some(classify_type_token(th, &self.class_fields))
+                } else {
+                    Some(IrType::I64)
+                }
+            }
+            ("set", 1) => Some(IrType::I64),
+            _ => None,
         }
     }
 
@@ -530,23 +621,706 @@ impl ScopeTree {
     }
 }
 
+#[derive(Clone)]
+struct ActiveFnAiContext {
+    enclosing_fn: String,
+    return_type: String,
+    struct_defs: Vec<String>,
+    temp: f32,
+    ecosystem_context: Option<String>,
+    import_chain: Vec<String>,
+    dynamic_declarations: HashSet<String>,
+    escalation_depth: usize,
+}
+
 pub struct CodeGenerator<'a> {
     engine: &'a dyn InferenceEngine,
+    target_triple: String,
     cmp_re: Regex,
     idx_re: Regex,
     len_re: Regex,
     pop_re: Regex,
+    active_ai_ctx: RefCell<Option<ActiveFnAiContext>>,
+    drilled_spines: Vec<String>,
+    verified_annotated_classes: RefCell<HashSet<String>>,
 }
 
 impl<'a> CodeGenerator<'a> {
     pub fn new(engine: &'a dyn InferenceEngine) -> Self {
         Self {
             engine,
+            target_triple: host_target_triple().to_string(),
             cmp_re: Regex::new(r#"^\s*(.*?)\s*(===|!==|==|!=|~=|<=|>=|<|>)\s*(.*?)\s*$"#).unwrap(),
             idx_re: Regex::new(r#"^([a-zA-Z_0-9]+)\[(.+?)\]$"#).unwrap(),
             len_re: Regex::new(r#"^len\s*\(\s*([a-zA-Z_0-9]+)\s*\)$"#).unwrap(),
             pop_re: Regex::new(r#"^([a-zA-Z_0-9]+)\.pop\s*\(\s*\)$"#).unwrap(),
+            active_ai_ctx: RefCell::new(None),
+            drilled_spines: Vec::new(),
+            verified_annotated_classes: RefCell::new(HashSet::new()),
         }
+    }
+
+    pub fn with_target_triple(mut self, triple: impl Into<String>) -> Self {
+        let t = triple.into();
+        if !t.trim().is_empty() {
+            self.target_triple = t;
+        }
+        self
+    }
+
+    pub fn with_drilled_spines(mut self, spines: Vec<String>) -> Self {
+        self.drilled_spines = spines;
+        self
+    }
+
+    /// Infers the canonical element-type tag (`"double"`, `"i8* (string)"`, `"omni_slice:<inner>"`,
+    /// `"omni_map:<inner>"`, `"%struct.<Cls>*"`, or `"i64"`) for an element stored into a collection.
+    fn infer_elem_tag_from_expr(expr: &str, tv_ty: &IrType, scope_tree: &ScopeTree) -> String {
+        let t = expr.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            if let Ok(ast) = OmniParser::parse_expr(t) {
+                if let ExprAst::ListLit(elems) = ast.node {
+                    if let Some(first) = elems.first() {
+                        let first_s = first.slice(t);
+                        let sub = if parse_polyglot_f64(first_s).is_some() {
+                            "double".to_string()
+                        } else if (first_s.starts_with('"') && first_s.ends_with('"'))
+                            || (first_s.starts_with('\'') && first_s.ends_with('\''))
+                            || Self::is_string_expr(first_s, scope_tree)
+                        {
+                            "i8* (string)".to_string()
+                        } else {
+                            "i64".to_string()
+                        };
+                        return format!("omni_slice:{}", sub);
+                    }
+                    return "omni_slice:i64".to_string();
+                }
+            }
+        }
+        if let Some(b) = scope_tree.resolve(t) {
+            if b.type_hint.contains("omni_slice") {
+                let inner = scope_tree
+                    .collection_elem_types
+                    .get(t)
+                    .cloned()
+                    .unwrap_or_else(|| "i64".to_string());
+                return format!("omni_slice:{}", inner);
+            }
+            if b.type_hint.contains("omni_map") {
+                let inner = scope_tree
+                    .collection_elem_types
+                    .get(t)
+                    .cloned()
+                    .unwrap_or_else(|| "i64".to_string());
+                return format!("omni_map:{}", inner);
+            }
+            if is_string_type_hint(&b.type_hint) {
+                return "i8* (string)".to_string();
+            }
+        }
+        match tv_ty {
+            IrType::F64 => "double".to_string(),
+            IrType::StructPtr(cls) => format!("%struct.{}*", cls),
+            IrType::Ptr => {
+                if Self::is_string_expr(t, scope_tree)
+                    || (t.starts_with('"') && t.ends_with('"'))
+                    || (t.starts_with('\'') && t.ends_with('\''))
+                {
+                    "i8* (string)".to_string()
+                } else {
+                    "i8*".to_string()
+                }
+            }
+            _ => "i64".to_string(),
+        }
+    }
+
+    /// Resolves the collection kind (`"omni_slice"` or `"omni_map"`) and preserved element-type tag
+    /// for an arbitrary collection target expression (`items`, `matrix[i]`, `self.items`).
+    fn resolve_collection_target_info(
+        target_expr: &str,
+        scope_tree: &ScopeTree,
+    ) -> (bool, Option<String>) {
+        let t = target_expr.trim();
+        if let Some(b) = scope_tree.resolve(t) {
+            let is_map = b.type_hint.contains("omni_map");
+            let elem = scope_tree.collection_elem_types.get(t).cloned();
+            return (is_map, elem);
+        }
+        if let Ok(ast) = OmniParser::parse_expr(t) {
+            match ast.node {
+                ExprAst::Index { target, .. } => {
+                    let (_, parent_elem) = Self::resolve_collection_target_info(target.slice(t), scope_tree);
+                    if let Some(pe) = parent_elem {
+                        if let Some(sub) = pe.strip_prefix("omni_slice:") {
+                            return (false, Some(sub.to_string()));
+                        }
+                        if let Some(sub) = pe.strip_prefix("omni_map:") {
+                            return (true, Some(sub.to_string()));
+                        }
+                        if pe == "omni_slice" {
+                            return (false, Some("i64".to_string()));
+                        }
+                        if pe == "omni_map" {
+                            return (true, Some("i64".to_string()));
+                        }
+                    }
+                }
+                ExprAst::Member { target, field } => {
+                    let rec = target.slice(t);
+                    if let Some(b) = scope_tree.resolve(rec) {
+                        if b.type_hint.starts_with("%struct.") {
+                            let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            if let Some(ft) = scope_tree.class_field_types.get(cls).and_then(|m| m.get(&field)) {
+                                if let Some(sub) = ft.strip_prefix("omni_slice:") {
+                                    return (false, Some(sub.to_string()));
+                                }
+                                if let Some(sub) = ft.strip_prefix("omni_map:") {
+                                    return (true, Some(sub.to_string()));
+                                }
+                                if ft.contains("omni_map") {
+                                    return (true, None);
+                                }
+                                if ft.contains("omni_slice") {
+                                    return (false, None);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (false, None)
+    }
+
+    /// Coerces a raw 64-bit slot loaded from `@__omni_slice_get` / `@__omni_map_get` back into
+    /// its preserved `TypedValue` (`F64` via `bitcast`, `StructPtr` / `Ptr` via `inttoptr`, or `I64`).
+    fn unpack_raw_elem_bits(
+        raw_reg: String,
+        elem_tag: Option<&str>,
+        ir: &mut String,
+        temp_counter: &mut usize,
+    ) -> TypedValue {
+        if let Some(tag) = elem_tag {
+            if tag == "double" || is_float_type_hint(tag) {
+                let f_reg = format!("%elem_f64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = bitcast i64 {} to double\n", f_reg, raw_reg));
+                return TypedValue { reg: f_reg, ty: IrType::F64 };
+            }
+            if tag.starts_with("%struct.") {
+                let cls = tag.trim_start_matches("%struct.").trim_end_matches('*');
+                let s_reg = format!("%elem_sptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", s_reg, raw_reg, cls));
+                return TypedValue {
+                    reg: s_reg,
+                    ty: IrType::StructPtr(cls.to_string()),
+                };
+            }
+            if tag.starts_with("i8*")
+                || tag.starts_with("omni_slice")
+                || tag.starts_with("omni_map")
+                || is_string_type_hint(tag)
+            {
+                let p_reg = format!("%elem_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", p_reg, raw_reg));
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p_reg));
+                return TypedValue { reg: p_reg, ty: IrType::Ptr };
+            }
+        }
+        TypedValue { reg: raw_reg, ty: IrType::I64 }
+    }
+
+    /// Universal structural aggregate initialization for heap/stack `%struct.<cls_name>*` allocations:
+    /// zero-initializes all declared field slots, applies field default expressions, dispatches to an
+    /// explicit constructor method if one exists in source, or directly populates declared GEP slots
+    /// from positional and `kw=val` arguments (handling >5 fields and keyword init across all languages).
+    fn init_struct_instance(
+        &self,
+        cls_name: &str,
+        raw_inst: &str,
+        inst_struct_ptr: &str,
+        assoc_ctor_method: &str,
+        raw_args: &[String],
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) {
+        let field_count = scope_tree
+            .class_fields
+            .get(cls_name)
+            .map(|m| m.len())
+            .unwrap_or(1);
+        for f_idx in 0..field_count {
+            let zgep = format!("%zinit_gep_{}_{}", f_idx, *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                zgep, cls_name, cls_name, inst_struct_ptr, f_idx
+            ));
+            ir.push_str(&format!("  store i64 0, i64* {}\n", zgep));
+        }
+
+        let ordered_fields = scope_tree
+            .class_field_order
+            .get(cls_name)
+            .cloned()
+            .unwrap_or_default();
+        for (fname, _, def_opt) in &ordered_fields {
+            if let Some(def_expr) = def_opt {
+                if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fname)) {
+                    let dtv = self.eval_typed(def_expr, ir, scope_tree, string_constants, temp_counter);
+                    let dbits = self.coerce_to_raw_i64_bits(dtv, ir, temp_counter);
+                    let dgep = format!("%dinit_gep_{}_{}", f_idx, *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                        dgep, cls_name, cls_name, inst_struct_ptr, f_idx
+                    ));
+                    ir.push_str(&format!("  store i64 {}, i64* {}\n", dbits, dgep));
+                }
+            }
+        }
+
+        let mut pos_vals: Vec<String> = Vec::new();
+        let mut kw_vals: Vec<(String, String)> = Vec::new();
+        for a in raw_args {
+            let trimmed_a = a.trim();
+            let mut parsed_kw = None;
+            if let Some(eq_idx) = trimmed_a.find('=') {
+                let before = trimmed_a[..eq_idx].trim();
+                let after_eq = &trimmed_a[eq_idx + 1..];
+                if !before.is_empty()
+                    && !after_eq.starts_with('=')
+                    && !before.ends_with('!')
+                    && !before.ends_with('<')
+                    && !before.ends_with('>')
+                    && before.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && scope_tree
+                        .class_fields
+                        .get(cls_name)
+                        .map(|m| m.contains_key(before))
+                        .unwrap_or(false)
+                {
+                    parsed_kw = Some((before.to_string(), after_eq.trim().to_string()));
+                }
+            }
+            if let Some((k, vexpr)) = parsed_kw {
+                let tv = self.eval_typed(&vexpr, ir, scope_tree, string_constants, temp_counter);
+                let bits = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
+                kw_vals.push((k, bits));
+            } else {
+                let clean = Self::strip_kwarg_prefix(trimmed_a);
+                let tv = self.eval_typed(clean, ir, scope_tree, string_constants, temp_counter);
+                let bits = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
+                pos_vals.push(bits);
+            }
+        }
+
+        let has_explicit_ctor = scope_tree
+            .method_defining_class
+            .contains_key(&(cls_name.to_string(), assoc_ctor_method.to_string()));
+
+        if has_explicit_ctor && (!pos_vals.is_empty() || kw_vals.is_empty()) {
+            let mut arg_regs = pos_vals.clone();
+            while arg_regs.len() < 5 {
+                arg_regs.push("0".to_string());
+            }
+            let def_cls = scope_tree.resolve_defining_class(cls_name, assoc_ctor_method);
+            let init_ret = format!("%init_ret_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                init_ret, def_cls, assoc_ctor_method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
+            ));
+        } else {
+            for (idx, bits) in pos_vals.iter().enumerate() {
+                if let Some((fname, _, _)) = ordered_fields.get(idx) {
+                    if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fname)) {
+                        let pgep = format!("%pinit_gep_{}_{}", f_idx, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                            pgep, cls_name, cls_name, inst_struct_ptr, f_idx
+                        ));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", bits, pgep));
+                    }
+                }
+            }
+        }
+
+        for (k, bits) in kw_vals {
+            if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(&k)) {
+                let kgep = format!("%kwinit_gep_{}_{}", f_idx, *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                    kgep, cls_name, cls_name, inst_struct_ptr, f_idx
+                ));
+                ir.push_str(&format!("  store i64 {}, i64* {}\n", bits, kgep));
+            }
+        }
+    }
+
+    /// Synthesizes an unresolved `@__omni_method_<cls_name>_<method_name>` on an annotated/decorated struct
+    /// via `self.engine.lower_intent` (`omni-coder.gguf` + `VerifiedSynthesisEngine` Clang verification),
+    /// using drilled bytecode/package spines from `DependencyDriller` and `%struct.<cls_name>` GEP metadata.
+    fn synthesize_unresolved_struct_method(
+        &self,
+        sym: &str,
+        cls_name: &str,
+        method_name: &str,
+        scope_tree: &ScopeTree,
+        struct_defs: &[String],
+        ecosystem_context: Option<&str>,
+        import_chain: &[String],
+        temp: f32,
+        temp_counter: &mut usize,
+    ) -> Option<String> {
+        let decorators = scope_tree.class_decorators.get(cls_name)?;
+        if decorators.is_empty() {
+            return None;
+        }
+        let (fname, f_idx, f_type_opt, kind) = scope_tree.match_structural_field(cls_name, method_name)?;
+
+        let slot_id = *temp_counter;
+        *temp_counter += 8;
+        let this_var = format!("%var_this_{}", slot_id);
+        let arg_var = format!("%var_arg_{}", slot_id);
+        let ret_var = format!("%var_ret_{}", slot_id);
+
+        let structural_obligation = match kind {
+            "get" | "exact" => {
+                let extra_ptr_hint = if f_type_opt
+                    .as_deref()
+                    .map(|t| t.starts_with("i8*") || is_string_type_hint(t))
+                    .unwrap_or(false)
+                {
+                    format!(
+                        "  %p8_{0} = inttoptr i64 %fv_{0} to i8*\n  call void @__omni_c_return_ptr(i8* %p8_{0})\n",
+                        slot_id
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "__OMNI_SHORT_CIRCUIT_IR__:  %st_{0} = load %struct.{1}*, %struct.{1}** {2}\n  %fg_{0} = getelementptr inbounds %struct.{1}, %struct.{1}* %st_{0}, i32 0, i32 {3}\n  %fv_{0} = load i64, i64* %fg_{0}\n{4}  store i64 %fv_{0}, i64* {5}",
+                    slot_id, cls_name, this_var, f_idx, extra_ptr_hint, ret_var
+                )
+            }
+            "set" => format!(
+                "__OMNI_SHORT_CIRCUIT_IR__:  %st_{0} = load %struct.{1}*, %struct.{1}** {2}\n  %av_{0} = load i64, i64* {3}\n  %fg_{0} = getelementptr inbounds %struct.{1}, %struct.{1}* %st_{0}, i32 0, i32 {4}\n  store i64 %av_{0}, i64* %fg_{0}\n  store i64 0, i64* {5}",
+                slot_id, cls_name, this_var, arg_var, f_idx, ret_var
+            ),
+            "fluent_set" => format!(
+                "__OMNI_SHORT_CIRCUIT_IR__:  %st_{0} = load %struct.{1}*, %struct.{1}** {2}\n  %av_{0} = load i64, i64* {3}\n  %fg_{0} = getelementptr inbounds %struct.{1}, %struct.{1}* %st_{0}, i32 0, i32 {4}\n  store i64 %av_{0}, i64* %fg_{0}\n  %sp8_{0} = bitcast %struct.{1}* %st_{0} to i8*\n  call void @__omni_c_return_ptr(i8* %sp8_{0})\n  %si_{0} = ptrtoint %struct.{1}* %st_{0} to i64\n  store i64 %si_{0}, i64* {5}",
+                slot_id, cls_name, this_var, arg_var, f_idx, ret_var
+            ),
+            _ => return None,
+        };
+
+        let mut env_imports = import_chain.to_vec();
+        env_imports.push(structural_obligation.clone());
+
+        let intent_desc = match kind {
+            "get" | "exact" => format!(
+                "method_ret = this.{} ; annotations: [{}], method: {}.{}()",
+                fname,
+                decorators.join(", "),
+                cls_name,
+                method_name
+            ),
+            "set" => format!(
+                "this.{} = val ; annotations: [{}], method: {}.{}(val)",
+                fname,
+                decorators.join(", "),
+                cls_name,
+                method_name
+            ),
+            _ => format!(
+                "this.{} = val ; method_ret = this ; annotations: [{}], method: {}.{}(val)",
+                fname,
+                decorators.join(", "),
+                cls_name,
+                method_name
+            ),
+        };
+
+        let envelope = SsaContextEnvelope {
+            target_abi: self.target_triple.clone(),
+            enclosing_fn: sym.to_string(),
+            return_type: "i64".to_string(),
+            next_ssa_idx: *temp_counter,
+            active_symbols: vec![
+                SsaVariable {
+                    name: "this".to_string(),
+                    llvm_name: this_var.clone(),
+                    type_hint: format!("%struct.{}*", cls_name),
+                },
+                SsaVariable {
+                    name: "val".to_string(),
+                    llvm_name: arg_var.clone(),
+                    type_hint: "i64".to_string(),
+                },
+                SsaVariable {
+                    name: "method_ret".to_string(),
+                    llvm_name: ret_var.clone(),
+                    type_hint: "i64".to_string(),
+                },
+            ],
+            struct_definitions: struct_defs.to_vec(),
+            raw_intent: intent_desc.clone(),
+            idiom_hint: Some("AnnotatedStructMethodSynthesis".to_string()),
+            anchor_id: Some(slot_id),
+            physical_source: Some(intent_desc),
+            concurrency_mode: None,
+            yield_expectation: Some(format!("store 64-bit result to {}", ret_var)),
+            action_directive: Some("SYNTHESIZE_ANNOTATED_METHOD".to_string()),
+            ecosystem_context: ecosystem_context.map(|s| s.to_string()),
+            lifetime_context: None,
+            import_chain: env_imports,
+        };
+
+        let class_cache_key = format!("{}::[{}]", cls_name, decorators.join(","));
+        let sc_body_only = structural_obligation
+            .strip_prefix("__OMNI_SHORT_CIRCUIT_IR__:")
+            .unwrap_or(&structural_obligation)
+            .to_string();
+
+        let synthesized = if self.verified_annotated_classes.borrow().contains(&class_cache_key) {
+            sc_body_only
+        } else {
+            let syn = self.engine.lower_intent(&envelope, temp).ok()?;
+            self.verified_annotated_classes.borrow_mut().insert(class_cache_key);
+            syn
+        };
+        let (_, raw_body) = extract_declarations_and_body(&synthesized);
+        let clean_body: String = raw_body
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.starts_with("ret ") && t != "ret"
+            })
+            .map(|l| format!("  {}\n", l.trim()))
+            .collect();
+        advance_ssa_counter_past_body(&clean_body, temp_counter);
+
+        let fn_ir = format!(
+            "define i64 @{sym}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  %self_cast_{slot} = bitcast i8* %self_raw to %struct.{cls}*\n  {this_var} = alloca %struct.{cls}*\n  store %struct.{cls}* %self_cast_{slot}, %struct.{cls}** {this_var}\n  {arg_var} = alloca i64\n  store i64 %len, i64* {arg_var}\n  {ret_var} = alloca i64\n  store i64 0, i64* {ret_var}\n{body}  %final_ret_{slot} = load i64, i64* {ret_var}\n  ret i64 %final_ret_{slot}\n}}\n\n",
+            sym = sym,
+            slot = slot_id,
+            cls = cls_name,
+            this_var = this_var,
+            arg_var = arg_var,
+            ret_var = ret_var,
+            body = clean_body
+        );
+        Some(fn_ir)
+    }
+
+    /// Mid-expression LLM Escalation Gate: lowers an unrecognized or foreign sub-expression
+    /// via `self.engine.lower_intent` using live `ScopeTree` SSA bindings and returns its `TypedValue`.
+    fn escalate_subexpr_to_llm(
+        &self,
+        expr: &str,
+        idiom_hint: &str,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> Option<TypedValue> {
+        let ctx_snapshot = {
+            let mut guard = self.active_ai_ctx.borrow_mut();
+            let ctx = guard.as_mut()?;
+            if ctx.escalation_depth >= 2 {
+                return None;
+            }
+            ctx.escalation_depth += 1;
+            ctx.clone()
+        };
+
+        let reset_depth = || {
+            if let Some(ctx) = self.active_ai_ctx.borrow_mut().as_mut() {
+                ctx.escalation_depth = ctx.escalation_depth.saturating_sub(1);
+            }
+        };
+
+        // Deterministically evaluate any non-trivial call arguments into temporary SSA bindings first
+        // so the 1.5B model receives clean scalar symbols rather than nested arithmetic inside foreign calls.
+        let mut extra_vars: Vec<SsaVariable> = Vec::new();
+        let mut rewritten_expr = expr.trim().to_string();
+        if let Ok(ast) = OmniParser::parse_expr(expr.trim()) {
+            if let ExprAst::Call { callee, args } = ast.node {
+                let mut new_args = Vec::new();
+                let mut any_rewritten = false;
+                for (ai, arg) in args.iter().enumerate() {
+                    let is_atomic = matches!(
+                        arg.value.node,
+                        ExprAst::IntLit(_) | ExprAst::FloatLit(_) | ExprAst::BoolLit(_) | ExprAst::StrLit(_)
+                    ) || (matches!(arg.value.node, ExprAst::Ident(ref id) if scope_tree.resolve(id).is_some()));
+                    if is_atomic {
+                        new_args.push(arg.raw.clone());
+                    } else {
+                        let arg_slice = arg.value.slice(expr.trim());
+                        let atv = self.eval_typed(arg_slice, ir, scope_tree, string_constants, temp_counter);
+                        let abits = self.coerce_to_raw_i64_bits(atv, ir, temp_counter);
+                        let arg_sym = format!("ai_arg_{}_{}", ai, *temp_counter);
+                        let arg_ptr = format!("%var_{}", arg_sym);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i64\n", arg_ptr));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", abits, arg_ptr));
+                        extra_vars.push(SsaVariable {
+                            name: arg_sym.clone(),
+                            llvm_name: arg_ptr,
+                            type_hint: "i64".to_string(),
+                        });
+                        if let Some(ref kw) = arg.name {
+                            new_args.push(format!("{}={}", kw, arg_sym));
+                        } else {
+                            new_args.push(arg_sym);
+                        }
+                        any_rewritten = true;
+                    }
+                }
+                if any_rewritten {
+                    rewritten_expr = format!("{}({})", callee.slice(expr.trim()), new_args.join(", "));
+                }
+            }
+        }
+
+        let slot_id = *temp_counter;
+        *temp_counter += 1;
+        let out_name = ["jitter", "nonce", "ticket", "sample_id"]
+            .iter()
+            .find(|cand| scope_tree.resolve(cand).is_none())
+            .map(|s| (*s).to_string())
+            .unwrap_or_else(|| format!("jitter_{}", slot_id));
+        let slot_ptr = format!("%var_{}_{}", out_name, slot_id);
+
+        let mut active_symbols: Vec<SsaVariable> = scope_tree
+            .active_bindings()
+            .into_iter()
+            .map(|b| SsaVariable {
+                name: b.name,
+                llvm_name: b.llvm_ptr,
+                type_hint: b.type_hint,
+            })
+            .collect();
+        active_symbols.extend(extra_vars);
+        active_symbols.push(SsaVariable {
+            name: out_name.clone(),
+            llvm_name: slot_ptr.clone(),
+            type_hint: "i64".to_string(),
+        });
+
+        let intent_stmt = format!("{} = {}", out_name, rewritten_expr);
+        let envelope = SsaContextEnvelope {
+            target_abi: self.target_triple.clone(),
+            enclosing_fn: ctx_snapshot.enclosing_fn.clone(),
+            return_type: ctx_snapshot.return_type.clone(),
+            next_ssa_idx: *temp_counter,
+            active_symbols,
+            struct_definitions: ctx_snapshot.struct_defs.clone(),
+            raw_intent: intent_stmt.clone(),
+            idiom_hint: Some(idiom_hint.to_string()),
+            anchor_id: Some(slot_id),
+            physical_source: Some(intent_stmt),
+            concurrency_mode: None,
+            yield_expectation: Some(format!("store 64-bit scalar result to {}", slot_ptr)),
+            action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+            ecosystem_context: ctx_snapshot.ecosystem_context.clone(),
+            lifetime_context: None,
+            import_chain: ctx_snapshot.import_chain.clone(),
+        };
+
+        let synth_res = self.engine.lower_intent(&envelope, ctx_snapshot.temp);
+        reset_depth();
+
+        let synthesized = synth_res.ok()?;
+        let (dyn_decls, raw_body) = extract_declarations_and_body(&synthesized);
+        // Strip any stray `ret` terminators so a mid-expression block never exits the enclosing function early
+        let filtered_lines: Vec<&str> = raw_body
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.starts_with("ret ") && t != "ret"
+            })
+            .collect();
+        let body = filtered_lines.join("\n");
+        let exec_lines: Vec<&str> = filtered_lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with(';'))
+            .collect();
+        if exec_lines.is_empty() {
+            return None;
+        }
+
+        advance_ssa_counter_past_body(&body, temp_counter);
+        if let Some(ctx) = self.active_ai_ctx.borrow_mut().as_mut() {
+            for d in dyn_decls {
+                ctx.dynamic_declarations.insert(d);
+            }
+        }
+
+        ir.push_str(&format!("  {} = alloca i64\n", slot_ptr));
+        ir.push_str(&format!("  store i64 0, i64* {}\n", slot_ptr));
+        ir.push_str(&body);
+        if !body.ends_with('\n') {
+            ir.push('\n');
+        }
+
+        let already_stored = exec_lines.iter().any(|l| {
+            l.starts_with("store ")
+                && (l.contains(&format!("* {}", slot_ptr)) || l.contains(&format!("*{}", slot_ptr)))
+        });
+        if !already_stored {
+            if let Some(last_assign) = exec_lines.iter().rev().find(|l| l.starts_with('%') && l.contains('=')) {
+                if let Some(eq_pos) = last_assign.find('=') {
+                    let reg = last_assign[..eq_pos].trim();
+                    let rhs = last_assign[eq_pos + 1..].trim();
+                    let head = rhs.split('(').next().unwrap_or(rhs);
+                    if rhs.starts_with("call i8*")
+                        || rhs.starts_with("load i8*")
+                        || head.contains("i8*")
+                        || rhs.starts_with("inttoptr")
+                        || rhs.starts_with("getelementptr")
+                    {
+                        let cast_reg = format!("%ptr_to_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_reg, reg));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", cast_reg, slot_ptr));
+                    } else if (rhs.starts_with("call i64") || rhs.starts_with("load i64") || head.contains("i64"))
+                        && !rhs.contains("to i32")
+                    {
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", reg, slot_ptr));
+                    } else if rhs.starts_with("call double") || rhs.starts_with("load double") || head.contains("double") {
+                        let fbits = format!("%f_to_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = fptosi double {} to i64\n", fbits, reg));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", fbits, slot_ptr));
+                    } else {
+                        let sext_reg = format!("%sext_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = sext i32 {} to i64\n", sext_reg, reg));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", sext_reg, slot_ptr));
+                    }
+                }
+            }
+        }
+
+        let loaded = format!("%ai_subexpr_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!("  {} = load i64, i64* {}\n", loaded, slot_ptr));
+        Some(TypedValue {
+            reg: loaded,
+            ty: IrType::I64,
+        })
     }
 
     fn escape_llvm_string(src: &str) -> (String, usize) {
@@ -756,146 +1530,7 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn split_binary_expr(expr: &str) -> Option<(String, String, String)> {
-        let trimmed = expr.trim();
-        if trimmed.starts_with('(') && trimmed.ends_with(')') {
-            let mut depth = 0;
-            let mut wraps_all = true;
-            let chars: Vec<char> = trimmed.chars().collect();
-            for (idx, &c) in chars.iter().enumerate() {
-                if c == '(' { depth += 1; }
-                else if c == ')' { depth -= 1; }
-                if depth == 0 && idx < chars.len() - 1 {
-                    wraps_all = false;
-                    break;
-                }
-            }
-            if wraps_all {
-                return Self::split_binary_expr(&trimmed[1..trimmed.len() - 1]);
-            }
-        }
-
-        let mut depth;
-        let mut active_quote: Option<char>;
-        let chars: Vec<char> = trimmed.chars().collect();
-
-        // Pass 0: Look for bitwise operators (|, ^, &) from right to left
-        depth = 0;
-        active_quote = None;
-        for i in (1..chars.len()).rev() {
-            let c = chars[i];
-            if c == '"' || c == '\'' {
-                if active_quote == Some(c) { active_quote = None; }
-                else if active_quote.is_none() { active_quote = Some(c); }
-            }
-            if active_quote.is_some() { continue; }
-            if c == ')' { depth += 1; }
-            else if c == '(' { depth -= 1; }
-            if depth == 0 && (c == '|' || c == '^' || c == '&') {
-                let prev = chars[i - 1];
-                if prev != '|' && prev != '&' && (i + 1 == chars.len() || chars[i + 1] != c) {
-                    let left: String = chars[..i].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
-                }
-            }
-        }
-
-        // Pass 0.5: Look for bitwise shift operators (<<, >>) from right to left
-        depth = 0;
-        active_quote = None;
-        for i in (1..chars.len()).rev() {
-            let c = chars[i];
-            if c == '"' || c == '\'' {
-                if active_quote == Some(c) { active_quote = None; }
-                else if active_quote.is_none() { active_quote = Some(c); }
-            }
-            if active_quote.is_some() { continue; }
-            if c == ')' { depth += 1; }
-            else if c == '(' { depth -= 1; }
-            if depth == 0 && (c == '<' || c == '>') {
-                if i >= 2 && c == '>' && chars[i - 1] == '>' && chars[i - 2] == '>' {
-                    let left: String = chars[..i - 2].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    return Some((left.trim().to_string(), ">>>".to_string(), right.trim().to_string()));
-                }
-                if i > 0 && chars[i - 1] == c {
-                    let left: String = chars[..i - 1].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    let op = if c == '<' { "<<" } else { ">>" };
-                    return Some((left.trim().to_string(), op.to_string(), right.trim().to_string()));
-                }
-            }
-        }
-
-        // Pass 1: Look for lowest precedence operators (+, -) from right to left
-        depth = 0;
-        active_quote = None;
-        for i in (1..chars.len()).rev() {
-            let c = chars[i];
-            if c == '"' || c == '\'' {
-                if active_quote == Some(c) { active_quote = None; }
-                else if active_quote.is_none() { active_quote = Some(c); }
-            }
-            if active_quote.is_some() { continue; }
-            if c == ')' { depth += 1; }
-            else if c == '(' { depth -= 1; }
-            if depth == 0 && (c == '+' || c == '-') {
-                // Do not split IEEE-754 scientific notation exponents (e.g. `1.5e-3`, `2e+6`)
-                if (chars[i - 1] == 'e' || chars[i - 1] == 'E')
-                    && i >= 2
-                    && (chars[i - 2].is_ascii_digit() || chars[i - 2] == '.')
-                    && !trimmed.starts_with("0x")
-                    && !trimmed.starts_with("0X")
-                {
-                    continue;
-                }
-                let prev_non_ws = chars[..i].iter().rev().find(|ch| !ch.is_whitespace()).copied();
-                if let Some(prev) = prev_non_ws {
-                    if !matches!(
-                        prev,
-                        '+' | '-' | '*' | '/' | '%' | '(' | ',' | '^' | '&' | '|' | '<' | '>' | '=' | '?' | ':'
-                    ) {
-                        let left: String = chars[..i].iter().collect();
-                        let right: String = chars[i + 1..].iter().collect();
-                        return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
-                    }
-                }
-            }
-        }
-
-        // Pass 2: Look for higher precedence operators (*, /, %) from right to left
-        depth = 0;
-        active_quote = None;
-        for i in (1..chars.len()).rev() {
-            let c = chars[i];
-            if c == '"' || c == '\'' {
-                if active_quote == Some(c) { active_quote = None; }
-                else if active_quote.is_none() { active_quote = Some(c); }
-            }
-            if active_quote.is_some() { continue; }
-            if c == ')' { depth += 1; }
-            else if c == '(' { depth -= 1; }
-            if depth == 0 && (c == '*' || c == '/' || c == '%') {
-                if c == '*' && i > 0 && chars[i - 1] == '*' {
-                    let left: String = chars[..i - 1].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    return Some((left.trim().to_string(), "**".to_string(), right.trim().to_string()));
-                } else if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    continue;
-                } else if c == '/' && i > 0 && chars[i - 1] == '/' {
-                    let left: String = chars[..i - 1].iter().collect();
-                    let right: String = chars[i + 1..].iter().collect();
-                    return Some((left.trim().to_string(), "/".to_string(), right.trim().to_string()));
-                } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                    continue;
-                }
-                let left: String = chars[..i].iter().collect();
-                let right: String = chars[i + 1..].iter().collect();
-                return Some((left.trim().to_string(), c.to_string(), right.trim().to_string()));
-            }
-        }
-
-        None
+        OmniParser::pratt_split_top_binary(expr)
     }
 
     fn scan_strings_recursive(
@@ -951,8 +1586,9 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
                 Statement::MapInit { entries, .. } => {
-                    for (k, _) in entries {
+                    for (k, v) in entries {
                         Self::intern_string(string_constants, counter, k);
+                        scan_text(v, string_constants, counter);
                     }
                 }
                 Statement::IndexSet { index_expr, val_expr, .. } => {
@@ -1066,6 +1702,31 @@ impl<'a> CodeGenerator<'a> {
                 if let Some(IrType::Ptr) = scope_tree.fn_return_types.get(callee) {
                     return true;
                 }
+                if let Some((rec, mname)) = callee.rsplit_once('.') {
+                    let rec = rec.trim();
+                    let mname = mname.trim();
+                    let inner = trimmed[lp + 1..trimmed.len() - 1].trim();
+                    let arity = if inner.is_empty() {
+                        0
+                    } else {
+                        omni_parser::OmniParser::split_respecting_quotes(inner, ',').len()
+                    };
+                    if let Some(b) = scope_tree.resolve(rec) {
+                        if b.type_hint.starts_with("%struct.") {
+                            let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                            let def_cls = scope_tree.resolve_defining_class(cls, mname);
+                            if matches!(
+                                scope_tree.method_return_types.get(&(def_cls.clone(), mname.to_string())),
+                                Some(IrType::Ptr)
+                            ) || matches!(
+                                scope_tree.infer_structural_method_return_type(&def_cls, mname, arity),
+                                Some(IrType::Ptr)
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some((left, op, right)) = Self::split_binary_expr(trimmed) {
@@ -1087,6 +1748,16 @@ impl<'a> CodeGenerator<'a> {
                             .and_then(|m| m.get(fld))
                             .map(|th| th.starts_with("i8*") || is_string_type_hint(th))
                             .unwrap_or(false);
+                    }
+                }
+            }
+        }
+        if let Ok(ast) = OmniParser::parse_expr(trimmed) {
+            if let ExprAst::Index { target, .. } = ast.node {
+                let (_, elem_tag) = Self::resolve_collection_target_info(target.slice(trimmed), scope_tree);
+                if let Some(tag) = elem_tag {
+                    if is_string_type_hint(&tag) {
+                        return true;
                     }
                 }
             }
@@ -1125,6 +1796,37 @@ impl<'a> CodeGenerator<'a> {
 
         if is_null_literal(trimmed) {
             return "null".to_string();
+        }
+
+        // Top-level ternary (`cond ? a : b` or `a if cond else b`) and `+` concatenation first
+        // so `str(a) + str(b)` splits at `+` instead of matching `str(...)` across both calls.
+        if let Ok(ast) = OmniParser::parse_expr(trimmed) {
+            match ast.node {
+                ExprAst::Ternary { cond, then_br, else_br } => {
+                    let cond_v = self.eval_cond(cond.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let tr_p = self.eval_str_ptr(then_br.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let fa_p = self.eval_str_ptr(else_br.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let tern_ptr = format!("%tern_str_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = select i1 {}, i8* {}, i8* {}\n",
+                        tern_ptr, cond_v, tr_p, fa_p
+                    ));
+                    return tern_ptr;
+                }
+                ExprAst::Binary { ref op, ref lhs, ref rhs } if op == "+" => {
+                    let left_ptr = self.eval_str_ptr(lhs.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let right_ptr = self.eval_str_ptr(rhs.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let concat_res = format!("%concat_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i8* @__omni_str_concat(i8* {}, i8* {})\n",
+                        concat_res, left_ptr, right_ptr
+                    ));
+                    return concat_res;
+                }
+                _ => {}
+            }
         }
 
         // Go `errors.New(msg)` / `fmt.Errorf(fmt, ...)` error string constructors
@@ -1663,6 +2365,506 @@ impl<'a> CodeGenerator<'a> {
             return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
         }
 
+        // Pratt AST Top-Level Structural Dispatch:
+        // Evaluates lowest-precedence root operators (`Ternary`, `Binary`, `Cast`, `Unary`, `ListLit`,
+        // `MapLit`, arbitrary-depth `Index`, and chained `Member`) BEFORE single-call/cast prefix matches
+        // so `foo(1) + bar(2)`, `int(a) + int(b)`, `2 * 3 ** 2`, `~x`, `matrix[i][j]`, and `x as f64`
+        // lower with exact precedence and zero substring hijacking.
+        if let Ok(ast) = OmniParser::parse_expr(trimmed) {
+            match ast.node {
+                ExprAst::Ternary { cond, then_br, else_br } => {
+                    let cond_v = self.eval_cond(cond.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let tr_tv = self.eval_typed(then_br.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    let fa_tv = self.eval_typed(else_br.slice(trimmed), ir, scope_tree, string_constants, temp_counter);
+                    if tr_tv.ty == IrType::F64 || fa_tv.ty == IrType::F64 {
+                        let tr_f = self.coerce_to_f64(tr_tv, ir, temp_counter);
+                        let fa_f = self.coerce_to_f64(fa_tv, ir, temp_counter);
+                        let tern_reg = format!("%tern_f64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = select i1 {}, double {}, double {}\n",
+                            tern_reg, cond_v, tr_f, fa_f
+                        ));
+                        return TypedValue { reg: tern_reg, ty: IrType::F64 };
+                    }
+                    if tr_tv.ty == IrType::Ptr && fa_tv.ty == IrType::Ptr {
+                        let tern_reg = format!("%tern_ptr_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = select i1 {}, i8* {}, i8* {}\n",
+                            tern_reg, cond_v, tr_tv.reg, fa_tv.reg
+                        ));
+                        ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", tern_reg));
+                        return TypedValue { reg: tern_reg, ty: IrType::Ptr };
+                    }
+                    let tr_i = self.coerce_to_i64(tr_tv, ir, temp_counter);
+                    let fa_i = self.coerce_to_i64(fa_tv, ir, temp_counter);
+                    let tern_reg = format!("%tern_i64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = select i1 {}, i64 {}, i64 {}\n",
+                        tern_reg, cond_v, tr_i, fa_i
+                    ));
+                    return TypedValue { reg: tern_reg, ty: IrType::I64 };
+                }
+                ExprAst::Binary { op, lhs, rhs } => {
+                    let left = lhs.slice(trimmed);
+                    let right = rhs.slice(trimmed);
+                    if op == "|>" {
+                        let ltv = self.eval_typed(left, ir, scope_tree, string_constants, temp_counter);
+                        let pid = *temp_counter;
+                        *temp_counter += 1;
+                        let pipe_sym = format!("__pipe_lhs_{}", pid);
+                        let mut sub_scope = scope_tree.clone();
+                        match ltv.ty {
+                            IrType::F64 => {
+                                let fp = format!("%f64_var_pipe_{}", pid);
+                                ir.push_str(&format!("  {} = alloca double\n", fp));
+                                ir.push_str(&format!("  store double {}, double* {}\n", ltv.reg, fp));
+                                sub_scope.insert(
+                                    pipe_sym.clone(),
+                                    SymbolBinding {
+                                        name: pipe_sym.clone(),
+                                        llvm_ptr: fp,
+                                        type_hint: "double".to_string(),
+                                        is_scoped: true,
+                                    },
+                                );
+                            }
+                            IrType::Ptr => {
+                                let pp = format!("%str_var_pipe_{}", pid);
+                                ir.push_str(&format!("  {} = alloca i8*\n", pp));
+                                ir.push_str(&format!("  store i8* {}, i8** {}\n", ltv.reg, pp));
+                                sub_scope.insert(
+                                    pipe_sym.clone(),
+                                    SymbolBinding {
+                                        name: pipe_sym.clone(),
+                                        llvm_ptr: pp,
+                                        type_hint: "i8* (string)".to_string(),
+                                        is_scoped: true,
+                                    },
+                                );
+                            }
+                            IrType::StructPtr(ref cls) => {
+                                let sp = format!("%var_pipe_{}", pid);
+                                ir.push_str(&format!("  {} = alloca %struct.{}*\n", sp, cls));
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, ltv.reg, cls, sp));
+                                sub_scope.insert(
+                                    pipe_sym.clone(),
+                                    SymbolBinding {
+                                        name: pipe_sym.clone(),
+                                        llvm_ptr: sp,
+                                        type_hint: format!("%struct.{}*", cls),
+                                        is_scoped: true,
+                                    },
+                                );
+                            }
+                            _ => {
+                                let v64 = self.coerce_to_i64(ltv, ir, temp_counter);
+                                let ip = format!("%var_pipe_{}", pid);
+                                ir.push_str(&format!("  {} = alloca i64\n", ip));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", v64, ip));
+                                sub_scope.insert(
+                                    pipe_sym.clone(),
+                                    SymbolBinding {
+                                        name: pipe_sym.clone(),
+                                        llvm_ptr: ip,
+                                        type_hint: "i64".to_string(),
+                                        is_scoped: true,
+                                    },
+                                );
+                            }
+                        }
+                        let piped_call = if let Some(open) = right.find('(') {
+                            if right.ends_with(')') {
+                                let fn_head = right[..open].trim();
+                                let inner = right[open + 1..right.len() - 1].trim();
+                                if inner.is_empty() {
+                                    format!("{}({})", fn_head, pipe_sym)
+                                } else {
+                                    format!("{}({}, {})", fn_head, pipe_sym, inner)
+                                }
+                            } else {
+                                format!("{}({})", right, pipe_sym)
+                            }
+                        } else {
+                            format!("{}({})", right, pipe_sym)
+                        };
+                        return self.eval_typed(&piped_call, ir, &sub_scope, string_constants, temp_counter);
+                    }
+                    if matches!(
+                        op.as_str(),
+                        "||" | "or" | "&&" | "and" | "==" | "!=" | "===" | "!==" | "~=" | "<" | "<=" | ">" | ">=" | "is" | "is not"
+                    ) {
+                        let c_reg = self.eval_cond(trimmed, ir, scope_tree, string_constants, temp_counter);
+                        let z_reg = format!("%bool_i64_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = zext i1 {} to i64\n", z_reg, c_reg));
+                        return TypedValue { reg: z_reg, ty: IrType::I64 };
+                    }
+
+                    if op == "+" && (Self::is_string_expr(left, scope_tree) || Self::is_string_expr(right, scope_tree)) {
+                        let str_ptr = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", str_ptr));
+                        return TypedValue { reg: str_ptr, ty: IrType::Ptr };
+                    }
+
+                    if op == "**" {
+                        if let (Some(lb), Some(rb)) = (parse_polyglot_i64(left), parse_polyglot_i64(right)) {
+                            if (0..=62).contains(&rb) {
+                                return TypedValue {
+                                    reg: lb.wrapping_pow(rb as u32).to_string(),
+                                    ty: IrType::I64,
+                                };
+                            }
+                        }
+                    }
+
+                    let ltv = self.eval_typed(left, ir, scope_tree, string_constants, temp_counter);
+                    let rtv = self.eval_typed(right, ir, scope_tree, string_constants, temp_counter);
+
+                    if ltv.ty == IrType::F64 || rtv.ty == IrType::F64 {
+                        let lf = self.coerce_to_f64(ltv, ir, temp_counter);
+                        let rf = self.coerce_to_f64(rtv, ir, temp_counter);
+                        let res_var = format!("%tf_{}", *temp_counter);
+                        *temp_counter += 1;
+                        if op == "**" {
+                            if let Some(exp_i) = parse_polyglot_i64(right) {
+                                if exp_i == 0 {
+                                    return TypedValue { reg: format_llvm_f64(1.0), ty: IrType::F64 };
+                                } else if (1..=12).contains(&exp_i) {
+                                    let mut acc = lf.clone();
+                                    for _ in 1..exp_i {
+                                        let step = format!("%powf_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = fmul double {}, {}\n", step, acc, lf));
+                                        acc = step;
+                                    }
+                                    return TypedValue { reg: acc, ty: IrType::F64 };
+                                }
+                            }
+                            ir.push_str(&format!("  {} = call double @llvm.pow.f64(double {}, double {})\n", res_var, lf, rf));
+                            return TypedValue { reg: res_var, ty: IrType::F64 };
+                        }
+                        let finstr = match op.as_str() {
+                            "+" => "fadd",
+                            "-" => "fsub",
+                            "*" => "fmul",
+                            "/" => "fdiv",
+                            "%" => "frem",
+                            _ => "fadd",
+                        };
+                        ir.push_str(&format!("  {} = {} double {}, {}\n", res_var, finstr, lf, rf));
+                        return TypedValue { reg: res_var, ty: IrType::F64 };
+                    }
+
+                    let left_val = self.coerce_to_i64(ltv, ir, temp_counter);
+                    let right_val = self.coerce_to_i64(rtv, ir, temp_counter);
+
+                    let res_var = format!("%t_{}", *temp_counter);
+                    *temp_counter += 1;
+
+                    let instr = match op.as_str() {
+                        "+" => "add",
+                        "-" => "sub",
+                        "*" => "mul",
+                        "/" | "%" | "//" => {
+                            let is_zero = format!("%div_zero_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
+                            let safe_div = format!("%safe_div_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = select i1 {}, i64 1, i64 {}\n", safe_div, is_zero, right_val));
+                            let op_name = if op == "%" { "srem" } else { "sdiv" };
+                            ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, safe_div));
+                            return TypedValue { reg: res_var, ty: IrType::I64 };
+                        }
+                        "^" => "xor",
+                        "&" => "and",
+                        "|" => "or",
+                        "<<" => "shl",
+                        ">>" => "ashr",
+                        ">>>" => "lshr",
+                        "**" => {
+                            if let Some(exp_i) = parse_polyglot_i64(right) {
+                                if exp_i == 0 {
+                                    return TypedValue { reg: "1".to_string(), ty: IrType::I64 };
+                                } else if (1..=16).contains(&exp_i) {
+                                    let mut acc = left_val.clone();
+                                    for _ in 1..exp_i {
+                                        let step = format!("%pow64_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = mul i64 {}, {}\n", step, acc, left_val));
+                                        acc = step;
+                                    }
+                                    return TypedValue { reg: acc, ty: IrType::I64 };
+                                }
+                            }
+                            ir.push_str(&format!("  {} = call i64 @__omni_ipow64(i64 {}, i64 {})\n", res_var, left_val, right_val));
+                            return TypedValue { reg: res_var, ty: IrType::I64 };
+                        }
+                        _ => "add",
+                    };
+
+                    ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, instr, left_val, right_val));
+                    return TypedValue { reg: res_var, ty: IrType::I64 };
+                }
+                ExprAst::Cast { expr: inner, target_type } => {
+                    let inner_s = inner.slice(trimmed);
+                    let tt = target_type.trim();
+                    if is_float_type_hint(tt) {
+                        let tv = self.eval_typed(inner_s, ir, scope_tree, string_constants, temp_counter);
+                        let freg = self.coerce_to_f64(tv, ir, temp_counter);
+                        return TypedValue { reg: freg, ty: IrType::F64 };
+                    } else if is_string_type_hint(tt) {
+                        let sptr = self.eval_str_ptr(inner_s, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", sptr));
+                        return TypedValue { reg: sptr, ty: IrType::Ptr };
+                    } else {
+                        let tv = self.eval_typed(inner_s, ir, scope_tree, string_constants, temp_counter);
+                        let ireg = self.coerce_to_i64(tv, ir, temp_counter);
+                        if matches!(tt, "i32" | "int32" | "int32_t" | "c_int") {
+                            let tr = format!("%cast_tr32_{}", *temp_counter);
+                            let sx = format!("%cast_sx64_{}", *temp_counter);
+                            *temp_counter += 2;
+                            ir.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  {} = sext i32 {} to i64\n",
+                                tr, ireg, sx, tr
+                            ));
+                            return TypedValue { reg: sx, ty: IrType::I64 };
+                        } else if matches!(tt, "u32" | "uint32" | "uint32_t") {
+                            let tr = format!("%cast_utr32_{}", *temp_counter);
+                            let zx = format!("%cast_zx64_{}", *temp_counter);
+                            *temp_counter += 2;
+                            ir.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  {} = zext i32 {} to i64\n",
+                                tr, ireg, zx, tr
+                            ));
+                            return TypedValue { reg: zx, ty: IrType::I64 };
+                        }
+                        return TypedValue { reg: ireg, ty: IrType::I64 };
+                    }
+                }
+                ExprAst::Unary { ref op, ref rhs } => {
+                    let inner_s = rhs.slice(trimmed);
+                    match op.as_str() {
+                        "!" | "not" => {
+                            let c_reg = self.eval_cond(trimmed, ir, scope_tree, string_constants, temp_counter);
+                            let z_reg = format!("%not_i64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = zext i1 {} to i64\n", z_reg, c_reg));
+                            return TypedValue { reg: z_reg, ty: IrType::I64 };
+                        }
+                        "~" => {
+                            let tv = self.eval_typed(inner_s, ir, scope_tree, string_constants, temp_counter);
+                            let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                            let res = format!("%bitnot_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = xor i64 {}, -1\n", res, v64));
+                            return TypedValue { reg: res, ty: IrType::I64 };
+                        }
+                        "-" => {
+                            let tv = self.eval_typed(inner_s, ir, scope_tree, string_constants, temp_counter);
+                            if tv.ty == IrType::F64 {
+                                let res = format!("%fneg_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = fsub double 0x0000000000000000, {}\n", res, tv.reg));
+                                return TypedValue { reg: res, ty: IrType::F64 };
+                            } else {
+                                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                                let res = format!("%ineg_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = sub i64 0, {}\n", res, v64));
+                                return TypedValue { reg: res, ty: IrType::I64 };
+                            }
+                        }
+                        "+" => {
+                            return self.eval_typed(inner_s, ir, scope_tree, string_constants, temp_counter);
+                        }
+                        _ => {}
+                    }
+                }
+                ExprAst::ListLit(elems) => {
+                    let cap = elems.len().max(4);
+                    let slice_res = format!("%rval_slice_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_slice_create(i64 {})\n", slice_res, cap));
+                    for elem in &elems {
+                        let es = elem.slice(trimmed);
+                        let etv = self.eval_typed(es, ir, scope_tree, string_constants, temp_counter);
+                        let ebits = self.coerce_to_raw_i64_bits(etv, ir, temp_counter);
+                        ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", slice_res, ebits));
+                    }
+                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", slice_res));
+                    return TypedValue { reg: slice_res, ty: IrType::Ptr };
+                }
+                ExprAst::MapLit(entries) => {
+                    let cap = entries.len().max(8);
+                    let map_res = format!("%rval_map_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_map_create(i64 {})\n", map_res, cap));
+                    for (k, v) in &entries {
+                        let ks = k.slice(trimmed);
+                        let vs = v.slice(trimmed);
+                        let vtv = self.eval_typed(vs, ir, scope_tree, string_constants, temp_counter);
+                        let vbits = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
+                        if Self::is_string_expr(ks, scope_tree)
+                            || (ks.starts_with('"') && ks.ends_with('"'))
+                            || (ks.starts_with('\'') && ks.ends_with('\''))
+                        {
+                            let kptr = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
+                            ir.push_str(&format!("  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n", map_res, kptr, vbits));
+                        } else {
+                            let ktv = self.eval_typed(ks, ir, scope_tree, string_constants, temp_counter);
+                            let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
+                            ir.push_str(&format!("  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n", map_res, k64, vbits));
+                        }
+                    }
+                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", map_res));
+                    return TypedValue { reg: map_res, ty: IrType::Ptr };
+                }
+                ExprAst::Index { ref target, ref index } => {
+                    let target_s = target.slice(trimmed);
+                    let idx_expr = index.slice(trimmed);
+                    let (is_map, elem_tag) = Self::resolve_collection_target_info(target_s, scope_tree);
+                    let col_ptr = if let Some(b) = scope_tree.resolve(target_s) {
+                        if b.type_hint.starts_with("i8*") {
+                            let loaded = format!("%col_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                            Some(loaded)
+                        } else {
+                            let t_tv = self.eval_typed(target_s, ir, scope_tree, string_constants, temp_counter);
+                            Some(self.coerce_to_ptr(t_tv, ir, temp_counter))
+                        }
+                    } else {
+                        let t_tv = self.eval_typed(target_s, ir, scope_tree, string_constants, temp_counter);
+                        if t_tv.ty == IrType::Ptr || matches!(t_tv.ty, IrType::StructPtr(_)) {
+                            Some(self.coerce_to_ptr(t_tv, ir, temp_counter))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(loaded) = col_ptr {
+                        if is_map {
+                            let val_res = format!("%map_get_{}", *temp_counter);
+                            *temp_counter += 1;
+                            if (idx_expr.starts_with('"') && idx_expr.ends_with('"'))
+                                || (idx_expr.starts_with('\'') && idx_expr.ends_with('\''))
+                            {
+                                let text = &idx_expr[1..idx_expr.len() - 1];
+                                if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
+                                    let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                        str_ptr, len, len, const_name
+                                    ));
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n",
+                                        val_res, loaded, str_ptr
+                                    ));
+                                } else {
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_map_get(i8* {}, i8* null)\n",
+                                        val_res, loaded
+                                    ));
+                                }
+                            } else if Self::is_string_expr(idx_expr, scope_tree) {
+                                let key_ptr = self.eval_str_ptr(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!(
+                                    "  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n",
+                                    val_res, loaded, key_ptr
+                                ));
+                            } else {
+                                let idx_tv = self.eval_typed(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                                let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
+                                ir.push_str(&format!(
+                                    "  {} = call i64 @__omni_map_get_int(i8* {}, i64 {})\n",
+                                    val_res, loaded, idx_64
+                                ));
+                            }
+                            return Self::unpack_raw_elem_bits(val_res, elem_tag.as_deref(), ir, temp_counter);
+                        } else {
+                            let idx_tv = self.eval_typed(idx_expr, ir, scope_tree, string_constants, temp_counter);
+                            let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
+                            let val_res = format!("%slice_get_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n",
+                                val_res, loaded, idx_64
+                            ));
+                            return Self::unpack_raw_elem_bits(val_res, elem_tag.as_deref(), ir, temp_counter);
+                        }
+                    }
+                }
+                ExprAst::Call { ref callee, ref args } => {
+                    if let ExprAst::Member { ref target, ref field } = callee.node {
+                        if !matches!(target.node, ExprAst::Ident(_)) {
+                            let target_s = target.slice(trimmed);
+                            let target_tv = self.eval_typed(target_s, ir, scope_tree, string_constants, temp_counter);
+                            if let IrType::StructPtr(cls_name) = target_tv.ty {
+                                let def_cls = scope_tree.resolve_defining_class(&cls_name, field);
+                                let raw_inst = format!("%chain_call_inst_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = bitcast %struct.{}* {} to i8*\n",
+                                    raw_inst, cls_name, target_tv.reg
+                                ));
+                                let mut arg_regs = Vec::new();
+                                for a in args {
+                                    let a_clean = Self::strip_kwarg_prefix(&a.raw);
+                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
+                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
+                                }
+                                while arg_regs.len() < 5 {
+                                    arg_regs.push("0".to_string());
+                                }
+                                let ret_reg = format!("%chain_method_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
+                                    ret_reg, def_cls, field, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
+                                ));
+                                let mret = scope_tree
+                                    .method_return_types
+                                    .get(&(def_cls.clone(), field.clone()))
+                                    .cloned()
+                                    .or_else(|| scope_tree.infer_structural_method_return_type(&def_cls, field, args.len()));
+                                return Self::apply_return_ir_type(ret_reg, mret.as_ref(), ir, temp_counter);
+                            }
+                        }
+                    }
+                }
+                ExprAst::Member { ref target, ref field } if !matches!(target.node, ExprAst::Ident(_)) => {
+                    let target_s = target.slice(trimmed);
+                    let target_tv = self.eval_typed(target_s, ir, scope_tree, string_constants, temp_counter);
+                    if let IrType::StructPtr(cls_name) = target_tv.ty {
+                        if let Some(&f_idx) = scope_tree.class_fields.get(&cls_name).and_then(|m| m.get(field)) {
+                            let gep = format!("%chain_gep_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                                gep, cls_name, cls_name, target_tv.reg, f_idx
+                            ));
+                            let val64 = format!("%chain_val64_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i64, i64* {}\n", val64, gep));
+                            let ft = scope_tree.class_field_types.get(&cls_name).and_then(|m| m.get(field)).map(|s| s.as_str());
+                            return Self::unpack_raw_elem_bits(val64, ft, ir, temp_counter);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // If outer parentheses wrapped a sub-expression (e.g. `(foo(1))`), evaluate the unwrapped inner slice!
+            let unwrapped = ast.slice(trimmed);
+            if unwrapped != trimmed && !unwrapped.is_empty() {
+                return self.eval_typed(unwrapped, ir, scope_tree, string_constants, temp_counter);
+            }
+        }
+
         // Go error constructors: `errors.New("...")` / `fmt.Errorf("...")`
         if (trimmed.starts_with("errors.New(") || trimmed.starts_with("fmt.Errorf("))
             && trimmed.ends_with(')')
@@ -1951,7 +3153,11 @@ impl<'a> CodeGenerator<'a> {
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, val64));
                                     return TypedValue { reg: fval, ty: IrType::F64 };
-                                } else if ft.starts_with("i8*") || is_string_type_hint(ft) {
+                                } else if ft.starts_with("i8*")
+                                    || ft.starts_with("omni_slice")
+                                    || ft.starts_with("omni_map")
+                                    || is_string_type_hint(ft)
+                                {
                                     let sval = format!("%fld_ptr_{}", *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sval, val64));
@@ -2164,8 +3370,12 @@ impl<'a> CodeGenerator<'a> {
                                         "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
                                         ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
                                     ));
-                                    let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
-                                    return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
+                                    let mret = scope_tree
+                                        .method_return_types
+                                        .get(&(def_cls.clone(), method.to_string()))
+                                        .cloned()
+                                        .or_else(|| scope_tree.infer_structural_method_return_type(&def_cls, method, raw_args.len()));
+                                    return Self::apply_return_ir_type(ret_reg, mret.as_ref(), ir, temp_counter);
                                 } else if b.type_hint.starts_with("i8*") || b.type_hint == "i64" {
                                     if let Some((_, def_cls)) = scope_tree.method_defining_class.iter().find(|((_, m), _)| m == method) {
                                         let def_cls = def_cls.clone();
@@ -2278,14 +3488,19 @@ impl<'a> CodeGenerator<'a> {
                                     let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
                                     arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                                 }
+                                let actual_c_args: String = arg_regs
+                                    .iter()
+                                    .map(|r| format!("i64 {}", r))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
                                 while arg_regs.len() < 6 {
                                     arg_regs.push("0".to_string());
                                 }
 
-                                let ret_reg = format!("%foreign_ret_{}", *temp_counter);
-                                *temp_counter += 1;
                                 let prefixed_fn = format!("{}_{}", rec, method);
                                 if scope_tree.known_functions.contains(method) {
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
                                     ir.push_str(&format!(
                                         "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
                                         ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
@@ -2293,6 +3508,8 @@ impl<'a> CodeGenerator<'a> {
                                     let fret = scope_tree.fn_return_types.get(method);
                                     return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
                                 } else if scope_tree.known_functions.contains(&prefixed_fn) {
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
                                     ir.push_str(&format!(
                                         "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
                                         ret_reg, prefixed_fn, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
@@ -2300,18 +3517,59 @@ impl<'a> CodeGenerator<'a> {
                                     let fret = scope_tree.fn_return_types.get(&prefixed_fn);
                                     return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
                                 } else if NATIVE_C_LIB_I64_FNS.contains(&method) {
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
                                     ir.push_str(&format!(
-                                        "  {} = call i64 @{}(i64 {})\n",
-                                        ret_reg, method, arg_regs[0]
+                                        "  {} = call i64 @{}({})\n",
+                                        ret_reg, method, actual_c_args
                                     ));
                                     return TypedValue { reg: ret_reg, ty: IrType::I64 };
                                 } else if NATIVE_C_LIB_FNS.contains(&method) {
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
                                     ir.push_str(&format!(
-                                        "  {} = call i32 @{}(i64 {})\n",
-                                        ret_reg, method, arg_regs[0]
+                                        "  {} = call i32 @{}({})\n",
+                                        ret_reg, method, actual_c_args
                                     ));
                                     return TypedValue { reg: ret_reg, ty: IrType::I32 };
+                                } else if scope_tree.c_module_aliases.contains(rec) {
+                                    if let Some(ctx) = self.active_ai_ctx.borrow_mut().as_mut() {
+                                        ctx.dynamic_declarations
+                                            .insert(format!("declare i64 @{}(...)", method));
+                                    }
+                                    let ret_reg = format!("%c_ffi_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @{}({})\n",
+                                        ret_reg, method, actual_c_args
+                                    ));
+                                    return TypedValue { reg: ret_reg, ty: IrType::I64 };
                                 } else {
+                                    let is_c_eco = self
+                                        .active_ai_ctx
+                                        .borrow()
+                                        .as_ref()
+                                        .and_then(|c| c.ecosystem_context.as_deref())
+                                        .map(|ec| ec.contains("c (module:") && ec.contains(rec))
+                                        .unwrap_or(false);
+                                    if !is_c_eco
+                                        && !scope_tree.is_natively_routed_call(rec, method, &parts, trimmed)
+                                        && scope_tree.resolve(rec).is_none()
+                                        && !scope_tree.class_fields.contains_key(rec)
+                                    {
+                                        if let Some(ai_tv) = self.escalate_subexpr_to_llm(
+                                            trimmed,
+                                            "ForeignModuleAssignment",
+                                            ir,
+                                            scope_tree,
+                                            string_constants,
+                                            temp_counter,
+                                        ) {
+                                            return ai_tv;
+                                        }
+                                    }
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
                                     ir.push_str(&format!(
                                         "  {} = call i64 @{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
                                         ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
@@ -2349,31 +3607,26 @@ impl<'a> CodeGenerator<'a> {
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", raw_inst, alloc_bytes));
 
-                            let mut arg_regs = Vec::new();
-                            for a in &raw_args {
-                                let a_clean = Self::strip_kwarg_prefix(a);
-                                let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
-                                arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                            }
-                            while arg_regs.len() < 5 {
-                                arg_regs.push("0".to_string());
-                            }
-
-                            let def_cls = scope_tree.resolve_defining_class(&target_cls, "__init__");
-                            let init_ret = format!("%ctor_init_ret_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!(
-                                "  {} = call i64 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                init_ret, def_cls, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                            ));
-
-                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_inst));
                             let struct_ptr = format!("%ctor_struct_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
                                 "  {} = bitcast i8* {} to %struct.{}*\n",
                                 struct_ptr, raw_inst, target_cls
                             ));
+
+                            self.init_struct_instance(
+                                &target_cls,
+                                &raw_inst,
+                                &struct_ptr,
+                                "__init__",
+                                &raw_args,
+                                ir,
+                                scope_tree,
+                                string_constants,
+                                temp_counter,
+                            );
+
+                            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_inst));
                             return TypedValue {
                                 reg: struct_ptr,
                                 ty: IrType::StructPtr(target_cls),
@@ -2387,6 +3640,11 @@ impl<'a> CodeGenerator<'a> {
                             let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
                             arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
                         }
+                        let actual_c_args: String = arg_regs
+                            .iter()
+                            .map(|r| format!("i64 {}", r))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         while arg_regs.len() < 6 {
                             arg_regs.push("0".to_string());
                         }
@@ -2461,14 +3719,14 @@ impl<'a> CodeGenerator<'a> {
                             return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
                         } else if NATIVE_C_LIB_I64_FNS.contains(&call_target) {
                             ir.push_str(&format!(
-                                "  {} = call i64 @{}(i64 {})\n",
-                                ret_reg, call_target, arg_regs[0]
+                                "  {} = call i64 @{}({})\n",
+                                ret_reg, call_target, actual_c_args
                             ));
                             return TypedValue { reg: ret_reg, ty: IrType::I64 };
                         } else if NATIVE_C_LIB_FNS.contains(&call_target) {
                             ir.push_str(&format!(
-                                "  {} = call i32 @{}(i64 {})\n",
-                                ret_reg, call_target, arg_regs[0]
+                                "  {} = call i32 @{}({})\n",
+                                ret_reg, call_target, actual_c_args
                             ));
                             return TypedValue { reg: ret_reg, ty: IrType::I32 };
                         } else {
@@ -2515,7 +3773,8 @@ impl<'a> CodeGenerator<'a> {
                 let pop_res = format!("%pop_res_{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call i64 @__omni_slice_pop(i8* {})\n", pop_res, loaded));
-                return TypedValue { reg: pop_res, ty: IrType::I64 };
+                let elem_tag = scope_tree.collection_elem_types.get(var_name).map(|s| s.as_str());
+                return Self::unpack_raw_elem_bits(pop_res, elem_tag, ir, temp_counter);
             }
         }
 
@@ -2793,7 +4052,11 @@ impl<'a> CodeGenerator<'a> {
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fval, val64));
                             return TypedValue { reg: fval, ty: IrType::F64 };
-                        } else if ft.starts_with("i8*") || is_string_type_hint(ft) {
+                        } else if ft.starts_with("i8*")
+                            || ft.starts_with("omni_slice")
+                            || ft.starts_with("omni_map")
+                            || is_string_type_hint(ft)
+                        {
                             let sval = format!("%self_fld_ptr_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sval, val64));
@@ -2831,6 +4094,27 @@ impl<'a> CodeGenerator<'a> {
             return TypedValue { reg: raw_fptr, ty: IrType::Ptr };
         }
 
+        // Mid-Expression LLM Escalation Gate for non-trivial unrecognized polyglot sub-expressions
+        if !trimmed.is_empty()
+            && (trimmed.contains('(')
+                || trimmed.contains('[')
+                || trimmed.contains('.')
+                || trimmed.contains("::")
+                || trimmed.contains("..")
+                || trimmed.contains("=>"))
+        {
+            if let Some(ai_tv) = self.escalate_subexpr_to_llm(
+                trimmed,
+                "PolyglotSubExpression",
+                ir,
+                scope_tree,
+                string_constants,
+                temp_counter,
+            ) {
+                return ai_tv;
+            }
+        }
+
         TypedValue { reg: "0".to_string(), ty: IrType::I64 }
     }
 
@@ -2856,7 +4140,170 @@ impl<'a> CodeGenerator<'a> {
         string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
     ) -> String {
-        let mut clean_cond = cond.trim().to_string();
+        let src_cond = cond.trim();
+
+        // Pratt AST boolean & relational evaluation: handles arbitrary parenthesized `(a || b) && !(c && d)`,
+        // Python `is None` / `is not None` / `not x == 5`, and float/int/string/null comparisons.
+        if let Ok(ast) = OmniParser::parse_expr(src_cond) {
+            match ast.node {
+                ExprAst::BoolLit(b) => {
+                    let cval = if b { "true" } else { "false" };
+                    let cond_var = format!("%bool_lit_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = icmp eq i1 {}, true\n", cond_var, cval));
+                    return cond_var;
+                }
+                ExprAst::Binary { ref op, ref lhs, ref rhs } if op == "||" || op == "or" => {
+                    let sc_id = *temp_counter;
+                    *temp_counter += 1;
+                    let l_res = self.eval_cond(lhs.slice(src_cond), ir, scope_tree, string_constants, temp_counter);
+                    ir.push_str(&format!(
+                        "  br i1 {}, label %sc_or_short_{}, label %sc_or_rhs_{}\n\nsc_or_short_{}:\n  br label %sc_or_merge_{}\n\nsc_or_rhs_{}:\n",
+                        l_res, sc_id, sc_id, sc_id, sc_id, sc_id
+                    ));
+                    let r_res = self.eval_cond(rhs.slice(src_cond), ir, scope_tree, string_constants, temp_counter);
+                    let res = format!("%or_cond_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  br label %sc_or_done_{}\n\nsc_or_done_{}:\n  br label %sc_or_merge_{}\n\nsc_or_merge_{}:\n  {} = phi i1 [ true, %sc_or_short_{} ], [ {}, %sc_or_done_{} ]\n",
+                        sc_id, sc_id, sc_id, sc_id, res, sc_id, r_res, sc_id
+                    ));
+                    return res;
+                }
+                ExprAst::Binary { ref op, ref lhs, ref rhs } if op == "&&" || op == "and" => {
+                    let sc_id = *temp_counter;
+                    *temp_counter += 1;
+                    let l_res = self.eval_cond(lhs.slice(src_cond), ir, scope_tree, string_constants, temp_counter);
+                    ir.push_str(&format!(
+                        "  br i1 {}, label %sc_and_rhs_{}, label %sc_and_short_{}\n\nsc_and_short_{}:\n  br label %sc_and_merge_{}\n\nsc_and_rhs_{}:\n",
+                        l_res, sc_id, sc_id, sc_id, sc_id, sc_id
+                    ));
+                    let r_res = self.eval_cond(rhs.slice(src_cond), ir, scope_tree, string_constants, temp_counter);
+                    let res = format!("%and_cond_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  br label %sc_and_done_{}\n\nsc_and_done_{}:\n  br label %sc_and_merge_{}\n\nsc_and_merge_{}:\n  {} = phi i1 [ false, %sc_and_short_{} ], [ {}, %sc_and_done_{} ]\n",
+                        sc_id, sc_id, sc_id, sc_id, res, sc_id, r_res, sc_id
+                    ));
+                    return res;
+                }
+                ExprAst::Unary { ref op, ref rhs } if op == "!" || op == "not" => {
+                    let inner = self.eval_cond(rhs.slice(src_cond), ir, scope_tree, string_constants, temp_counter);
+                    let neg = format!("%not_cond_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = xor i1 {}, true\n", neg, inner));
+                    return neg;
+                }
+                ExprAst::Binary { ref op, ref lhs, ref rhs }
+                    if matches!(
+                        op.as_str(),
+                        "==" | "!=" | "===" | "!==" | "~=" | "<" | "<=" | ">" | ">=" | "is" | "is not"
+                    ) =>
+                {
+                    let left_raw = lhs.slice(src_cond);
+                    let right_raw = rhs.slice(src_cond);
+                    let norm_op = match op.as_str() {
+                        "is" => "==",
+                        "is not" => "!=",
+                        other => other,
+                    };
+
+                    if is_null_literal(left_raw) || is_null_literal(right_raw) {
+                        let non_null_expr = if is_null_literal(left_raw) { right_raw } else { left_raw };
+                        let predicate = match norm_op {
+                            "===" | "==" => "eq",
+                            _ => "ne",
+                        };
+                        if is_null_literal(non_null_expr) {
+                            let cval = if predicate == "eq" { "true" } else { "false" };
+                            let cond_var = format!("%null_const_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = icmp eq i1 {}, true\n", cond_var, cval));
+                            return cond_var;
+                        }
+                        let tv = self.eval_typed(non_null_expr, ir, scope_tree, string_constants, temp_counter);
+                        let cond_var = format!("%null_cmp_{}", *temp_counter);
+                        *temp_counter += 1;
+                        match tv.ty {
+                            IrType::Ptr => {
+                                ir.push_str(&format!("  {} = icmp {} i8* {}, null\n", cond_var, predicate, tv.reg));
+                            }
+                            IrType::StructPtr(cls) => {
+                                ir.push_str(&format!("  {} = icmp {} %struct.{}* {}, null\n", cond_var, predicate, cls, tv.reg));
+                            }
+                            _ => {
+                                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                                ir.push_str(&format!("  {} = icmp {} i64 {}, 0\n", cond_var, predicate, v64));
+                            }
+                        }
+                        return cond_var;
+                    }
+
+                    if (Self::is_string_expr(left_raw, scope_tree) || Self::is_string_expr(right_raw, scope_tree))
+                        && parse_polyglot_i64(left_raw).is_none()
+                        && parse_polyglot_i64(right_raw).is_none()
+                        && parse_polyglot_f64(left_raw).is_none()
+                        && parse_polyglot_f64(right_raw).is_none()
+                    {
+                        let left_ptr = self.eval_str_ptr(left_raw, ir, scope_tree, string_constants, temp_counter);
+                        let right_ptr = self.eval_str_ptr(right_raw, ir, scope_tree, string_constants, temp_counter);
+                        let cmp_res = format!("%strcmp_res_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i32 @strcmp(i8* {}, i8* {})\n", cmp_res, left_ptr, right_ptr));
+                        let cond_var = format!("%cond_{}", *temp_counter);
+                        *temp_counter += 1;
+                        let predicate = match norm_op {
+                            "===" | "==" => "eq",
+                            "!==" | "!=" | "~=" => "ne",
+                            "<" => "slt",
+                            "<=" => "sle",
+                            ">" => "sgt",
+                            ">=" => "sge",
+                            _ => "eq",
+                        };
+                        ir.push_str(&format!("  {} = icmp {} i32 {}, 0\n", cond_var, predicate, cmp_res));
+                        return cond_var;
+                    }
+
+                    let ltv = self.eval_typed(left_raw, ir, scope_tree, string_constants, temp_counter);
+                    let rtv = self.eval_typed(right_raw, ir, scope_tree, string_constants, temp_counter);
+                    let cond_var = format!("%cond_{}", *temp_counter);
+                    *temp_counter += 1;
+                    if ltv.ty == IrType::F64 || rtv.ty == IrType::F64 {
+                        let lf = self.coerce_to_f64(ltv, ir, temp_counter);
+                        let rf = self.coerce_to_f64(rtv, ir, temp_counter);
+                        let fpred = match norm_op {
+                            "===" | "==" => "oeq",
+                            "!==" | "!=" | "~=" => "une",
+                            "<" => "olt",
+                            "<=" => "ole",
+                            ">" => "ogt",
+                            ">=" => "oge",
+                            _ => "une",
+                        };
+                        ir.push_str(&format!("  {} = fcmp {} double {}, {}\n", cond_var, fpred, lf, rf));
+                        return cond_var;
+                    }
+
+                    let left = self.coerce_to_i64(ltv, ir, temp_counter);
+                    let right = self.coerce_to_i64(rtv, ir, temp_counter);
+                    let predicate = match norm_op {
+                        "===" | "==" => "eq",
+                        "!==" | "!=" | "~=" => "ne",
+                        "<" => "slt",
+                        "<=" => "sle",
+                        ">" => "sgt",
+                        ">=" => "sge",
+                        _ => "ne",
+                    };
+                    ir.push_str(&format!("  {} = icmp {} i64 {}, {}\n", cond_var, predicate, left, right));
+                    return cond_var;
+                }
+                _ => {}
+            }
+        }
+
+        let mut clean_cond = src_cond.to_string();
         if clean_cond.contains(" is not None") {
             clean_cond = clean_cond.replace(" is not None", " != null");
         } else if clean_cond.contains(" is None") {
@@ -3238,6 +4685,7 @@ impl<'a> CodeGenerator<'a> {
         ecosystem_context: Option<&str>,
         import_chain: &[String],
         dynamic_declarations: &mut HashSet<String>,
+        is_tail_position: bool,
     ) -> anyhow::Result<bool> {
         let mut custom_return = false;
 
@@ -3292,13 +4740,22 @@ impl<'a> CodeGenerator<'a> {
                                     let is_struct_var = scope_tree.resolve(trimmed_expr)
                                         .map(|sb| sb.type_hint.starts_with("%struct."))
                                         .unwrap_or(false);
-                                    let is_field_access = trimmed_expr.contains('.') && !trimmed_expr.contains('(');
+                                    let is_field_access = {
+                                        let parts: Vec<&str> = trimmed_expr.split('.').collect();
+                                        parts.len() == 2
+                                            && parts[0].trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                            && parts[1].trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                            && parse_polyglot_f64(trimmed_expr).is_none()
+                                    };
                                     let is_str_binding = scope_tree.resolve(trimmed_expr)
                                         .map(|sb| is_string_type_hint(&sb.type_hint))
                                         .unwrap_or(false);
                                     let store_val = if is_struct_var {
-                                        let src_b = scope_tree.resolve(trimmed_expr).unwrap();
-                                        let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                        let src_b = scope_tree.resolve(trimmed_expr).cloned().unwrap();
+                                        let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*').to_string();
+                                        if let Some(ft_map) = scope_tree.class_field_types.get_mut(cls_name) {
+                                            ft_map.entry(syn_fld.to_string()).or_insert_with(|| format!("%struct.{}*", s_cls));
+                                        }
                                         let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
@@ -3353,7 +4810,10 @@ impl<'a> CodeGenerator<'a> {
                                     } else if is_null_literal(trimmed_expr) {
                                         "0".to_string()
                                     } else if is_str_binding {
-                                        let src_b = scope_tree.resolve(trimmed_expr).unwrap();
+                                        let src_b = scope_tree.resolve(trimmed_expr).cloned().unwrap();
+                                        if let Some(ft_map) = scope_tree.class_field_types.get_mut(cls_name) {
+                                            ft_map.entry(syn_fld.to_string()).or_insert_with(|| "i8* (string)".to_string());
+                                        }
                                         if src_b.type_hint.starts_with("i8*") {
                                             let ldp = format!("%str_ldp_{}", *temp_counter);
                                             *temp_counter += 1;
@@ -3370,9 +4830,25 @@ impl<'a> CodeGenerator<'a> {
                                         }
                                     } else {
                                         let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
-                                        if tv.ty == IrType::F64 {
+                                        let inferred_ft = if tv.ty == IrType::F64 {
+                                            Some("f64".to_string())
+                                        } else {
+                                            let tag = Self::infer_elem_tag_from_expr(trimmed_expr, &tv.ty, scope_tree);
+                                            if tag != "i64" && tag != "i8*" {
+                                                Some(tag)
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(ft) = inferred_ft {
                                             if let Some(ft_map) = scope_tree.class_field_types.get_mut(cls_name) {
-                                                ft_map.entry(syn_fld.to_string()).or_insert_with(|| "f64".to_string());
+                                                let should_set = ft_map
+                                                    .get(syn_fld)
+                                                    .map(|ex| ex == "i64" || ex == "any")
+                                                    .unwrap_or(true);
+                                                if should_set {
+                                                    ft_map.insert(syn_fld.to_string(), ft);
+                                                }
                                             }
                                         }
                                         self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
@@ -3497,16 +4973,17 @@ impl<'a> CodeGenerator<'a> {
                         continue;
                     }
 
-                    // Class / Struct Constructor Call: `c = Counter(10)`, `u = new User(...)`, or Rust `h = Adler32::new()`
+                    // Class / Struct Constructor Call: `c = Counter(10)`, `u = new User<T>(...)`, or Rust `h = Adler32::new()`
                     let ctor_candidate_expr = trimmed_expr.strip_prefix("new ").unwrap_or(trimmed_expr).trim();
                     if let Some(open) = ctor_candidate_expr.find('(') {
                         if ctor_candidate_expr.ends_with(')') {
-                            let cls_cand = ctor_candidate_expr[..open].trim();
+                            let raw_cls_cand = ctor_candidate_expr[..open].trim();
+                            let cls_cand = raw_cls_cand.split('<').next().unwrap_or(raw_cls_cand).trim();
                             let (cls_name_opt, assoc_ctor_method) = if scope_tree.class_fields.contains_key(cls_cand) {
                                 (Some(cls_cand), "__init__")
-                            } else if let Some((base_cls, assoc_m)) = cls_cand.split_once("::") {
-                                let base_cls = base_cls.trim();
-                                let assoc_m = assoc_m.trim();
+                            } else if let Some((base_cls, assoc_m)) = raw_cls_cand.split_once("::") {
+                                let base_cls = base_cls.split('<').next().unwrap_or(base_cls).trim();
+                                let assoc_m = assoc_m.split('<').next().unwrap_or(assoc_m).trim();
                                 if scope_tree.class_fields.contains_key(base_cls)
                                     && (assoc_m == "new" || assoc_m == "default" || assoc_m.starts_with("from_"))
                                 {
@@ -3536,23 +5013,17 @@ impl<'a> CodeGenerator<'a> {
                                     omni_parser::OmniParser::split_respecting_quotes(inner, ',')
                                 };
 
-                                let mut arg_regs = Vec::new();
-                                for a in &raw_args {
-                                    let a_clean = Self::strip_kwarg_prefix(a);
-                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
-                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                                }
-                                while arg_regs.len() < 5 {
-                                    arg_regs.push("0".to_string());
-                                }
-
-                                let def_cls = scope_tree.resolve_defining_class(cls_name, assoc_ctor_method);
-                                let init_ret = format!("%init_ret_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!(
-                                    "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                    init_ret, def_cls, assoc_ctor_method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                                ));
+                                self.init_struct_instance(
+                                    cls_name,
+                                    &raw_inst,
+                                    &inst_alloc,
+                                    assoc_ctor_method,
+                                    &raw_args,
+                                    ir,
+                                    scope_tree,
+                                    string_constants,
+                                    temp_counter,
+                                );
 
                                 let expected_th = format!("%struct.{}*", cls_name);
                                 let target_ptr = if let Some(eb) = (!*is_scoped_decl)
@@ -3649,16 +5120,26 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  store i64 0, i64* {}\n", payload_gep));
                         }
 
-                        let target_ptr = format!("%var_{}_{}", target, *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca %enum.{}*\n", target_ptr, e_name));
+                        let expected_enum_th = format!("%enum.{}*", e_name);
+                        let target_ptr = if let Some(eb) = (!*is_scoped_decl)
+                            .then(|| scope_tree.resolve(target))
+                            .flatten()
+                            .filter(|b| b.type_hint == expected_enum_th)
+                        {
+                            eb.llvm_ptr.clone()
+                        } else {
+                            let tp = format!("%var_{}_{}", target, *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = alloca %enum.{}*\n", tp, e_name));
+                            scope_tree.insert(target.clone(), SymbolBinding {
+                                name: target.clone(),
+                                llvm_ptr: tp.clone(),
+                                type_hint: expected_enum_th,
+                                is_scoped: *is_scoped_decl,
+                            });
+                            tp
+                        };
                         ir.push_str(&format!("  store %enum.{}* {}, %enum.{}** {}\n", e_name, inst_alloc, e_name, target_ptr));
-                        scope_tree.insert(target.clone(), SymbolBinding {
-                            name: target.clone(),
-                            llvm_ptr: target_ptr,
-                            type_hint: format!("%enum.{}*", e_name),
-                            is_scoped: true,
-                        });
                         continue;
                     }
 
@@ -3738,17 +5219,27 @@ impl<'a> CodeGenerator<'a> {
                     }
 
                     // Foreign module call where receiver is foreign ecosystem (e.g. `RandomNumberGenerator.GetInt32(0, 100)`):
-                    let is_foreign_call = if let Some(open) = trimmed_expr.find('(') {
-                        if trimmed_expr.ends_with(')') {
-                            let callee = trimmed_expr[..open].trim();
-                            if callee.contains('.') {
-                                let parts: Vec<&str> = callee.split('.').collect();
-                                let rec = parts[0].trim();
-                                let method = parts[parts.len() - 1].trim();
-                                if scope_tree.is_natively_routed_call(rec, method, &parts, trimmed_expr) {
-                                    false
+                    // Only match when the ROOT Pratt AST node is `ExprAst::Call` (so compound expressions like
+                    // `10 + RandomNumberGenerator.GetInt32(5, 6)` split via Pratt in `eval_typed` first!).
+                    let is_root_call = OmniParser::parse_expr(trimmed_expr)
+                        .ok()
+                        .map(|a| matches!(a.node, ExprAst::Call { .. }))
+                        .unwrap_or(false);
+                    let is_foreign_call = if is_root_call {
+                        if let Some(open) = trimmed_expr.find('(') {
+                            if trimmed_expr.ends_with(')') {
+                                let callee = trimmed_expr[..open].trim();
+                                if callee.contains('.') {
+                                    let parts: Vec<&str> = callee.split('.').collect();
+                                    let rec = parts[0].trim();
+                                    let method = parts[parts.len() - 1].trim();
+                                    if scope_tree.is_natively_routed_call(rec, method, &parts, trimmed_expr) {
+                                        false
+                                    } else {
+                                        scope_tree.resolve(rec).is_none() && !scope_tree.class_fields.contains_key(rec)
+                                    }
                                 } else {
-                                    scope_tree.resolve(rec).is_none() && !scope_tree.class_fields.contains_key(rec)
+                                    false
                                 }
                             } else {
                                 false
@@ -3824,7 +5315,7 @@ impl<'a> CodeGenerator<'a> {
                             .collect();
 
                         let envelope = SsaContextEnvelope {
-                            target_abi: host_target_triple().to_string(),
+                            target_abi: self.target_triple.clone(),
                             enclosing_fn: fn_name.to_string(),
                             return_type: if fn_name == "main" { "i32".to_string() } else { "i64".to_string() },
                             next_ssa_idx: *temp_counter,
@@ -3897,6 +5388,9 @@ impl<'a> CodeGenerator<'a> {
 
                     if let Some(src) = existing_src_binding.filter(|b| b.type_hint.starts_with("i8*")) {
                         // Preserving collection/channel/string reference semantics (zero truncation)
+                        if let Some(elem_ty) = scope_tree.collection_elem_types.get(trimmed_expr).cloned() {
+                            scope_tree.collection_elem_types.insert(target.clone(), elem_ty);
+                        }
                         let ptr = if *is_scoped_decl || scope_tree.resolve(target).filter(|b| b.type_hint.starts_with("i8*")).is_none() {
                             let p = format!("%col_ref_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
@@ -4017,6 +5511,28 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, tv.reg, cls, alloca_ptr));
                             }
                             IrType::Ptr => {
+                                let (ptr_hint, nested_elem) = if trimmed_expr.starts_with('[') && trimmed_expr.ends_with(']') {
+                                    let tag = Self::infer_elem_tag_from_expr(trimmed_expr, &tv.ty, scope_tree);
+                                    let sub = tag.strip_prefix("omni_slice:").map(|s| s.to_string());
+                                    ("i8* (omni_slice)".to_string(), sub)
+                                } else if trimmed_expr.starts_with('{') && trimmed_expr.ends_with('}') {
+                                    ("i8* (omni_map)".to_string(), None)
+                                } else {
+                                    let (is_inner_map, sub_opt) = Self::resolve_collection_target_info(trimmed_expr, scope_tree);
+                                    if let Some(sub) = sub_opt {
+                                        let h = if is_inner_map {
+                                            "i8* (omni_map)".to_string()
+                                        } else {
+                                            "i8* (omni_slice)".to_string()
+                                        };
+                                        (h, Some(sub))
+                                    } else {
+                                        ("i8* (string)".to_string(), None)
+                                    }
+                                };
+                                if let Some(sub_ty) = nested_elem {
+                                    scope_tree.collection_elem_types.insert(target.clone(), sub_ty);
+                                }
                                 let alloca_ptr = if let Some(eb) = existing_target.filter(|b| b.type_hint.starts_with("i8*")) {
                                     eb.llvm_ptr
                                 } else {
@@ -4028,7 +5544,7 @@ impl<'a> CodeGenerator<'a> {
                                         SymbolBinding {
                                             name: target.clone(),
                                             llvm_ptr: ptr.clone(),
-                                            type_hint: "i8* (string)".to_string(),
+                                            type_hint: ptr_hint,
                                             is_scoped: *is_scoped_decl,
                                         },
                                     );
@@ -4158,6 +5674,7 @@ impl<'a> CodeGenerator<'a> {
                                     ecosystem_context,
                                     import_chain,
                                     dynamic_declarations,
+                                    is_tail_position && is_last_stmt,
                                 )?;
                                 if !arm_ret {
                                     ir.push_str(&format!("  br label %{}\n", exit_lbl));
@@ -4198,6 +5715,7 @@ impl<'a> CodeGenerator<'a> {
                         ));
                     }
 
+                    let branch_is_tail = is_tail_position && is_last_stmt && else_branch.is_some();
                     // Then branch
                     ir.push_str(&format!("{}:\n", then_lbl));
                     scope_tree.enter_scope();
@@ -4217,6 +5735,7 @@ impl<'a> CodeGenerator<'a> {
                         ecosystem_context,
                         import_chain,
                         dynamic_declarations,
+                        branch_is_tail,
                     )?;
                     if !then_ret {
                         Self::emit_cleanups(ir, &deferred_frees[then_snapshot..], temp_counter, "Then Branch Exit");
@@ -4247,6 +5766,7 @@ impl<'a> CodeGenerator<'a> {
                             ecosystem_context,
                             import_chain,
                             dynamic_declarations,
+                            branch_is_tail,
                         )?;
                         if !else_ret {
                             Self::emit_cleanups(ir, &deferred_frees[else_snapshot..], temp_counter, "Else Branch Exit");
@@ -4300,6 +5820,7 @@ impl<'a> CodeGenerator<'a> {
                         ecosystem_context,
                         import_chain,
                         dynamic_declarations,
+                        false,
                     )?;
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
@@ -4316,7 +5837,7 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("{}:\n", exit_lbl));
                 }
 
-                // 4. For Loop (64-bit counter)
+                // 4. For Loop (64-bit counter OR typed slice value iteration `for val in items:`)
                 Statement::ForLoop { var, count, body } => {
                     let id = *lbl_counter;
                     *lbl_counter += 1;
@@ -4325,6 +5846,170 @@ impl<'a> CodeGenerator<'a> {
                     let body_lbl = format!("for_body_{}", id);
                     let inc_lbl = format!("for_inc_{}", id);
                     let exit_lbl = format!("for_exit_{}", id);
+
+                    let count_trim = count.trim();
+                    let slice_iter_info: Option<(Option<SymbolBinding>, Option<String>)> = if !count_trim.contains("..")
+                        && !count_trim.starts_with("len(")
+                        && !count_trim.starts_with("range(")
+                    {
+                        if let Some(sb) = scope_tree.resolve(count_trim).filter(|b| b.type_hint.contains("omni_slice")).cloned() {
+                            let etag = scope_tree.collection_elem_types.get(count_trim).cloned();
+                            Some((Some(sb), etag))
+                        } else {
+                            let (is_map, etag_opt) = Self::resolve_collection_target_info(count_trim, scope_tree);
+                            if !is_map && etag_opt.is_some() {
+                                Some((None, etag_opt))
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some((sb_opt, elem_tag)) = slice_iter_info {
+                        let slice_ld = if let Some(sb) = sb_opt {
+                            let ld = format!("%for_slice_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, sb.llvm_ptr));
+                            ld
+                        } else {
+                            let stv = self.eval_typed(count_trim, ir, scope_tree, string_constants, temp_counter);
+                            self.coerce_to_ptr(stv, ir, temp_counter)
+                        };
+                        let slice_len = format!("%for_slice_len_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i64 @__omni_slice_len(i8* {})\n", slice_len, slice_ld));
+
+                        let idx_ptr = format!("%for_idx_{}_{}", id, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i64\n", idx_ptr));
+                        ir.push_str(&format!("  store i64 0, i64* {}\n", idx_ptr));
+
+                        scope_tree.enter_scope();
+                        ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+                        ir.push_str(&format!("{}:\n", cond_lbl));
+
+                        let curr_val = format!("%curr_{}", id);
+                        ir.push_str(&format!("  {} = load i64, i64* {}\n", curr_val, idx_ptr));
+                        let cmp_var = format!("%cmp_{}", id);
+                        ir.push_str(&format!("  {} = icmp slt i64 {}, {}\n", cmp_var, curr_val, slice_len));
+                        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", cmp_var, body_lbl, exit_lbl));
+
+                        ir.push_str(&format!("{}:\n", body_lbl));
+                        let raw_elem = format!("%for_raw_elem_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", raw_elem, slice_ld, curr_val));
+                        let elem_tv = Self::unpack_raw_elem_bits(raw_elem, elem_tag.as_deref(), ir, temp_counter);
+                        match elem_tv.ty {
+                            IrType::F64 => {
+                                let vptr = format!("%for_flt_{}_{}", var, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca double\n", vptr));
+                                ir.push_str(&format!("  store double {}, double* {}\n", elem_tv.reg, vptr));
+                                scope_tree.insert(var.clone(), SymbolBinding {
+                                    name: var.clone(),
+                                    llvm_ptr: vptr,
+                                    type_hint: "double".to_string(),
+                                    is_scoped: true,
+                                });
+                            }
+                            IrType::StructPtr(cls) => {
+                                let vptr = format!("%for_sptr_{}_{}", var, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca %struct.{}*\n", vptr, cls));
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, elem_tv.reg, cls, vptr));
+                                scope_tree.insert(var.clone(), SymbolBinding {
+                                    name: var.clone(),
+                                    llvm_ptr: vptr,
+                                    type_hint: format!("%struct.{}*", cls),
+                                    is_scoped: true,
+                                });
+                            }
+                            IrType::Ptr => {
+                                let vptr = format!("%for_ptr_{}_{}", var, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i8*\n", vptr));
+                                ir.push_str(&format!("  store i8* {}, i8** {}\n", elem_tv.reg, vptr));
+                                let th = if let Some(ref et) = elem_tag {
+                                    if let Some(sub) = et.strip_prefix("omni_slice:") {
+                                        scope_tree.collection_elem_types.insert(var.clone(), sub.to_string());
+                                        "i8* (omni_slice)".to_string()
+                                    } else if let Some(sub) = et.strip_prefix("omni_map:") {
+                                        scope_tree.collection_elem_types.insert(var.clone(), sub.to_string());
+                                        "i8* (omni_map)".to_string()
+                                    } else {
+                                        "i8* (string)".to_string()
+                                    }
+                                } else {
+                                    "i8* (string)".to_string()
+                                };
+                                scope_tree.insert(var.clone(), SymbolBinding {
+                                    name: var.clone(),
+                                    llvm_ptr: vptr,
+                                    type_hint: th,
+                                    is_scoped: true,
+                                });
+                            }
+                            _ => {
+                                let v64 = self.coerce_to_i64(elem_tv, ir, temp_counter);
+                                let vptr = format!("%for_var_{}_{}", var, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca i64\n", vptr));
+                                ir.push_str(&format!("  store i64 {}, i64* {}\n", v64, vptr));
+                                scope_tree.insert(var.clone(), SymbolBinding {
+                                    name: var.clone(),
+                                    llvm_ptr: vptr,
+                                    type_hint: "i64".to_string(),
+                                    is_scoped: true,
+                                });
+                            }
+                        }
+
+                        scope_tree.loop_exit_labels.push(exit_lbl.clone());
+                        scope_tree.loop_cond_labels.push(inc_lbl.clone());
+                        scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
+                        let for_snapshot = deferred_frees.len();
+                        let body_ret = self.lower_statements(
+                            body,
+                            ir,
+                            scope_tree,
+                            deferred_frees,
+                            string_constants,
+                            cur_str_idx,
+                            lbl_counter,
+                            temp_counter,
+                            fn_name,
+                            struct_defs,
+                            temp,
+                            ecosystem_context,
+                            import_chain,
+                            dynamic_declarations,
+                            false,
+                        )?;
+                        scope_tree.loop_exit_labels.pop();
+                        scope_tree.loop_cond_labels.pop();
+                        scope_tree.loop_entry_try_depths.pop();
+                        if !body_ret {
+                            Self::emit_cleanups(ir, &deferred_frees[for_snapshot..], temp_counter, "For Iteration Exit");
+                            ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
+                        }
+                        deferred_frees.truncate(for_snapshot);
+
+                        ir.push_str(&format!("{}:\n", inc_lbl));
+                        let load_for_inc = format!("%curr_inc_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = load i64, i64* {}\n", load_for_inc, idx_ptr));
+                        let next_val = format!("%next_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = add i64 {}, 1\n", next_val, load_for_inc));
+                        ir.push_str(&format!("  store i64 {}, i64* {}\n", next_val, idx_ptr));
+
+                        scope_tree.exit_scope();
+                        ir.push_str(&format!("  br label %{}\n\n", cond_lbl));
+                        ir.push_str(&format!("{}:\n", exit_lbl));
+                        continue;
+                    }
 
                     let (start_val, limit_expr) = if let Some((s, e)) = count.split_once("..") {
                         let s_clean = s.trim();
@@ -4390,6 +6075,7 @@ impl<'a> CodeGenerator<'a> {
                         ecosystem_context,
                         import_chain,
                         dynamic_declarations,
+                        false,
                     )?;
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
@@ -4592,11 +6278,15 @@ impl<'a> CodeGenerator<'a> {
                         ir.push_str(&format!("  ; [UMO Inline Alloc: {} bytes]\n", sz));
                         let ptr_name = format!("%{}", target);
                         ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr_name, sz));
+                        let slot_ptr = format!("%umo_slot_{}_{}", target, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i8*\n", slot_ptr));
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", ptr_name, slot_ptr));
                         scope_tree.insert(
                             target.clone(),
                             SymbolBinding {
                                 name: target.clone(),
-                                llvm_ptr: ptr_name,
+                                llvm_ptr: slot_ptr,
                                 type_hint: "i8*".to_string(),
                                 is_scoped: false,
                             },
@@ -4851,6 +6541,8 @@ impl<'a> CodeGenerator<'a> {
                     ));
                     ir.push_str(&format!("  store i8* {}, i8** {}\n", slice_res, ptr));
 
+                    let mut inferred_list_elem: Option<String> = None;
+
                     if elements.len() == 1 && elements[0].contains(" for ") && elements[0].contains(" in ") {
                         let comp_str = &elements[0];
                         if let Some((map_part, rest)) = comp_str.split_once(" for ") {
@@ -4864,6 +6556,7 @@ impl<'a> CodeGenerator<'a> {
                             };
 
                             if let Some(src_binding) = scope_tree.resolve(iter_name).cloned() {
+                                let src_elem_tag = scope_tree.collection_elem_types.get(iter_name).cloned();
                                 let src_ld = format!("%comp_src_ld_{}", *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", src_ld, src_binding.llvm_ptr));
@@ -4898,19 +6591,62 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = call i64 @__omni_slice_get(i8* {}, i64 {})\n", elem_val, src_ld, curr_idx));
 
-                                let param_ptr = format!("%var_{}_{}", var_name, *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca i64\n", param_ptr));
-                                ir.push_str(&format!("  store i64 {}, i64* {}\n", elem_val, param_ptr));
-                                scope_tree.insert(
-                                    var_name.to_string(),
-                                    SymbolBinding {
-                                        name: var_name.to_string(),
-                                        llvm_ptr: param_ptr,
-                                        type_hint: "i64".to_string(),
-                                        is_scoped: true,
-                                    },
-                                );
+                                scope_tree.enter_scope();
+                                let unpacked_src = Self::unpack_raw_elem_bits(elem_val, src_elem_tag.as_deref(), ir, temp_counter);
+                                match unpacked_src.ty {
+                                    IrType::F64 => {
+                                        let param_ptr = format!("%var_flt_{}_{}", var_name, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = alloca double\n", param_ptr));
+                                        ir.push_str(&format!("  store double {}, double* {}\n", unpacked_src.reg, param_ptr));
+                                        scope_tree.insert(var_name.to_string(), SymbolBinding {
+                                            name: var_name.to_string(),
+                                            llvm_ptr: param_ptr,
+                                            type_hint: "double".to_string(),
+                                            is_scoped: true,
+                                        });
+                                    }
+                                    IrType::StructPtr(cls) => {
+                                        let param_ptr = format!("%var_sp_{}_{}", var_name, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = alloca %struct.{}*\n", param_ptr, cls));
+                                        ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, unpacked_src.reg, cls, param_ptr));
+                                        scope_tree.insert(var_name.to_string(), SymbolBinding {
+                                            name: var_name.to_string(),
+                                            llvm_ptr: param_ptr,
+                                            type_hint: format!("%struct.{}*", cls),
+                                            is_scoped: true,
+                                        });
+                                    }
+                                    IrType::Ptr => {
+                                        let param_ptr = format!("%var_ptr_{}_{}", var_name, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = alloca i8*\n", param_ptr));
+                                        ir.push_str(&format!("  store i8* {}, i8** {}\n", unpacked_src.reg, param_ptr));
+                                        scope_tree.insert(var_name.to_string(), SymbolBinding {
+                                            name: var_name.to_string(),
+                                            llvm_ptr: param_ptr,
+                                            type_hint: "i8* (string)".to_string(),
+                                            is_scoped: true,
+                                        });
+                                    }
+                                    _ => {
+                                        let v64 = self.coerce_to_i64(unpacked_src, ir, temp_counter);
+                                        let param_ptr = format!("%var_{}_{}", var_name, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = alloca i64\n", param_ptr));
+                                        ir.push_str(&format!("  store i64 {}, i64* {}\n", v64, param_ptr));
+                                        scope_tree.insert(
+                                            var_name.to_string(),
+                                            SymbolBinding {
+                                                name: var_name.to_string(),
+                                                llvm_ptr: param_ptr,
+                                                type_hint: "i64".to_string(),
+                                                is_scoped: true,
+                                            },
+                                        );
+                                    }
+                                }
 
                                 let append_lbl = format!("comp_append_{}", comp_id);
                                 if let Some(cond) = cond_opt {
@@ -4922,9 +6658,12 @@ impl<'a> CodeGenerator<'a> {
 
                                 ir.push_str(&format!("{}:\n", append_lbl));
                                 let mapped_tv = self.eval_typed(map_expr, ir, scope_tree, string_constants, temp_counter);
+                                inferred_list_elem = Some(Self::infer_elem_tag_from_expr(map_expr, &mapped_tv.ty, scope_tree));
                                 let mapped_64 = self.coerce_to_raw_i64_bits(mapped_tv, ir, temp_counter);
                                 ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", slice_res, mapped_64));
                                 ir.push_str(&format!("  br label %{}\n\n", inc_lbl));
+
+                                scope_tree.exit_scope();
 
                                 ir.push_str(&format!("{}:\n", inc_lbl));
                                 let next_idx = format!("%next_comp_idx_{}", *temp_counter);
@@ -4940,6 +6679,9 @@ impl<'a> CodeGenerator<'a> {
                         for elem in elements {
                             let elem_trim = elem.trim();
                             let elem_tv = self.eval_typed(elem_trim, ir, scope_tree, string_constants, temp_counter);
+                            if inferred_list_elem.is_none() {
+                                inferred_list_elem = Some(Self::infer_elem_tag_from_expr(elem_trim, &elem_tv.ty, scope_tree));
+                            }
                             let val_64 = self.coerce_to_raw_i64_bits(elem_tv, ir, temp_counter);
                             ir.push_str(&format!(
                                 "  call void @__omni_slice_append(i8* {}, i64 {})\n",
@@ -4951,6 +6693,9 @@ impl<'a> CodeGenerator<'a> {
                     // Register RAII cleanup for slice resource
                     deferred_frees.push(CleanupOp::DestroySlice(ptr.clone()));
 
+                    if let Some(etag) = inferred_list_elem {
+                        scope_tree.collection_elem_types.insert(target.clone(), etag);
+                    }
                     scope_tree.insert(
                         target.clone(),
                         SymbolBinding {
@@ -4987,6 +6732,10 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", slice_loaded, binding.llvm_ptr));
 
                             let tv = self.eval_typed(expr, ir, scope_tree, string_constants, temp_counter);
+                            let etag = Self::infer_elem_tag_from_expr(expr, &tv.ty, scope_tree);
+                            if etag != "i64" || !scope_tree.collection_elem_types.contains_key(target) {
+                                scope_tree.collection_elem_types.insert(target.clone(), etag);
+                            }
                             let val_64 = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
                             ir.push_str(&format!(
                                 "  call void @__omni_slice_append(i8* {}, i64 {})\n",
@@ -4996,21 +6745,38 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
 
-                // 10. Polyglot Index Assignment: `items[0] = 99`, `m["key"] = 10`
+                // 10. Polyglot Index Assignment: `items[0] = 99`, `grid[1][0] = 99`, `m["key"] = 10`
                 Statement::IndexSet {
                     target,
                     index_expr,
                     val_expr,
                 } => {
-                    if let Some(binding) = scope_tree.resolve(target).cloned() {
+                    let resolved_col: Option<(String, bool)> = if let Some(binding) = scope_tree.resolve(target).cloned() {
                         let col_loaded = format!("%col_load_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = load i8*, i8** {}\n", col_loaded, binding.llvm_ptr));
+                        Some((col_loaded, binding.type_hint.contains("omni_map")))
+                    } else {
+                        let (is_map, _) = Self::resolve_collection_target_info(target, scope_tree);
+                        let ttv = self.eval_typed(target, ir, scope_tree, string_constants, temp_counter);
+                        if matches!(ttv.ty, IrType::Ptr) {
+                            Some((ttv.reg, is_map))
+                        } else {
+                            None
+                        }
+                    };
 
+                    if let Some((col_loaded, is_map_target)) = resolved_col {
                         let vtv = self.eval_typed(val_expr, ir, scope_tree, string_constants, temp_counter);
+                        let val_etag = Self::infer_elem_tag_from_expr(val_expr, &vtv.ty, scope_tree);
+                        if scope_tree.resolve(target).is_some()
+                            && (val_etag != "i64" || !scope_tree.collection_elem_types.contains_key(target))
+                        {
+                            scope_tree.collection_elem_types.insert(target.clone(), val_etag);
+                        }
                         let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
-                        if binding.type_hint.contains("omni_map") {
+                        if is_map_target {
                             let trimmed_idx = index_expr.trim();
                             if (trimmed_idx.starts_with('"') && trimmed_idx.ends_with('"'))
                                 || (trimmed_idx.starts_with('\'') && trimmed_idx.ends_with('\''))
@@ -5073,8 +6839,12 @@ impl<'a> CodeGenerator<'a> {
                     ));
                     ir.push_str(&format!("  store i8* {}, i8** {}\n", map_res, ptr));
 
+                    let mut inferred_map_elem: Option<String> = None;
                     for (k, v) in entries {
                         let vtv = self.eval_typed(v, ir, scope_tree, string_constants, temp_counter);
+                        if inferred_map_elem.is_none() {
+                            inferred_map_elem = Some(Self::infer_elem_tag_from_expr(v, &vtv.ty, scope_tree));
+                        }
                         let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
                         if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
@@ -5094,6 +6864,9 @@ impl<'a> CodeGenerator<'a> {
                     // Register RAII cleanup for map resource
                     deferred_frees.push(CleanupOp::DestroyMap(ptr.clone()));
 
+                    if let Some(etag) = inferred_map_elem {
+                        scope_tree.collection_elem_types.insert(target.clone(), etag);
+                    }
                     scope_tree.insert(
                         target.clone(),
                         SymbolBinding {
@@ -5184,7 +6957,7 @@ impl<'a> CodeGenerator<'a> {
 
                     let env_ret = if fn_name == "main" { "i32".to_string() } else { "i64".to_string() };
                     let envelope = SsaContextEnvelope {
-                        target_abi: host_target_triple().to_string(),
+                        target_abi: self.target_triple.clone(),
                         enclosing_fn: fn_name.to_string(),
                         return_type: env_ret.clone(),
                         next_ssa_idx: *temp_counter,
@@ -5250,7 +7023,7 @@ impl<'a> CodeGenerator<'a> {
                     };
 
                     let envelope = SsaContextEnvelope {
-                        target_abi: host_target_triple().to_string(),
+                        target_abi: self.target_triple.clone(),
                         enclosing_fn: fn_name.to_string(),
                         return_type: if fn_name == "main" { "i32".to_string() } else { "i64".to_string() },
                         next_ssa_idx: *temp_counter,
@@ -5439,7 +7212,7 @@ impl<'a> CodeGenerator<'a> {
                     }
 
                     // Direct method invocation on known object instance: `obj.method(args...)` or base class `Base.method(...)`
-                    let is_rust_tail_expr = is_last_stmt && fn_name != "main" && !code.trim().ends_with(';');
+                    let is_rust_tail_expr = is_tail_position && is_last_stmt && fn_name != "main" && !code.trim().ends_with(';');
                     if let Some(open) = trimmed_code.find('(') {
                         if trimmed_code.ends_with(')') {
                             let target = trimmed_code[..open].trim();
@@ -5456,18 +7229,30 @@ impl<'a> CodeGenerator<'a> {
                                         continue;
                                     }
                                     if !is_rust_tail_expr {
-                                        if scope_tree.resolve(rec).is_some() || scope_tree.class_fields.contains_key(rec) {
+                                        if scope_tree.resolve(rec).is_some()
+                                            || scope_tree.class_fields.contains_key(rec)
+                                            || scope_tree.c_module_aliases.contains(rec)
+                                            || scope_tree.known_functions.contains(method)
+                                            || rec.contains('(')
+                                        {
                                             let _ = self.eval_typed(trimmed_code, ir, scope_tree, string_constants, temp_counter);
                                             continue;
                                         }
                                     }
                                 }
+                            } else if !is_rust_tail_expr
+                                && (scope_tree.known_functions.contains(target)
+                                    || NATIVE_C_LIB_FNS.contains(&target)
+                                    || NATIVE_C_LIB_I64_FNS.contains(&target))
+                            {
+                                let _ = self.eval_typed(trimmed_code, ir, scope_tree, string_constants, temp_counter);
+                                continue;
                             }
                         }
                     }
 
                     // Implicit return expression in non-main functions (e.g. Rust block `(value ^ salt) + 7` or `h.checksum()`)
-                    if fn_name != "main" && !code.trim().ends_with(';') {
+                    if is_tail_position && is_last_stmt && fn_name != "main" && !code.trim().ends_with(';') {
                         if Self::split_binary_expr(code).is_some()
                             || scope_tree.resolve(code).is_some()
                             || parse_polyglot_i64(code).is_some()
@@ -5499,7 +7284,7 @@ impl<'a> CodeGenerator<'a> {
 
                     let env_ret = if fn_name == "main" { "i32".to_string() } else { "i64".to_string() };
                     let envelope = SsaContextEnvelope {
-                        target_abi: host_target_triple().to_string(),
+                        target_abi: self.target_triple.clone(),
                         enclosing_fn: fn_name.to_string(),
                         return_type: env_ret.clone(),
                         next_ssa_idx: *temp_counter,
@@ -5539,9 +7324,11 @@ impl<'a> CodeGenerator<'a> {
                     let mut resource_cls = None;
                     let mut resource_raw = None;
 
-                    if let Some(open) = trimmed_expr.find('(') {
-                        if trimmed_expr.ends_with(')') {
-                            let cls_cand = trimmed_expr[..open].trim();
+                    let with_cand_expr = trimmed_expr.strip_prefix("new ").unwrap_or(trimmed_expr).trim();
+                    if let Some(open) = with_cand_expr.find('(') {
+                        if with_cand_expr.ends_with(')') {
+                            let raw_cls_cand = with_cand_expr[..open].trim();
+                            let cls_cand = raw_cls_cand.split('<').next().unwrap_or(raw_cls_cand).trim();
                             if scope_tree.class_fields.contains_key(cls_cand) {
                                 let cls_name = cls_cand.to_string();
                                 let inst_alloc = format!("%inst_alloc_with_{}", *temp_counter);
@@ -5552,37 +7339,34 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_alloc));
 
-                                let inner = &trimmed_expr[open + 1..trimmed_expr.len() - 1];
+                                let inner = &with_cand_expr[open + 1..with_cand_expr.len() - 1];
                                 let raw_args: Vec<String> = if inner.is_empty() {
                                     Vec::new()
                                 } else {
                                     omni_parser::OmniParser::split_respecting_quotes(inner, ',')
                                 };
 
-                                let mut arg_regs = Vec::new();
-                                for a in &raw_args {
-                                    let atv = self.eval_typed(Self::strip_kwarg_prefix(a.trim()), ir, scope_tree, string_constants, temp_counter);
-                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                                }
-                                while arg_regs.len() < 5 {
-                                    arg_regs.push("0".to_string());
-                                }
-
-                                let def_init = scope_tree.resolve_defining_class(&cls_name, "__init__");
-                                let init_ret = format!("%with_init_ret_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!(
-                                    "  {} = call i64 @__omni_method_{}___init__(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                    init_ret, def_init, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                                ));
+                                self.init_struct_instance(
+                                    &cls_name,
+                                    &raw_inst,
+                                    &inst_alloc,
+                                    "__init__",
+                                    &raw_args,
+                                    ir,
+                                    scope_tree,
+                                    string_constants,
+                                    temp_counter,
+                                );
 
                                 let def_enter = scope_tree.resolve_defining_class(&cls_name, "__enter__");
-                                let enter_ret = format!("%with_enter_ret_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!(
-                                    "  {} = call i64 @__omni_method_{}___enter__(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
-                                    enter_ret, def_enter, raw_inst
-                                ));
+                                if scope_tree.method_defining_class.contains_key(&(def_enter.clone(), "__enter__".to_string())) {
+                                    let enter_ret = format!("%with_enter_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_method_{}___enter__(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                                        enter_ret, def_enter, raw_inst
+                                    ));
+                                }
 
                                 if let Some(ref t) = var_alias {
                                     let target_ptr = format!("%var_{}_{}", t, *temp_counter);
@@ -5601,6 +7385,42 @@ impl<'a> CodeGenerator<'a> {
                                 resource_raw = Some(raw_inst);
                             }
                         }
+                    } else if let Some(b) = scope_tree.resolve(with_cand_expr).cloned() {
+                        if b.type_hint.starts_with("%struct.") {
+                            let cls_name = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*').to_string();
+                            let inst_ld = format!("%with_var_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", inst_ld, cls_name, cls_name, b.llvm_ptr));
+                            let raw_inst = format!("%raw_with_var_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
+
+                            let def_enter = scope_tree.resolve_defining_class(&cls_name, "__enter__");
+                            if scope_tree.method_defining_class.contains_key(&(def_enter.clone(), "__enter__".to_string())) {
+                                let enter_ret = format!("%with_enter_ret_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = call i64 @__omni_method_{}___enter__(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                                    enter_ret, def_enter, raw_inst
+                                ));
+                            }
+
+                            if let Some(ref t) = var_alias {
+                                let target_ptr = format!("%var_{}_{}", t, *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = alloca %struct.{}*\n", target_ptr, cls_name));
+                                ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls_name, inst_ld, cls_name, target_ptr));
+                                scope_tree.insert(t.clone(), SymbolBinding {
+                                    name: t.clone(),
+                                    llvm_ptr: target_ptr,
+                                    type_hint: format!("%struct.{}*", cls_name),
+                                    is_scoped: true,
+                                });
+                            }
+
+                            resource_cls = Some(cls_name);
+                            resource_raw = Some(raw_inst);
+                        }
                     }
 
                     self.lower_statements(
@@ -5618,6 +7438,7 @@ impl<'a> CodeGenerator<'a> {
                         ecosystem_context,
                         import_chain,
                         dynamic_declarations,
+                        false,
                     )?;
 
                     if let (Some(cls_name), Some(raw_inst)) = (resource_cls, resource_raw) {
@@ -5942,7 +7763,17 @@ impl<'a> CodeGenerator<'a> {
 
                     let sj_reg = format!("%sj_res_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = call i32 @_setjmp(i8* {}) returns_twice\n", sj_reg, jb_reg));
+                    if self.target_triple.contains("windows") {
+                        ir.push_str(&format!(
+                            "  {} = call i32 @_setjmp(i8* {}, i8* null) returns_twice\n",
+                            sj_reg, jb_reg
+                        ));
+                    } else {
+                        ir.push_str(&format!(
+                            "  {} = call i32 @_setjmp(i8* {}) returns_twice\n",
+                            sj_reg, jb_reg
+                        ));
+                    }
 
                     let is_zero = format!("%sj_ok_{}", *temp_counter);
                     *temp_counter += 1;
@@ -5973,6 +7804,7 @@ impl<'a> CodeGenerator<'a> {
                         ecosystem_context,
                         import_chain,
                         dynamic_declarations,
+                        false,
                     )?;
 
                     scope_tree.active_try_depth -= 1;
@@ -6059,6 +7891,7 @@ impl<'a> CodeGenerator<'a> {
                                 ecosystem_context,
                                 import_chain,
                                 dynamic_declarations,
+                                false,
                             )?;
                             scope_tree.exit_scope();
                             if !catch_ret {
@@ -6093,6 +7926,7 @@ impl<'a> CodeGenerator<'a> {
                             ecosystem_context,
                             import_chain,
                             dynamic_declarations,
+                            false,
                         )?;
                         scope_tree.exit_scope();
                         if !fin_ret {
@@ -6126,6 +7960,7 @@ impl<'a> CodeGenerator<'a> {
                             ecosystem_context,
                             import_chain,
                             dynamic_declarations,
+                            false,
                         )?;
                         scope_tree.exit_scope();
                         deferred_frees.truncate(fin_mark);
@@ -6189,6 +8024,7 @@ impl<'a> CodeGenerator<'a> {
     fn infer_expr_return_ir_type(
         expr: &str,
         class_fields: &HashMap<String, HashMap<String, usize>>,
+        self_field_types: Option<&HashMap<String, String>>,
     ) -> Option<IrType> {
         let e = expr.trim();
         if e.is_empty() || is_null_literal(e) {
@@ -6217,12 +8053,52 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
         }
+        if let Ok(ast) = OmniParser::parse_expr(e) {
+            match ast.node {
+                ExprAst::FloatLit(_) => return Some(IrType::F64),
+                ExprAst::StrLit(_) | ExprAst::ListLit(_) | ExprAst::MapLit(_) => return Some(IrType::Ptr),
+                ExprAst::Unary { op, rhs } if op == "-" || op == "+" => {
+                    return Self::infer_expr_return_ir_type(rhs.slice(e), class_fields, self_field_types);
+                }
+                ExprAst::Member { target, field } => {
+                    let rec = target.slice(e);
+                    if (rec == "self" || rec == "this" || rec == "cls")
+                        && self_field_types.is_some()
+                    {
+                        if let Some(ft) = self_field_types.unwrap().get(&field) {
+                            if is_float_type_hint(ft) {
+                                return Some(IrType::F64);
+                            } else if ft.starts_with("%struct.") {
+                                let c = ft.trim_start_matches("%struct.").trim_end_matches('*');
+                                return Some(IrType::StructPtr(c.to_string()));
+                            } else if ft.starts_with("i8*") || ft.starts_with("omni_slice") || ft.starts_with("omni_map") {
+                                return Some(IrType::Ptr);
+                            }
+                        }
+                    }
+                }
+                ExprAst::Binary { op, lhs, rhs } => {
+                    if matches!(op.as_str(), "+" | "-" | "*" | "/" | "**" | "%") {
+                        let lt = Self::infer_expr_return_ir_type(lhs.slice(e), class_fields, self_field_types);
+                        let rt = Self::infer_expr_return_ir_type(rhs.slice(e), class_fields, self_field_types);
+                        if lt == Some(IrType::F64) || rt == Some(IrType::F64) {
+                            return Some(IrType::F64);
+                        }
+                        if op == "+" && (lt == Some(IrType::Ptr) || rt == Some(IrType::Ptr)) {
+                            return Some(IrType::Ptr);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         Some(IrType::I64)
     }
 
     fn infer_return_signature_recursive(
         stmts: &[Statement],
         class_fields: &HashMap<String, HashMap<String, usize>>,
+        self_field_types: Option<&HashMap<String, String>>,
         scalar_acc: &mut Option<IrType>,
         tuple_acc: &mut Option<Vec<Option<IrType>>>,
     ) {
@@ -6252,41 +8128,41 @@ impl<'a> CodeGenerator<'a> {
                             if idx >= slots.len() {
                                 break;
                             }
-                            if let Some(inferred) = Self::infer_expr_return_ir_type(p, class_fields) {
+                            if let Some(inferred) = Self::infer_expr_return_ir_type(p, class_fields, self_field_types) {
                                 if slots[idx].is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
                                     slots[idx] = Some(inferred);
                                 }
                             }
                         }
-                    } else if let Some(inferred) = Self::infer_expr_return_ir_type(unwrapped, class_fields) {
+                    } else if let Some(inferred) = Self::infer_expr_return_ir_type(unwrapped, class_fields, self_field_types) {
                         if scalar_acc.is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
                             *scalar_acc = Some(inferred);
                         }
                     }
                 }
                 Statement::If { then_branch, else_branch, .. } => {
-                    Self::infer_return_signature_recursive(then_branch, class_fields, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_recursive(then_branch, class_fields, self_field_types, scalar_acc, tuple_acc);
                     if let Some(eb) = else_branch {
-                        Self::infer_return_signature_recursive(eb, class_fields, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_recursive(eb, class_fields, self_field_types, scalar_acc, tuple_acc);
                     }
                 }
                 Statement::WhileLoop { body, .. }
                 | Statement::ForLoop { body, .. }
                 | Statement::WithContext { body, .. } => {
-                    Self::infer_return_signature_recursive(body, class_fields, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_recursive(body, class_fields, self_field_types, scalar_acc, tuple_acc);
                 }
                 Statement::TryCatch { try_block, catch_clauses, finally_block } => {
-                    Self::infer_return_signature_recursive(try_block, class_fields, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_recursive(try_block, class_fields, self_field_types, scalar_acc, tuple_acc);
                     for c in catch_clauses {
-                        Self::infer_return_signature_recursive(&c.body, class_fields, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_recursive(&c.body, class_fields, self_field_types, scalar_acc, tuple_acc);
                     }
                     if let Some(fb) = finally_block {
-                        Self::infer_return_signature_recursive(fb, class_fields, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_recursive(fb, class_fields, self_field_types, scalar_acc, tuple_acc);
                     }
                 }
                 Statement::Match { arms, .. } => {
                     for arm in arms {
-                        Self::infer_return_signature_recursive(&arm.body, class_fields, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_recursive(&arm.body, class_fields, self_field_types, scalar_acc, tuple_acc);
                     }
                 }
                 _ => {}
@@ -6478,6 +8354,15 @@ impl<'a> CodeGenerator<'a> {
             self.scan_strings_recursive(&func.body, &mut string_constants, &mut str_counter);
         }
         for cls in &module.structs_and_classes {
+            for f in &cls.fields {
+                if let Some(ref dv) = f.default_val {
+                    let dt = dv.trim();
+                    if (dt.starts_with('"') && dt.ends_with('"')) || (dt.starts_with('\'') && dt.ends_with('\'')) {
+                        let inner = &dt[1..dt.len() - 1];
+                        Self::intern_string(&mut string_constants, &mut str_counter, inner);
+                    }
+                }
+            }
             for method in &cls.methods {
                 self.scan_strings_recursive(&method.body, &mut string_constants, &mut str_counter);
             }
@@ -6487,10 +8372,17 @@ impl<'a> CodeGenerator<'a> {
         // Extract ecosystem and import context
         let mut ecosystem_hints = Vec::new();
         let mut import_chain = Vec::new();
+        let mut c_module_aliases_set = HashSet::new();
 
         for imp in &module.imports {
             match imp {
                 omni_preamble::ImportDirective::Ecosystem { ecosystem, module, alias } => {
+                    if ecosystem == "c" || ecosystem == "cpp" {
+                        c_module_aliases_set.insert(module.clone());
+                        if let Some(a) = alias {
+                            c_module_aliases_set.insert(a.clone());
+                        }
+                    }
                     let desc = match alias {
                         Some(a) => format!("{} (module: {}, alias: {})", ecosystem, module, a),
                         None => format!("{} (module: {})", ecosystem, module),
@@ -6518,6 +8410,10 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
+        for spine in &self.drilled_spines {
+            import_chain.push(format!("__OMNI_DRILLED_MECH__:{}", spine));
+        }
+
         let ecosystem_context = if ecosystem_hints.is_empty() {
             None
         } else {
@@ -6531,7 +8427,7 @@ impl<'a> CodeGenerator<'a> {
             cls_name: &str,
             class_map: &HashMap<String, &omni_parser::ClassDef>,
             visited: &mut HashSet<String>,
-        ) -> Vec<(String, Option<String>)> {
+        ) -> Vec<(String, Option<String>, Option<String>)> {
             if visited.contains(cls_name) {
                 return Vec::new();
             }
@@ -6541,22 +8437,116 @@ impl<'a> CodeGenerator<'a> {
                 for base in &cls.base_classes {
                     let base_fields = collect_inherited_fields(base, class_map, visited);
                     for bf in base_fields {
-                        if !result.iter().any(|(n, _)| n == &bf.0) {
+                        if !result.iter().any(|(n, _, _)| n == &bf.0) {
                             result.push(bf);
                         }
                     }
                 }
                 for f in &cls.fields {
-                    if !result.iter().any(|(n, _)| n == &f.name) {
-                        result.push((f.name.clone(), f.type_hint.clone()));
+                    if !result.iter().any(|(n, _, _)| n == &f.name) {
+                        result.push((f.name.clone(), f.type_hint.clone(), f.default_val.clone()));
                     }
                 }
             }
             result
         }
 
+        fn scan_unannotated_self_fields(
+            stmts: &[Statement],
+            known_class_names: &HashSet<String>,
+            param_types: &HashMap<String, String>,
+            field_names: &mut Vec<String>,
+            f_types: &mut HashMap<String, String>,
+        ) {
+            for s in stmts {
+                match s {
+                    Statement::Assign { target, expr, .. } => {
+                        let maybe_fld = target
+                            .strip_prefix("self.")
+                            .or_else(|| target.strip_prefix("this."))
+                            .map(|f| f.trim());
+                        if let Some(fld) = maybe_fld {
+                            if !fld.is_empty() && !fld.contains('.') && !fld.contains('[') {
+                                if !field_names.iter().any(|n| n == fld) {
+                                    field_names.push(fld.to_string());
+                                }
+                                let needs_infer = f_types
+                                    .get(fld)
+                                    .map(|existing| existing == "i64" || existing == "any")
+                                    .unwrap_or(true);
+                                if needs_infer {
+                                    let rhs = expr.trim();
+                                    let inferred = if parse_polyglot_f64(rhs).is_some()
+                                        || FLOAT_CAST_PREFIXES.iter().any(|p| rhs.starts_with(p) && rhs.ends_with(')'))
+                                    {
+                                        Some("f64".to_string())
+                                    } else if (rhs.starts_with('"') && rhs.ends_with('"'))
+                                        || (rhs.starts_with('\'') && rhs.ends_with('\''))
+                                        || rhs.starts_with("f\"")
+                                        || STRING_CAST_PREFIXES.iter().any(|p| rhs.starts_with(p) && rhs.ends_with(')'))
+                                    {
+                                        Some("i8* (string)".to_string())
+                                    } else if rhs.starts_with('[') && rhs.ends_with(']') {
+                                        Some("omni_slice:i64".to_string())
+                                    } else if rhs.starts_with('{') && rhs.ends_with('}') {
+                                        Some("omni_map:i64".to_string())
+                                    } else if let Some(pth) = param_types.get(rhs) {
+                                        if is_float_type_hint(pth) {
+                                            Some("f64".to_string())
+                                        } else if is_string_type_hint(pth) || pth == "str" {
+                                            Some("i8* (string)".to_string())
+                                        } else if known_class_names.contains(pth) {
+                                            Some(format!("%struct.{}*", pth))
+                                        } else {
+                                            None
+                                        }
+                                    } else if let Some(open) = rhs.find('(') {
+                                        let head = rhs[..open].trim().trim_start_matches("new ").trim();
+                                        if known_class_names.contains(head) {
+                                            Some(format!("%struct.{}*", head))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(ft) = inferred {
+                                        f_types.insert(fld.to_string(), ft);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Statement::If { then_branch, else_branch, .. } => {
+                        scan_unannotated_self_fields(then_branch, known_class_names, param_types, field_names, f_types);
+                        if let Some(eb) = else_branch {
+                            scan_unannotated_self_fields(eb, known_class_names, param_types, field_names, f_types);
+                        }
+                    }
+                    Statement::WhileLoop { body, .. }
+                    | Statement::ForLoop { body, .. }
+                    | Statement::WithContext { body, .. } => {
+                        scan_unannotated_self_fields(body, known_class_names, param_types, field_names, f_types);
+                    }
+                    Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                        scan_unannotated_self_fields(try_block, known_class_names, param_types, field_names, f_types);
+                        for c in catch_clauses {
+                            scan_unannotated_self_fields(&c.body, known_class_names, param_types, field_names, f_types);
+                        }
+                        if let Some(fb) = finally_block {
+                            scan_unannotated_self_fields(fb, known_class_names, param_types, field_names, f_types);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let known_class_names: HashSet<String> = class_map.keys().cloned().collect();
         let mut class_fields_map: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let mut class_field_types_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut class_field_order_map: HashMap<String, Vec<(String, Option<String>, Option<String>)>> = HashMap::new();
+        let mut class_decorators_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut struct_defs = Vec::new();
         let mut struct_defs_ir = String::new();
 
@@ -6564,35 +8554,65 @@ impl<'a> CodeGenerator<'a> {
             let all_fields = collect_inherited_fields(&cls.name, &class_map, &mut HashSet::new());
             let mut field_names: Vec<String> = Vec::new();
             let mut f_types: HashMap<String, String> = HashMap::new();
-            for (f_name, th) in all_fields {
+            let mut f_defaults: HashMap<String, Option<String>> = HashMap::new();
+            for (f_name, th, dv) in all_fields {
                 if !field_names.contains(&f_name) {
                     field_names.push(f_name.clone());
                 }
                 if let Some(t) = th {
-                    f_types.insert(f_name, t);
+                    f_types.insert(f_name.clone(), t);
                 }
+                f_defaults.insert(f_name, dv);
+            }
+            for m in &cls.methods {
+                let mut p_types = HashMap::new();
+                for p in &m.params {
+                    if let Some(ref th) = p.type_hint {
+                        p_types.insert(p.name.clone(), th.trim().to_string());
+                    }
+                }
+                scan_unannotated_self_fields(&m.body, &known_class_names, &p_types, &mut field_names, &mut f_types);
             }
             if field_names.is_empty() {
                 field_names.push("_unused".to_string());
             }
 
             let mut f_map = HashMap::new();
+            let mut ordered_vec = Vec::new();
+            let mut field_desc_parts = Vec::new();
             for (idx, name) in field_names.iter().enumerate() {
                 f_map.insert(name.clone(), idx);
+                let th_opt = f_types.get(name).cloned();
+                let dv_opt = f_defaults.get(name).cloned().flatten();
+                field_desc_parts.push(format!("{}: {} ({})", idx, name, th_opt.as_deref().unwrap_or("i64")));
+                ordered_vec.push((name.clone(), th_opt, dv_opt));
             }
             class_fields_map.insert(cls.name.clone(), f_map);
             class_field_types_map.insert(cls.name.clone(), f_types);
+            class_field_order_map.insert(cls.name.clone(), ordered_vec);
+            class_decorators_map.insert(cls.name.clone(), cls.decorators.clone());
 
             let type_list = vec!["i64"; field_names.len()].join(", ");
             let s_def = format!("%struct.{} = type {{ {} }}", cls.name, type_list);
+            let s_def_annotated = if cls.decorators.is_empty() {
+                format!("{} ; fields: [{}]", s_def, field_desc_parts.join(", "))
+            } else {
+                format!(
+                    "{} ; decorators: [{}] ; fields: [{}]",
+                    s_def,
+                    cls.decorators.join(", "),
+                    field_desc_parts.join(", ")
+                )
+            };
             struct_defs_ir.push_str(&format!("; Struct Layout: {} ({} fields: {})\n", cls.name, field_names.len(), field_names.join(", ")));
             struct_defs_ir.push_str(&format!("{}\n\n", s_def));
-            struct_defs.push(s_def);
+            struct_defs.push(s_def_annotated);
         }
 
         let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
         let mut method_return_types_map: HashMap<(String, String), IrType> = HashMap::new();
         for cls in &module.structs_and_classes {
+            let self_ft_opt = class_field_types_map.get(&cls.name);
             for m in &cls.methods {
                 method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
                 let m_ret = if let Some(ref rt) = m.return_type {
@@ -6600,7 +8620,7 @@ impl<'a> CodeGenerator<'a> {
                 } else {
                     let mut sc = None;
                     let mut tp = None;
-                    Self::infer_return_signature_recursive(&m.body, &class_fields_map, &mut sc, &mut tp);
+                    Self::infer_return_signature_recursive(&m.body, &class_fields_map, self_ft_opt, &mut sc, &mut tp);
                     if tp.is_some() {
                         IrType::Ptr
                     } else {
@@ -6666,7 +8686,7 @@ impl<'a> CodeGenerator<'a> {
             } else {
                 let mut sc = None;
                 let mut tp = None;
-                Self::infer_return_signature_recursive(&f.body, &class_fields_map, &mut sc, &mut tp);
+                Self::infer_return_signature_recursive(&f.body, &class_fields_map, None, &mut sc, &mut tp);
                 if let Some(slots) = tp {
                     let resolved: Vec<IrType> = slots
                         .into_iter()
@@ -6754,6 +8774,9 @@ impl<'a> CodeGenerator<'a> {
                 let mut scope_tree = ScopeTree::new();
                 scope_tree.class_fields = class_fields_map.clone();
                 scope_tree.class_field_types = class_field_types_map.clone();
+                scope_tree.class_field_order = class_field_order_map.clone();
+                scope_tree.class_decorators = class_decorators_map.clone();
+                scope_tree.c_module_aliases = c_module_aliases_set.clone();
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
                 scope_tree.method_defining_class = method_defining_map.clone();
@@ -6820,6 +8843,18 @@ impl<'a> CodeGenerator<'a> {
                     );
                 }
 
+                let method_fn_name = format!("{}_{}", cls.name, method.name);
+                *self.active_ai_ctx.borrow_mut() = Some(ActiveFnAiContext {
+                    enclosing_fn: method_fn_name.clone(),
+                    return_type: "i64".to_string(),
+                    struct_defs: struct_defs.clone(),
+                    temp,
+                    ecosystem_context: ecosystem_context.clone(),
+                    import_chain: import_chain.clone(),
+                    dynamic_declarations: HashSet::new(),
+                    escalation_depth: 0,
+                });
+
                 let lower_res = self.lower_statements(
                     &method.body,
                     &mut functions_ir,
@@ -6829,13 +8864,24 @@ impl<'a> CodeGenerator<'a> {
                     &mut cur_str_idx,
                     &mut lbl_counter,
                     &mut temp_counter,
-                    &format!("{}_{}", cls.name, method.name),
+                    &method_fn_name,
                     &struct_defs,
                     temp,
                     ecosystem_context.as_deref(),
                     &import_chain,
                     &mut dynamic_declarations,
+                    true,
                 );
+
+                if let Some(ctx) = self.active_ai_ctx.borrow_mut().take() {
+                    dynamic_declarations.extend(ctx.dynamic_declarations);
+                }
+                for (cname, fmap) in &scope_tree.class_field_types {
+                    let entry = class_field_types_map.entry(cname.clone()).or_default();
+                    for (k, v) in fmap {
+                        entry.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
 
                 match lower_res {
                     Ok(custom_ret) => {
@@ -6905,6 +8951,9 @@ impl<'a> CodeGenerator<'a> {
             let mut scope_tree = ScopeTree::new();
             scope_tree.class_fields = class_fields_map.clone();
             scope_tree.class_field_types = class_field_types_map.clone();
+            scope_tree.class_field_order = class_field_order_map.clone();
+            scope_tree.class_decorators = class_decorators_map.clone();
+            scope_tree.c_module_aliases = c_module_aliases_set.clone();
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
             scope_tree.method_defining_class = method_defining_map.clone();
@@ -7000,6 +9049,17 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
 
+            *self.active_ai_ctx.borrow_mut() = Some(ActiveFnAiContext {
+                enclosing_fn: func.name.clone(),
+                return_type: if func.name == "main" { "i32".to_string() } else { "i64".to_string() },
+                struct_defs: struct_defs.clone(),
+                temp,
+                ecosystem_context: ecosystem_context.clone(),
+                import_chain: import_chain.clone(),
+                dynamic_declarations: HashSet::new(),
+                escalation_depth: 0,
+            });
+
             let lower_res = self.lower_statements(
                 &func.body,
                 &mut functions_ir,
@@ -7015,7 +9075,12 @@ impl<'a> CodeGenerator<'a> {
                 ecosystem_context.as_deref(),
                 &import_chain,
                 &mut dynamic_declarations,
+                true,
             );
+
+            if let Some(ctx) = self.active_ai_ctx.borrow_mut().take() {
+                dynamic_declarations.extend(ctx.dynamic_declarations);
+            }
 
             match lower_res {
                 Ok(custom_ret) => {
@@ -7064,10 +9129,17 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // Harvest any foreign C or un-emitted method/function symbols directly called in functions_ir
-        let runtime_headers = omni_runtime::runtime_llvm_declarations();
+        let runtime_headers = omni_runtime::runtime_llvm_declarations_for_triple(&self.target_triple);
         let call_c_re = Regex::new(r#"call\s+[a-zA-Z0-9_*]+\s+@([a-zA-Z0-9_]+)\("#).unwrap();
         let mut missing_omni_stubs = Vec::new();
         let mut seen_called = HashSet::new();
+
+        let mut synth_scope = ScopeTree::new();
+        synth_scope.class_fields = class_fields_map.clone();
+        synth_scope.class_field_types = class_field_types_map.clone();
+        synth_scope.class_field_order = class_field_order_map.clone();
+        synth_scope.class_decorators = class_decorators_map.clone();
+        synth_scope.c_module_aliases = c_module_aliases_set.clone();
 
         for cap in call_c_re.captures_iter(&functions_ir) {
             let sym = cap[1].to_string();
@@ -7078,10 +9150,40 @@ impl<'a> CodeGenerator<'a> {
                 if !functions_ir.contains(&format!("define i64 @{}(", sym))
                     && !functions_ir.contains(&format!("define i32 @{}(", sym))
                 {
-                    missing_omni_stubs.push(format!(
-                        "define i64 @{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
-                        sym
-                    ));
+                    let rest = &sym["__omni_method_".len()..];
+                    let mut matched_cls: Option<(&str, &str)> = None;
+                    for cname in class_map.keys() {
+                        let prefix = format!("{}_", cname);
+                        if let Some(mname) = rest.strip_prefix(&prefix) {
+                            if matched_cls
+                                .map(|(prev, _)| cname.len() > prev.len())
+                                .unwrap_or(true)
+                            {
+                                matched_cls = Some((cname.as_str(), mname));
+                            }
+                        }
+                    }
+                    let synthesized_opt = matched_cls.and_then(|(cname, mname)| {
+                        self.synthesize_unresolved_struct_method(
+                            &sym,
+                            cname,
+                            mname,
+                            &synth_scope,
+                            &struct_defs,
+                            ecosystem_context.as_deref(),
+                            &import_chain,
+                            temp,
+                            &mut temp_counter,
+                        )
+                    });
+                    if let Some(synth_fn) = synthesized_opt {
+                        missing_omni_stubs.push(format!("{}\n", Self::hoist_allocas(&synth_fn)));
+                    } else {
+                        missing_omni_stubs.push(format!(
+                            "define i64 @{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
+                            sym
+                        ));
+                    }
                 }
             } else if sym.starts_with("__omni_fn_") {
                 if !functions_ir.contains(&format!("define i64 @{}(", sym))
@@ -7106,6 +9208,7 @@ impl<'a> CodeGenerator<'a> {
                 && !known_functions_set.contains(&sym)
                 && !functions_ir.contains(&format!("define i64 @{}(", sym))
                 && !functions_ir.contains(&format!("define i32 @{}(", sym))
+                && !dynamic_declarations.iter().any(|d| d.contains(&format!("@{}(", sym)))
             {
                 if NATIVE_C_LIB_I64_FNS.contains(&sym.as_str()) {
                     dynamic_declarations.insert(format!("declare i64 @{}(...)", sym));
@@ -7154,7 +9257,7 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("'\nsource_filename = \"");
         ir.push_str(&module.name);
         ir.push_str(".omni\"\ntarget triple = \"");
-        ir.push_str(host_target_triple());
+        ir.push_str(&self.target_triple);
         ir.push_str("\"\n\n");
 
         // Runtime headers & extern declarations
@@ -7162,7 +9265,7 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("declare i8* @malloc(i64)\n");
         ir.push_str("declare void @free(i8*)\n");
         ir.push_str("declare i32 @printf(i8*, ...)\n");
-        ir.push_str(omni_runtime::runtime_llvm_declarations());
+        ir.push_str(omni_runtime::runtime_llvm_declarations_for_triple(&self.target_triple));
         ir.push_str("\n");
 
         if !dynamic_declarations.is_empty() {
@@ -7335,11 +9438,67 @@ def main():
         assert!(ir.contains("@__omni_try_push"));
         assert!(ir.contains("@_setjmp"));
         assert!(ir.contains("@__omni_throw"));
-        assert!(ir.contains("@__omni_catch_matches"));
+        assert!(ir.contains("declare i32 @__omni_catch_matches(i8*)"));
+        assert!(ir.contains("call i32 @__omni_catch_matches"));
 
         let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
         verifier
             .verify_ir(&ir)
             .expect("LLVM IR verification failed for 64-bit, double, setjmp unwind, and multi-return");
+    }
+
+    #[test]
+    fn test_codegen_pratt_element_types_and_unannotated_fields_verify() {
+        let src = r#"
+class Amplifier:
+    def __init__(self):
+        self.gain = 2.5
+
+    def scale(self, x):
+        return x * self.gain
+
+fn bump(v: i64) -> i64 {
+    return v + 1
+}
+
+def main():
+    bit_prec = 1 | 2 & 0
+    pow_mul = 2 * 3 ** 2
+    pow_assoc = 2 ** 3 ** 2
+    n = 4; dyn_pow = 3 ** n
+    dual_calls = bump(4) + bump(9)
+
+    floats = [1.5, 2.5, 3.0]
+    f_sum = 0.0
+    for x in floats:
+        f_sum = f_sum + x
+
+    scores = {"pi": 3.25, "e": 2.75}
+    m_sum = scores["pi"] + scores["e"]
+
+    grid = [[10, 20], [30, 40]]
+    grid[1][0] = 35
+    grid_pick = grid[1][0] + grid[0][1]
+
+    amp = new Amplifier<Double>()
+    scaled = amp.scale(4)
+
+    print(bit_prec, pow_mul, pow_assoc, dyn_pow, dual_calls, f_sum, m_sum, grid_pick, scaled)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("pratt_elem_codegen_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        assert!(ir.contains("@__omni_ipow64"));
+        assert!(ir.contains("bitcast i64") && ir.contains("to double"));
+        assert!(ir.contains("fadd double"));
+
+        let verifier = LlvmVerifier::new().expect("Failed to initialize LlvmVerifier");
+        verifier
+            .verify_ir(&ir)
+            .expect("LLVM IR verification failed for Pratt + element types + unannotated fields");
     }
 }

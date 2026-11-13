@@ -4,7 +4,19 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+typedef SRWLOCK omni_mutex_t;
+typedef CONDITION_VARIABLE omni_cond_t;
+#else
 #include <pthread.h>
+typedef pthread_mutex_t omni_mutex_t;
+typedef pthread_cond_t omni_cond_t;
+#endif
 
 typedef struct {
     uint8_t* buffer;
@@ -14,9 +26,9 @@ typedef struct {
     size_t tail;
     size_t count;
     bool closed;
-    pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
+    omni_mutex_t lock;
+    omni_cond_t not_empty;
+    omni_cond_t not_full;
 } OmniChan;
 
 OmniChan* __omni_chan_make(size_t capacity, size_t elem_size);

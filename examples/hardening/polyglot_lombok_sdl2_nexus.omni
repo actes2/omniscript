@@ -1,0 +1,339 @@
+#!/usr/bin/env omni
+#![allow(unused)]
+; Lisp / Assembly header comment
+% Erlang / MATLAB header comment
+#= Julia nested #= inner =# header comment =#
+{- Haskell nested {- inner -} header comment -}
+(* OCaml / F# nested (* inner *) header comment *)
+
+// ============================================================================
+// 7 Foreign Package Ecosystems Resolved, Introspected & Linked in One Binary
+// ============================================================================
+import 'java' lombok.Data
+import 'java' lombok.AllArgsConstructor
+import 'java' lombok.With
+import 'c' SDL2 as sdl
+import 'python' varint
+import 'node' crc-32 as crc32
+import 'rust' adler
+import 'go' github.com/cespare/xxhash as xxhash
+import 'csharp' System.Security.Cryptography
+
+// ============================================================================
+// 1. Java + Lombok (@Data @AllArgsConstructor @With) + Python RAII Context Hooks
+//    Zero handwritten constructors, getters, setters, or fluent with*() methods!
+// ============================================================================
+@Data
+@AllArgsConstructor
+@With
+public class TelemetryCanvas {
+    String title;
+    int width;
+    int height;
+    int bg_r;
+    int bg_g;
+    int bg_b;
+    int accent;
+    double wave_hz;
+    int enter_hits;
+    int exit_hits;
+
+    def __enter__(self):
+        self.enter_hits = self.enter_hits + 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exit_hits = self.exit_hits + 1
+        return 0
+}
+
+// ============================================================================
+// 2. Rust #[repr(C)] LP64 SDL_Rect ABI Layout + Tagged Enum Pattern Matching
+// ============================================================================
+#[repr(C)]
+struct SdlRectAbi {
+    pub xy: i64,
+    pub wh: i64,
+}
+
+enum RenderBackend {
+    Headless,
+    WaylandLive(i64),
+}
+
+// ============================================================================
+// 3. Zig LP64 Bit-Packer: packs two signed 32-bit C `int` lanes into one `i64`
+//    so `%struct.SdlRectAbi { xy, wh }` matches `SDL_Rect { int x, y, w, h }`!
+// ============================================================================
+pub fn zig_pack_i32_pair(lo: i64, hi: i64) i64 {
+    return ((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF);
+}
+
+// ============================================================================
+// 4. Kotlin Channel Clamper (`fun` + `val` immutable bindings + ternary)
+// ============================================================================
+fun kotlin_clamp_channel(v: Int, lo: Int, hi: Int): Int {
+    val low_bound = v < lo ? lo : v
+    val clamped = low_bound > hi ? hi : low_bound
+    return clamped
+}
+
+// ============================================================================
+// 5. Swift Unlabeled Parameter Interpolator (`func` + `_` external labels)
+// ============================================================================
+func swift_lerp(_ a: Double, _ b: Double, _ t: Double) -> Double {
+    return a + (b - a) * t
+}
+
+// ============================================================================
+// 6. Julia Typed IEEE-754 Parabolic Wave Kernel (`function ... ::Float64 ... end`)
+// ============================================================================
+function julia_wave_energy(phase::Float64, freq::Float64)::Float64
+    scaled = phase * freq
+    whole = float(int(scaled))
+    frac = scaled - whole
+    arch = 4.0 * frac * (1.0 - frac)
+    carrier = arch * 150.0 + (freq * 16.0)
+    return carrier
+end
+
+// ============================================================================
+// 7. Nim Indented `proc` Palette Mixer (`proc name(...): int64 =`)
+// ============================================================================
+proc nim_mix_palette(band: int64, seed: int64): int64 =
+    var mixed = ((band * 31) ^ (seed * 17)) + 48
+    return mixed & 255
+
+// ============================================================================
+// 8. Ruby Expressive Gamma Curve (`def ... unless ... elsif ... end` + postfix)
+// ============================================================================
+def ruby_gamma_curve(channel, boost)
+    toned = channel + boost
+    unless toned >= 64
+        toned = toned + 24
+    elsif toned > 235
+        toned = 235
+    end
+    toned = toned + 1 unless toned % 2 == 0
+    return toned
+end
+
+// ============================================================================
+// 9. Dart Spectrum Bar Geometry Sizer + 10. TypeScript Arrow Pulse
+// ============================================================================
+int dart_bar_height(int energy, int base_band, int canvas_h) {
+    int raw_h = energy + base_band * 2;
+    int max_h = canvas_h - 96;
+    if (raw_h > max_h) {
+        return max_h;
+    }
+    if (raw_h < 28) {
+        return 28;
+    }
+    return raw_h;
+}
+
+const ts_alpha_pulse = (frame: number): number => 192 + ((frame * 5) & 63);
+
+// ============================================================================
+// 11. Go M:N Cooperative Fiber Producer over Zero-GC Buffered Channel
+// ============================================================================
+func go_spectrum_worker(out_ch chan int, count int) {
+    for (int b = 0; b < count; ++b) {
+        band_val := 36 + ((b * 19 + 13) % 64)
+        out_ch <- band_val
+    }
+}
+
+// ============================================================================
+// 12. Python + Elixir `|>` + C# + C SDL2 Live Wayland Window Orchestrator
+// ============================================================================
+def main() -> int:
+    # Instantiate Java Lombok @Data @AllArgsConstructor @With class like a Python object:
+    # - No `new` keyword
+    # - Named keyword arguments across 10 typed fields (>5 register ABI boundary)
+    hud = TelemetryCanvas(
+        title="OmniScript :: Lombok x Python x SDL2 Polyglot Nexus",
+        width=780,
+        height=460,
+        bg_r=10,
+        bg_g=14,
+        bg_b=26,
+        accent=180,
+        wave_hz=1.75,
+        enter_hits=0,
+        exit_hits=0
+    )
+
+    # Mutate fields directly like a Python object
+    hud.width = hud.width + 20
+    hud.wave_hz = hud.wave_hz + 0.5
+
+    # Chain Lombok @With + @Data methods synthesized on-demand from JVM constant-pool spines
+    hud = hud.withBgR(14).withBgG(20).withBgB(38).withAccent(216)
+    hud.setAccent(hud.getAccent() + 8)
+
+    # Spawn Go M:N fiber worker & collect 12 spectrum baseline bands
+    spec_ch := make(chan int, 16)
+    go go_spectrum_worker(spec_ch, 12)
+    bands = []
+    stage2_go_sum = 0
+    for idx in 0..12:
+        bv := <-spec_ch
+        bands.append(bv)
+        stage2_go_sum = stage2_go_sum + bv
+
+    # Zero-GC UMO scratch buffer for 56-byte `SDL_Event` union + stack `SDL_Rect` struct
+    ev_buf = alloc(64)
+    defer free(ev_buf)
+    let rect_bar = SdlRectAbi { xy: 0, wh: 0 }
+
+    sdl_ready = 0
+    frames_processed = 0
+    frame_digest = 0
+
+    # Enter Python `with ... as ...:` RAII context manager on the Lombok TelemetryCanvas!
+    with hud as session:
+        init_rc = (sdl.SDL_Init(0x20) as i32)
+        win = 0
+        ren = 0
+        if init_rc >= 0:
+            win = sdl.SDL_CreateWindow(
+                session.getTitle(),
+                0x2FFF0000,
+                0x2FFF0000,
+                session.getWidth(),
+                session.getHeight(),
+                4
+            )
+            if win != 0:
+                ren = sdl.SDL_CreateRenderer(win, -1, 0)
+                if ren != 0:
+                    sdl_ready = 1
+
+        canvas_w = session.getWidth()
+        canvas_h = session.getHeight()
+        cur_accent = session.getAccent()
+        cur_freq = session.getWaveHz()
+
+        for frame in 0..48:
+            if sdl_ready == 1:
+                while (sdl.SDL_PollEvent(ev_buf) as i32) != 0:
+                    ev_noop = 0
+                sdl.SDL_SetRenderDrawColor(
+                    ren,
+                    session.getBgR(),
+                    session.getBgG(),
+                    session.getBgB(),
+                    255
+                )
+                sdl.SDL_RenderClear(ren)
+
+            t_norm = float(frame) / 48.0
+            sweep = swift_lerp(0.5, 1.5, t_norm)
+            alpha = ts_alpha_pulse(frame)
+
+            for b in 0..12:
+                phase = float(frame) * 0.125 + float(b) * 0.25
+                w_energy = int(julia_wave_energy(phase, cur_freq * sweep))
+
+                # Elixir / F# `|>` functional pipelines across Nim -> Ruby -> Kotlin
+                red_ch = (
+                    b
+                    |> nim_mix_palette(frame)
+                    |> ruby_gamma_curve(18)
+                    |> kotlin_clamp_channel(24, 250)
+                )
+                green_ch = (
+                    (b + 5)
+                    |> nim_mix_palette(frame + 3)
+                    |> ruby_gamma_curve(12)
+                    |> kotlin_clamp_channel(32, 244)
+                )
+                blue_ch = (cur_accent - b * 6) |> kotlin_clamp_channel(48, 255)
+
+                bh = dart_bar_height(w_energy, bands[b], canvas_h)
+                bx = 44 + b * 60
+                by = canvas_h - bh - 42
+
+                rect_bar.xy = zig_pack_i32_pair(bx, by)
+                rect_bar.wh = zig_pack_i32_pair(42, bh)
+
+                if sdl_ready == 1:
+                    sdl.SDL_SetRenderDrawColor(ren, red_ch, green_ch, blue_ch, alpha)
+                    sdl.SDL_RenderFillRect(ren, rect_bar)
+
+                if (frame % 12 == 0) and (b % 3 == 0):
+                    frame_digest = frame_digest + bh + red_ch + green_ch + blue_ch + (alpha >> 2)
+
+            if sdl_ready == 1:
+                scan_y = 36 + ((frame * 7) % (canvas_h - 80))
+                sdl.SDL_SetRenderDrawColor(ren, 90, 220, 255, 255)
+                sdl.SDL_RenderDrawLine(ren, 28, scan_y, canvas_w - 28, scan_y)
+                sdl.SDL_RenderPresent(ren)
+                sdl.SDL_Delay(16)
+
+            frames_processed = frames_processed + 1
+
+        if ren != 0:
+            sdl.SDL_DestroyRenderer(ren)
+        if win != 0:
+            sdl.SDL_DestroyWindow(win)
+        if init_rc >= 0:
+            sdl.SDL_Quit()
+
+    let backend_state = RenderBackend::Headless
+    if sdl_ready == 1:
+        backend_state = RenderBackend::WaylandLive(frames_processed)
+    mode_tag = 0
+    match backend_state {
+        RenderBackend::Headless => {
+            mode_tag = 1
+        }
+        RenderBackend::WaylandLive(n_frames) => {
+            mode_tag = n_frames
+        }
+    }
+
+    # Verify Lombok + Python hybrid state after `with` __enter__/__exit__ lifecycle
+    stage1_lombok_py = (
+        hud.getWidth()
+        + hud.height
+        + hud.getBgR()
+        + hud.getBgG()
+        + hud.getBgB()
+        + hud.getAccent()
+        + int(hud.getWaveHz() * 100.0)
+        + hud.enter_hits * 11
+        + hud.getExitHits() * 19
+    )
+
+    # Verify Zig + Rust #[repr(C)] SDL_Rect LP64 32-bit lane packing
+    xy_pack = zig_pack_i32_pair(40, 60)
+    wh_pack = zig_pack_i32_pair(48, 240)
+    rect_sig = (xy_pack & 0xFFFF) + ((xy_pack >> 32) & 0xFFFF) + (wh_pack & 0xFFFF) + ((wh_pack >> 32) & 0xFFFF)
+
+    # Verify all remaining foreign ecosystems (Python varint, Node crc32, Rust adler, Go xxhash, C# RNG)
+    v_enc = varint.encode(300)
+    c_crc = crc32.str("lombok-sdl2-nexus")
+    r_adl = adler.adler32_slice("lombok-sdl2-mesh")
+    g_xxh = xxhash.Sum64String("lombok-sdl2-go")
+    cs_nonce = 0 + RandomNumberGenerator.GetInt32(7, 8)
+
+    eco_bonus = 0
+    if v_enc != 0 and c_crc != 0 and (r_adl != 0 or g_xxh != 0) and frames_processed == 48:
+        eco_bonus = 50
+
+    nexus_score = stage1_lombok_py + stage2_go_sum + (frame_digest % 10000) + rect_sig + cs_nonce + eco_bonus
+
+    print("canvas_title: " + hud.getTitle())
+    print("stage1_lombok_py:", stage1_lombok_py)
+    print("stage2_go_sum:", stage2_go_sum)
+    print("frame_digest:", frame_digest)
+    print("sdl2_window_ready:", sdl_ready)
+    print("frames_processed:", frames_processed)
+    print("mode_tag:", mode_tag)
+    if eco_bonus == 50:
+        print("7 ecosystems linked: java+c+python+node+rust+go+csharp")
+    print("Polyglot Lombok SDL2 Nexus score:", nexus_score)
+    return 0

@@ -28,10 +28,23 @@ fn main() {
 
         println!("cargo:rerun-if-changed={}", model_path.display());
 
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let abs_model_path = fs::canonicalize(&model_path).unwrap_or(model_path);
+
+        // MSVC cl.exe / ml64.exe does not support GNU `.incbin` directives in `.S` files;
+        // export canonical path for compile-time `include_bytes!` fallback on Windows MSVC.
+        if target_os == "windows" && target_env == "msvc" {
+            println!(
+                "cargo:rustc-env=OMNI_EMBEDDED_MODEL_ABS_PATH={}",
+                abs_model_path.display()
+            );
+            return;
+        }
+
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let asm_path = out_dir.join("embedded_model.S");
 
-        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         let is_apple = target_os == "macos" || target_os == "ios";
 
         let (section_decl, sym_prefix) = if is_apple {
@@ -45,11 +58,8 @@ fn main() {
         let sym_start = format!("{}omni_embedded_model_start", sym_prefix);
         let sym_end = format!("{}omni_embedded_model_end", sym_prefix);
 
-        // Escape backslashes for assembly string literal on Windows
-        let abs_path_str = fs::canonicalize(&model_path)
-            .unwrap_or(model_path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // Escape backslashes for assembly string literal on Windows (MinGW/Clang)
+        let abs_path_str = abs_model_path.to_string_lossy().replace('\\', "/");
 
         let asm_source = format!(
             r#"{section_decl}

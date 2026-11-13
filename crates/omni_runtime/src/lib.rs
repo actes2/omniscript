@@ -3,12 +3,16 @@ use std::path::PathBuf;
 /// Returns the canonical LLVM target triple of the current host machine (Linux, macOS, Windows).
 pub fn host_target_triple() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return "arm64-apple-darwin";
+    return "arm64-apple-macosx11.0.0";
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return "x86_64-apple-darwin";
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return "x86_64-apple-macosx10.15.0";
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "gnu"))]
+    return "x86_64-pc-windows-gnu";
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", not(target_env = "gnu")))]
     return "x86_64-pc-windows-msvc";
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))]
+    return "aarch64-pc-windows-gnu";
+    #[cfg(all(target_os = "windows", target_arch = "aarch64", not(target_env = "gnu")))]
     return "aarch64-pc-windows-msvc";
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     return "aarch64-unknown-linux-gnu";
@@ -28,9 +32,9 @@ pub fn host_target_triple() -> &'static str {
 /// The compiled native C systems runtime static archive (Arena, Channels, Fibers, Slices, Robin Hood Map).
 /// Embedded directly into the binary to ensure 100% standalone execution without depending on source repos.
 pub static EMBEDDED_LIBOMNI_RUNTIME: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/libomni_runtime_native.a"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/omni_runtime_archive.bin"));
 
-/// Returns the path to the native runtime static library (`libomni_runtime_native.a`).
+/// Returns the path to the native runtime static library (`libomni_runtime_native.a` on Unix/MinGW, `omni_runtime_native.lib` on MSVC).
 /// If not already present in `~/.omnicache/lib/` (or if bytes have changed), it writes
 /// the embedded static archive out atomically.
 pub fn runtime_archive_path() -> PathBuf {
@@ -39,7 +43,7 @@ pub fn runtime_archive_path() -> PathBuf {
     } else {
         std::env::temp_dir().join("omnicache").join("lib")
     };
-    let lib_path = cache_dir.join("libomni_runtime_native.a");
+    let lib_path = cache_dir.join(env!("OMNI_RUNTIME_ARCHIVE_FILENAME"));
 
     let needs_write = match std::fs::read(&lib_path) {
         Ok(existing) => existing != EMBEDDED_LIBOMNI_RUNTIME,
@@ -60,9 +64,10 @@ pub fn runtime_c_sources() -> Vec<PathBuf> {
     vec![runtime_archive_path()]
 }
 
-/// Returns the C header declarations for LLVM IR module inclusion
-pub fn runtime_llvm_declarations() -> &'static str {
-    r#"
+macro_rules! omni_runtime_decls {
+    ($setjmp_sig:expr) => {
+        concat!(
+            r#"
 ; --- OmniScript Framework Runtime Declarations ---
 ; Standard POSIX libc & System Declarations
 declare i32 @sleep(i32)
@@ -86,10 +91,14 @@ declare void @__omni_sleep_s(i64)
 declare void @__omni_sleep_ms(i64)
 declare i64 @__omni_random_int()
 declare i64 @__omni_random_range(i64, i64)
+declare i64 @__omni_ipow64(i64, i64)
+declare double @llvm.pow.f64(double, double)
 declare void @fast_hash_block(i8*, i64, i8*)
 
 ; Thread-Local Stack-Unwinding Exception Runtime (setjmp / longjmp)
-declare i32 @_setjmp(i8*) returns_twice
+"#,
+            $setjmp_sig,
+            r#"
 declare i8* @__omni_try_push()
 declare void @__omni_try_pop()
 declare void @__omni_throw(i64, i8*, i8*)
@@ -97,7 +106,7 @@ declare void @__omni_rethrow()
 declare i8* @__omni_catch_msg()
 declare i8* @__omni_catch_type()
 declare i64 @__omni_catch_code()
-declare i1 @__omni_catch_matches(i8*)
+declare i32 @__omni_catch_matches(i8*)
 
 ; Arena Allocator
 declare i8* @__omni_arena_create(i64)
@@ -178,6 +187,22 @@ declare i32 @__omni_os_socket_send(i32, i8*)
 declare i8* @__omni_os_socket_recv(i32, i32)
 declare i8* @__omni_os_pipe_pair()
 "#
+        )
+    };
+}
+
+/// Returns the C header declarations for LLVM IR module inclusion parameterized by target triple.
+pub fn runtime_llvm_declarations_for_triple(triple: &str) -> &'static str {
+    if triple.contains("windows") {
+        omni_runtime_decls!("declare i32 @_setjmp(i8*, i8*) returns_twice")
+    } else {
+        omni_runtime_decls!("declare i32 @_setjmp(i8*) returns_twice")
+    }
+}
+
+/// Returns the C header declarations for LLVM IR module inclusion on the current host.
+pub fn runtime_llvm_declarations() -> &'static str {
+    runtime_llvm_declarations_for_triple(host_target_triple())
 }
 
 #[cfg(test)]

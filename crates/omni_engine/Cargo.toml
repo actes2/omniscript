@@ -24,4 +24,6 @@ cc = "1.0"
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-transformers/metal"]
+accelerate = ["candle-core/accelerate", "candle-transformers/accelerate"]
 full-build = []

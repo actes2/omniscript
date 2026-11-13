@@ -16,9 +16,15 @@
 #ifndef _WIN32
 #include <unistd.h>
 #else
-#include <windows.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#define strdup _strdup
 #endif
 
 OmniValue __omni_val_nil(void) {
@@ -164,7 +170,7 @@ bool __omni_val_truthy(OmniValue v) {
 
 void __omni_val_print(OmniValue v) {
     switch (v.type) {
-        case OMNI_VAL_INT: printf("%ld\n", v.as.i); break;
+        case OMNI_VAL_INT: printf("%lld\n", (long long)v.as.i); break;
         case OMNI_VAL_FLOAT: printf("%f\n", v.as.f); break;
         case OMNI_VAL_BOOL: printf("%s\n", v.as.b ? "true" : "false"); break;
         case OMNI_VAL_STR: printf("%s\n", v.as.str.data ? v.as.str.data : "nil"); break;
@@ -302,6 +308,18 @@ void __omni_sleep_ms(int64_t milliseconds) {
     }
 }
 
+#ifdef _MSC_VER
+int sleep(unsigned int seconds) {
+    Sleep((DWORD)seconds * 1000u);
+    return 0;
+}
+
+int usleep(unsigned int usec) {
+    Sleep((DWORD)((usec + 999u) / 1000u));
+    return 0;
+}
+#endif
+
 int64_t __omni_random_int(void) {
     static int seeded = 0;
     if (!seeded) {
@@ -315,6 +333,19 @@ int64_t __omni_random_range(int64_t min, int64_t max) {
     if (min >= max) return min;
     int64_t r = __omni_random_int();
     return min + (r % (max - min));
+}
+
+int64_t __omni_ipow64(int64_t base, int64_t exp) {
+    if (exp < 0) return 0;
+    uint64_t res = 1;
+    uint64_t b = (uint64_t)base;
+    uint64_t e = (uint64_t)exp;
+    while (e > 0) {
+        if (e & 1ULL) res *= b;
+        b *= b;
+        e >>= 1;
+    }
+    return (int64_t)res;
 }
 
 // ============================================================================
@@ -350,12 +381,21 @@ char* __omni_c_http_get(const char* url, int32_t* status_out) {
 #endif
 
     char cmd[1024];
+#ifdef _WIN32
+    int n = snprintf(
+        cmd,
+        sizeof(cmd),
+        "curl -sS -L --max-time 10 -w \"\\n__OMNI_STATUS:%%{http_code}\" \"%s\" 2>NUL",
+        url
+    );
+#else
     int n = snprintf(
         cmd,
         sizeof(cmd),
         "curl -sS -L --max-time 10 -w \"\\n__OMNI_STATUS:%%{http_code}\" \"%s\" 2>/dev/null",
         url
     );
+#endif
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         if (status_out) *status_out = 414;
         return strdup("{}");
@@ -575,8 +615,8 @@ int64_t __omni_catch_code(void) {
     return g_omni_last_exc_code;
 }
 
-bool __omni_catch_matches(const char* expected_type) {
-    if (!expected_type || !*expected_type) return true;
+int32_t __omni_catch_matches(const char* expected_type) {
+    if (!expected_type || !*expected_type) return 1;
     if (strcmp(expected_type, "Exception") == 0 ||
         strcmp(expected_type, "BaseException") == 0 ||
         strcmp(expected_type, "Error") == 0 ||
@@ -586,15 +626,15 @@ bool __omni_catch_matches(const char* expected_type) {
         strcmp(expected_type, "std::exception") == 0 ||
         strcmp(expected_type, "any") == 0 ||
         strcmp(expected_type, "_") == 0) {
-        return true;
+        return 1;
     }
     const char* actual = g_omni_last_exc_type ? g_omni_last_exc_type : "Exception";
-    if (strcmp(actual, expected_type) == 0) return true;
+    if (strcmp(actual, expected_type) == 0) return 1;
     const char* actual_tail = strrchr(actual, '.');
     actual_tail = actual_tail ? actual_tail + 1 : actual;
     const char* exp_tail = strrchr(expected_type, '.');
     exp_tail = exp_tail ? exp_tail + 1 : expected_type;
-    return strcmp(actual_tail, exp_tail) == 0;
+    return strcmp(actual_tail, exp_tail) == 0 ? 1 : 0;
 }
 
 void __omni_c_return_str(const char* s) {
@@ -1009,8 +1049,10 @@ char* __omni_os_socket_recv(int32_t fd, int32_t max_bytes) {
 void* __omni_os_pipe_pair(void) {
     int fds[2];
 #ifdef _WIN32
-    fds[0] = 0;
-    fds[1] = 0;
+    if (_pipe(fds, 4096, _O_BINARY) != 0) {
+        fds[0] = 0;
+        fds[1] = 0;
+    }
 #else
     if (pipe(fds) < 0) {
         fds[0] = 0;

@@ -16,6 +16,7 @@ typedef struct OmniFiber {
     size_t stack_size;          // Usable stack size
     size_t total_mmap_size;     // Total mapped size including guard page
     size_t guard_page_size;     // Guard page size
+    void* win_fiber_handle;     // Native Win32 fiber handle when targeting _WIN32
     OmniArena* arena;           // Fiber-local Task Arena
     int status;
     void (*entry)(void*);

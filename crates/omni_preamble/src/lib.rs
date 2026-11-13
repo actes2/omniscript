@@ -5,13 +5,19 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use walkdir::WalkDir;
 
+pub mod http;
 pub mod shimmer;
-pub use shimmer::{PackageEcosystem, PackageShimmer, PackageSpec};
+pub use shimmer::{
+    CPackageProvider, PackageEcosystem, PackageShimmer, PackageSpec, TargetArch, TargetPlatform,
+};
 
 #[derive(Error, Debug)]
 pub enum PreambleError {
     #[error("Import path '{0}' does not exist")]
     PathNotFound(String),
+
+    #[error("{0}")]
+    DependencyNotFound(String),
 
     #[error("Target '{0}' is not a directory for wildcard/from-import")]
     NotADirectory(String),
@@ -625,6 +631,7 @@ impl EcosystemWalkReport {
 
 pub struct DependencyDriller {
     pub oenv_root: Option<PathBuf>,
+    pub platform: TargetPlatform,
     visited: HashSet<PathBuf>,
     include_c_re: Regex,
     py_from_import_re: Regex,
@@ -643,6 +650,7 @@ impl DependencyDriller {
     pub fn new() -> Self {
         Self {
             oenv_root: None,
+            platform: TargetPlatform::detect_host(),
             visited: HashSet::new(),
             include_c_re: Regex::new(r#"^\s*#include\s*[<"]([^>"]+)[>"]"#).unwrap(),
             py_from_import_re: Regex::new(
@@ -657,6 +665,11 @@ impl DependencyDriller {
 
     pub fn with_oenv(mut self, oenv_root: Option<PathBuf>) -> Self {
         self.oenv_root = oenv_root;
+        self
+    }
+
+    pub fn with_platform(mut self, platform: TargetPlatform) -> Self {
+        self.platform = platform;
         self
     }
 
@@ -1311,39 +1324,155 @@ impl DependencyDriller {
         };
 
         let mut entry_opt: Option<(PathBuf, String)> = None;
+        let mut matched_pkg_dir: Option<PathBuf> = None;
 
-        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/c, <oenv>/git/c, <oenv>/include)
-        if let Some(oenv) = self.effective_oenv(base_dir) {
-            let oenv_c = oenv.join("packages").join("c");
-            if oenv_c.is_dir() {
-                let prefix = format!("{}-", module);
-                if let Ok(entries) = fs::read_dir(&oenv_c) {
-                    for e in entries.filter_map(|e| e.ok()) {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if name.starts_with(&prefix) || name == module {
-                            for ext in &["h", "hpp", "c", "cpp"] {
-                                let cand = e.path().join(format!("{}.{}", module, ext));
-                                let cand_inc = e.path().join("include").join(format!("{}.{}", module, ext));
-                                if cand.is_file() {
-                                    entry_opt = Some((cand, format!("oenv-c ({})", name)));
-                                    break;
-                                } else if cand_inc.is_file() {
-                                    entry_opt = Some((cand_inc, format!("oenv-c ({})", name)));
-                                    break;
+        let stem_no_digits = module.trim_end_matches(|c: char| c.is_ascii_digit());
+        let mod_lower = module.to_lowercase();
+        let mod_no_lib = mod_lower.strip_prefix("lib").unwrap_or(&mod_lower);
+        let mut header_stems = vec![
+            module.to_string(),
+            module.to_uppercase(),
+            mod_lower.clone(),
+            mod_no_lib.to_string(),
+        ];
+        if !stem_no_digits.is_empty() {
+            header_stems.push(stem_no_digits.to_string());
+            header_stems.push(stem_no_digits.to_uppercase());
+        }
+
+        // Helper to scan a C package cache directory (`<root>/packages/c/<platform>` or `<root>/packages/c`)
+        let find_in_c_pkg_root = |c_root: &Path, tier_label: &str| -> Option<(PathBuf, PathBuf, String)> {
+            if !c_root.is_dir() {
+                return None;
+            }
+            let Ok(entries) = fs::read_dir(c_root) else { return None };
+            let dir_prefixes = [
+                format!("{}-", mod_lower),
+                format!("{}-", mod_no_lib),
+            ];
+
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let raw_name = e.file_name().to_string_lossy().to_string();
+                let lower_dir = raw_name.to_lowercase();
+                let mut matches_pkg = lower_dir == mod_lower
+                    || lower_dir == mod_no_lib
+                    || dir_prefixes.iter().any(|pref| lower_dir.starts_with(pref));
+                if !matches_pkg {
+                    if let Ok(meta_txt) = fs::read_to_string(p.join("omni-c-pkg.json")) {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_txt) {
+                            let up = meta
+                                .get("upstream_package")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            if up == mod_lower
+                                || up == mod_no_lib
+                                || up.starts_with(&format!("{}-", mod_no_lib))
+                                || up.starts_with(&format!("lib{}-", mod_no_lib))
+                            {
+                                matches_pkg = true;
+                            }
+                        }
+                    }
+                }
+                if !matches_pkg {
+                    continue;
+                }
+
+                let inc_dir = p.join("include");
+                let mut search_inc_dirs = Vec::new();
+                if inc_dir.is_dir() {
+                    for sub in &[module.to_string(), module.to_uppercase(), mod_lower.clone()] {
+                        let sd = inc_dir.join(sub);
+                        if sd.is_dir() && !search_inc_dirs.contains(&sd) {
+                            search_inc_dirs.push(sd);
+                        }
+                    }
+                    search_inc_dirs.push(inc_dir.clone());
+                }
+                search_inc_dirs.push(p.clone());
+
+                for sdir in &search_inc_dirs {
+                    for stem in &header_stems {
+                        for ext in &["h", "hpp", "c", "cpp"] {
+                            let cand = sdir.join(format!("{}.{}", stem, ext));
+                            if cand.is_file() {
+                                return Some((
+                                    cand,
+                                    p,
+                                    format!("{}-c [{}] ({})", tier_label, self.platform.slug, raw_name),
+                                ));
+                            }
+                        }
+                    }
+                    // Case-insensitive stem match inside `sdir` (e.g. `cJSON.h` for `cjson`)
+                    if let Ok(files) = fs::read_dir(sdir) {
+                        for f in files.filter_map(|x| x.ok()) {
+                            let fp = f.path();
+                            if fp.is_file()
+                                && matches!(fp.extension().and_then(|s| s.to_str()), Some("h" | "hpp"))
+                            {
+                                let fstem = fp
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_lowercase();
+                                if header_stems.iter().any(|hs| hs.to_lowercase() == fstem) {
+                                    return Some((
+                                        fp,
+                                        p,
+                                        format!("{}-c [{}] ({})", tier_label, self.platform.slug, raw_name),
+                                    ));
                                 }
                             }
                         }
-                        if entry_opt.is_some() { break; }
                     }
                 }
+                // Fallback: first `.h`/`.hpp` inside `<pkg_dir>/include`
+                if inc_dir.is_dir() {
+                    for w in WalkDir::new(&inc_dir).max_depth(3).into_iter().filter_map(|x| x.ok()) {
+                        if w.file_type().is_file()
+                            && matches!(w.path().extension().and_then(|s| s.to_str()), Some("h" | "hpp"))
+                        {
+                            return Some((
+                                w.path().to_path_buf(),
+                                p,
+                                format!("{}-c [{}] ({})", tier_label, self.platform.slug, raw_name),
+                            ));
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // 0. Priority Tier: Local polyglot oenv (<oenv>/packages/c/<platform.slug>, then <oenv>/packages/c, then <oenv>/include)
+        if let Some(oenv) = self.effective_oenv(base_dir) {
+            let oenv_c = oenv.join("packages").join("c");
+            let oenv_c_plat = oenv_c.join(&self.platform.slug);
+            if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&oenv_c_plat, "oenv") {
+                entry_opt = Some((hdr, label));
+                matched_pkg_dir = Some(pdir);
+            } else if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&oenv_c, "oenv") {
+                entry_opt = Some((hdr, label));
+                matched_pkg_dir = Some(pdir);
             }
             if entry_opt.is_none() {
                 let oenv_inc = oenv.join("include");
                 if oenv_inc.is_dir() {
-                    for ext in &["h", "hpp"] {
-                        let cand = oenv_inc.join(format!("{}.{}", module, ext));
-                        if cand.is_file() {
-                            entry_opt = Some((cand, format!("oenv-include (.{})", ext)));
+                    for stem in &header_stems {
+                        for ext in &["h", "hpp"] {
+                            let cand = oenv_inc.join(format!("{}.{}", stem, ext));
+                            if cand.is_file() {
+                                entry_opt = Some((cand, format!("oenv-include (.{})", ext)));
+                                break;
+                            }
+                        }
+                        if entry_opt.is_some() {
                             break;
                         }
                     }
@@ -1366,60 +1495,159 @@ impl DependencyDriller {
             }
         }
 
-        // Check package managers: vcpkg_installed / conan / omnicache
+        // Check package managers: ~/.omnicache/packages/c/<platform.slug>, ~/.omnicache/packages/c, vcpkg_installed
         if entry_opt.is_none() {
             if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
                 let omni_c = PathBuf::from(home).join(".omnicache").join("packages").join("c");
-                if omni_c.is_dir() {
-                    let prefix = format!("{}-", module);
-                    if let Ok(entries) = fs::read_dir(&omni_c) {
-                        for e in entries.filter_map(|e| e.ok()) {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if name.starts_with(&prefix) || name == module {
-                                for ext in &["h", "hpp"] {
-                                    let cand = e.path().join(format!("{}.{}", module, ext));
-                                    let cand_inc = e.path().join("include").join(format!("{}.{}", module, ext));
-                                    if cand.is_file() {
-                                        entry_opt = Some((cand, format!("omnicache-c ({})", name)));
-                                        break;
-                                    } else if cand_inc.is_file() {
-                                        entry_opt = Some((cand_inc, format!("omnicache-c ({})", name)));
-                                        break;
-                                    }
-                                }
-                            }
-                            if entry_opt.is_some() { break; }
-                        }
-                    }
+                let omni_c_plat = omni_c.join(&self.platform.slug);
+                if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&omni_c_plat, "omnicache") {
+                    entry_opt = Some((hdr, label));
+                    matched_pkg_dir = Some(pdir);
+                } else if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&omni_c, "omnicache") {
+                    entry_opt = Some((hdr, label));
+                    matched_pkg_dir = Some(pdir);
                 }
             }
-            let vcpkg_inc = base_dir.join("vcpkg_installed");
-            if vcpkg_inc.is_dir() {
-                for ext in &["h", "hpp"] {
-                    let cand = vcpkg_inc.join(format!("{}.{}", module, ext));
-                    if cand.is_file() {
-                        entry_opt = Some((cand, "vcpkg-installed".to_string()));
-                        break;
+            if entry_opt.is_none() {
+                let vcpkg_inc = base_dir.join("vcpkg_installed");
+                if vcpkg_inc.is_dir() {
+                    for ext in &["h", "hpp"] {
+                        let cand = vcpkg_inc.join(format!("{}.{}", module, ext));
+                        if cand.is_file() {
+                            entry_opt = Some((cand, "vcpkg-installed".to_string()));
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        // Check standard system headers (/usr/include)
-        if entry_opt.is_none() {
-            // Check Homebrew (macOS Apple Silicon & Intel) + POSIX system include directories
-            for sys_dir in &[
-                "/opt/homebrew/include",
-                "/usr/local/include",
-                "/usr/include",
-                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include",
-            ] {
-                for ext in &["h", "hpp"] {
-                    let cand = Path::new(sys_dir).join(format!("{}.{}", module, ext));
-                    if cand.is_file() {
-                        entry_opt = Some((cand, format!("system-include ({})", sys_dir)));
-                        break;
+        let is_native_host_abi = self.platform.arch == TargetArch::host()
+            && ((cfg!(target_os = "linux") && self.platform.llvm_triple.contains("linux"))
+                || (cfg!(target_os = "macos")
+                    && (self.platform.llvm_triple.contains("apple")
+                        || self.platform.llvm_triple.contains("macosx")))
+                || (cfg!(target_os = "windows") && self.platform.llvm_triple.contains("windows")));
+
+        // Query `pkg-config` (`--cflags-only-I` / `--libs-only-L` / `--libs-only-l`) ONLY when targeting the host OS
+        let mut pkg_inc_dirs: Vec<PathBuf> = Vec::new();
+        let mut pkg_lib_dirs: Vec<PathBuf> = Vec::new();
+        let mut pkg_lib_names: Vec<String> = Vec::new();
+        if is_native_host_abi && matched_pkg_dir.is_none() {
+            for pkg_q in &[module.to_string(), module.to_lowercase()] {
+                if let Ok(out) = std::process::Command::new("pkg-config")
+                    .args(["--cflags-only-I", pkg_q])
+                    .output()
+                {
+                    if out.status.success() {
+                        for tok in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                            if let Some(inc) = tok.strip_prefix("-I") {
+                                let pb = PathBuf::from(inc);
+                                if pb.is_dir() && !pkg_inc_dirs.contains(&pb) {
+                                    pkg_inc_dirs.push(pb);
+                                }
+                            }
+                        }
                     }
+                }
+                if let Ok(out) = std::process::Command::new("pkg-config")
+                    .args(["--libs-only-L", pkg_q])
+                    .output()
+                {
+                    if out.status.success() {
+                        for tok in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                            if let Some(libd) = tok.strip_prefix("-L") {
+                                let pb = PathBuf::from(libd);
+                                if pb.is_dir() && !pkg_lib_dirs.contains(&pb) {
+                                    pkg_lib_dirs.push(pb);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(out) = std::process::Command::new("pkg-config")
+                    .args(["--libs-only-l", pkg_q])
+                    .output()
+                {
+                    if out.status.success() {
+                        for tok in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                            if let Some(lib) = tok.strip_prefix("-l") {
+                                if !pkg_lib_names.contains(&lib.to_string()) {
+                                    pkg_lib_names.push(lib.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check standard system headers ONLY when targeting the host OS ABI
+        if entry_opt.is_none() && is_native_host_abi {
+            let mut inc_roots: Vec<PathBuf> = pkg_inc_dirs.clone();
+            let mut raw_sys_dirs: Vec<PathBuf> = vec![
+                PathBuf::from(format!("/opt/homebrew/opt/{}/include", module.to_lowercase())),
+                PathBuf::from("/opt/homebrew/include"),
+                PathBuf::from("/opt/local/include"),
+                PathBuf::from("/usr/local/include"),
+                PathBuf::from("/usr/include"),
+                PathBuf::from("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include"),
+                PathBuf::from(r"C:\msys64\ucrt64\include"),
+                PathBuf::from(r"C:\msys64\clang64\include"),
+                PathBuf::from(r"C:\msys64\mingw64\include"),
+            ];
+            if let Some(sdk) = std::env::var_os("SDKROOT") {
+                raw_sys_dirs.push(PathBuf::from(sdk).join("usr").join("include"));
+            } else if cfg!(target_os = "macos") {
+                if let Ok(out) = std::process::Command::new("xcrun").arg("--show-sdk-path").output() {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if !s.is_empty() {
+                            raw_sys_dirs.push(PathBuf::from(s).join("usr").join("include"));
+                        }
+                    }
+                }
+            }
+            if let Some(vcpkg) = std::env::var_os("VCPKG_ROOT") {
+                let vp = PathBuf::from(vcpkg).join("installed");
+                for triplet in &["x64-windows", "arm64-windows", "x64-mingw-dynamic", "arm64-osx", "x64-osx", "x64-linux"] {
+                    raw_sys_dirs.push(vp.join(triplet).join("include"));
+                }
+            }
+            for env_key in &["CPATH", "C_INCLUDE_PATH", "INCLUDE"] {
+                if let Some(val) = std::env::var_os(env_key) {
+                    for p in std::env::split_paths(&val) {
+                        if !p.as_os_str().is_empty() {
+                            raw_sys_dirs.push(p);
+                        }
+                    }
+                }
+            }
+            for base_inc in raw_sys_dirs {
+                if base_inc.is_dir() {
+                    let sub_exact = base_inc.join(module);
+                    let sub_upper = base_inc.join(module.to_uppercase());
+                    if sub_exact.is_dir() && !inc_roots.contains(&sub_exact) {
+                        inc_roots.push(sub_exact);
+                    }
+                    if sub_upper.is_dir() && !inc_roots.contains(&sub_upper) {
+                        inc_roots.push(sub_upper);
+                    }
+                    if !inc_roots.contains(&base_inc) {
+                        inc_roots.push(base_inc);
+                    }
+                }
+            }
+            for inc_dir in &inc_roots {
+                for stem in &header_stems {
+                    for ext in &["h", "hpp"] {
+                        let cand = inc_dir.join(format!("{}.{}", stem, ext));
+                        if cand.is_file() {
+                            entry_opt = Some((cand, format!("system-include ({})", inc_dir.display())));
+                            break;
+                        }
+                    }
+                    if entry_opt.is_some() { break; }
                 }
                 if entry_opt.is_some() { break; }
             }
@@ -1445,14 +1673,16 @@ impl DependencyDriller {
         };
 
         report.resolved_origin = Some(origin.clone());
-        report.package_dir = origin.parent().map(|p| p.to_path_buf());
+        report.package_dir = matched_pkg_dir
+            .clone()
+            .or_else(|| origin.parent().map(|p| p.to_path_buf()));
         report.resolution_source = res_src;
 
         if !report.visited_files.contains(&origin) {
             report.visited_files.push(origin.clone());
         }
 
-        // Check for matching C/C++ implementation files
+        // Check for matching C/C++ implementation files and native binary libraries
         let ext = origin.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "h" || ext == "hpp" {
             for c_cand in &[
@@ -1465,46 +1695,177 @@ impl DependencyDriller {
                     report.visited_files.push(c_cand.clone());
                 }
             }
-            // Check any other .c/.cpp files in src/
-            let src_dir = base_dir.join("src");
-            if src_dir.is_dir() {
-                if let Ok(entries) = fs::read_dir(&src_dir) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let p = entry.path();
-                        let p_ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        if (p_ext == "c" || p_ext == "cpp") && !report.visited_files.contains(&p) {
-                            report.visited_files.push(p);
+            // Check any other .c/.cpp files in workspace `src/` or `<pkg_dir>/src/` (e.g. sqlite amalgamation)
+            let mut src_dirs = vec![base_dir.join("src")];
+            if let Some(ref pdir) = matched_pkg_dir {
+                src_dirs.push(pdir.join("src"));
+            }
+            for src_dir in src_dirs {
+                if src_dir.is_dir() {
+                    if let Ok(entries) = fs::read_dir(&src_dir) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let p = entry.path();
+                            let p_ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if (p_ext == "c" || p_ext == "cpp") && !report.visited_files.contains(&p) {
+                                report.visited_files.push(p);
+                            }
                         }
                     }
                 }
             }
 
-            // Check for matching system or local shared objects (.so / .dylib)
             let clean_mod = module.trim_start_matches("lib");
-            let mut so_candidates = vec![
-                format!("lib{}.so", module),
-                format!("lib{}.so", clean_mod),
-                format!("{}.so", module),
-                format!("lib{}.dylib", module),
-                format!("lib{}.dylib", clean_mod),
-            ];
-            if module == "zlib" {
-                so_candidates.push("libz.so".to_string());
-                so_candidates.push("libz.dylib".to_string());
-            }
-            for lib_dir in &[
-                "/usr/lib",
-                "/usr/lib64",
-                "/usr/lib/x86_64-linux-gnu",
-                "/usr/lib/aarch64-linux-gnu",
-                "/lib/x86_64-linux-gnu",
-                "/usr/local/lib",
-                "/opt/homebrew/lib",
-            ] {
-                for so_name in &so_candidates {
-                    let so_path = Path::new(lib_dir).join(so_name);
-                    if so_path.is_file() && !report.visited_files.contains(&so_path) {
-                        report.visited_files.push(so_path);
+            if let Some(ref pdir) = matched_pkg_dir {
+                // Resolved inside `oenv` / `omnicache`: prefer static `.a` / `.lib` FIRST for zero-`.so` internalization,
+                // then fall back to `.dll.a` / `.so` / `.dylib` (and `LlvmVerifier` auto-fails-over if static `.a` lacks transitive symbols).
+                let pkg_lib_dir = pdir.join("lib");
+                if pkg_lib_dir.is_dir() {
+                    let ordered_pkg_libs = vec![
+                        // Tier 1: Static archives (internalized directly into native binary)
+                        format!("lib{}.a", module),
+                        format!("lib{}.a", clean_mod),
+                        format!("lib{}.a", mod_lower),
+                        format!("lib{}.a", module.to_uppercase()),
+                        format!("{}.lib", module),
+                        format!("{}.lib", clean_mod),
+                        // Tier 2: Shared / import libraries (with automatic RPATH / DLL staging)
+                        format!("lib{}.dll.a", module),
+                        format!("lib{}.dll.a", clean_mod),
+                        format!("lib{}.dll.a", mod_lower),
+                        format!("lib{}.so", module),
+                        format!("lib{}.so", clean_mod),
+                        format!("lib{}.so", mod_lower),
+                        format!("lib{}.so", module.to_uppercase()),
+                        format!("lib{}.dylib", module),
+                        format!("lib{}.dylib", clean_mod),
+                        format!("lib{}.dylib", mod_lower),
+                        format!("lib{}.dylib", module.to_uppercase()),
+                    ];
+
+                    let mut selected_pkg_lib: Option<PathBuf> = None;
+                    for cand_name in &ordered_pkg_libs {
+                        let cand_p = pkg_lib_dir.join(cand_name);
+                        if cand_p.is_file() {
+                            selected_pkg_lib = Some(cand_p);
+                            break;
+                        }
+                    }
+                    // Fallback scan inside `<pkg_dir>/lib` if library name differs slightly (e.g. `libSDL2-2.0.so.0` or `libsqlite3.a`)
+                    if selected_pkg_lib.is_none() {
+                        if let Ok(entries) = fs::read_dir(&pkg_lib_dir) {
+                            let mut static_fallback = None;
+                            let mut shared_fallback = None;
+                            for entry in entries.filter_map(|e| e.ok()) {
+                                let p = entry.path();
+                                if !p.is_file() {
+                                    continue;
+                                }
+                                let fn_low = entry.file_name().to_string_lossy().to_lowercase();
+                                if fn_low.ends_with(".a") && !fn_low.ends_with(".dll.a") {
+                                    if static_fallback.is_none() || fn_low.contains(mod_no_lib) {
+                                        static_fallback = Some(p);
+                                    }
+                                } else if fn_low.ends_with(".dll.a")
+                                    || fn_low.ends_with(".so")
+                                    || fn_low.contains(".so.")
+                                    || fn_low.ends_with(".dylib")
+                                    || fn_low.ends_with(".lib")
+                                {
+                                    if shared_fallback.is_none() || fn_low.contains(mod_no_lib) {
+                                        shared_fallback = Some(p);
+                                    }
+                                }
+                            }
+                            selected_pkg_lib = static_fallback.or(shared_fallback);
+                        }
+                    }
+                    if let Some(lib_p) = selected_pkg_lib {
+                        if !report.visited_files.contains(&lib_p) {
+                            report.visited_files.push(lib_p);
+                        }
+                    }
+                }
+            } else if is_native_host_abi {
+                // Host system shared/import libraries (.so / .dylib / .lib / .dll.a / .dll)
+                let mut so_candidates = vec![
+                    format!("lib{}.so", module),
+                    format!("lib{}.so", clean_mod),
+                    format!("lib{}.so", module.to_uppercase()),
+                    format!("{}.so", module),
+                    format!("lib{}.dylib", module),
+                    format!("lib{}.dylib", clean_mod),
+                    format!("lib{}.dylib", module.to_uppercase()),
+                    format!("{}.lib", module),
+                    format!("{}.lib", clean_mod),
+                    format!("{}.lib", module.to_uppercase()),
+                    format!("lib{}.dll.a", module),
+                    format!("lib{}.dll.a", clean_mod),
+                    format!("lib{}.dll.a", module.to_uppercase()),
+                    format!("{}.dll", module),
+                    format!("{}.dll", module.to_uppercase()),
+                ];
+                for pkg_lib in &pkg_lib_names {
+                    so_candidates.insert(0, format!("lib{}.dll.a", pkg_lib));
+                    so_candidates.insert(0, format!("{}.lib", pkg_lib));
+                    so_candidates.insert(0, format!("lib{}.dylib", pkg_lib));
+                    so_candidates.insert(0, format!("lib{}.so", pkg_lib));
+                }
+                if module == "zlib" {
+                    so_candidates.push("libz.so".to_string());
+                    so_candidates.push("libz.dylib".to_string());
+                    so_candidates.push("zlib.lib".to_string());
+                    so_candidates.push("zdll.lib".to_string());
+                    so_candidates.push("libz.dll.a".to_string());
+                }
+                let mut lib_dirs: Vec<PathBuf> = pkg_lib_dirs;
+                for static_lib_dir in &[
+                    format!("/opt/homebrew/opt/{}/lib", module.to_lowercase()),
+                    "/opt/homebrew/lib".to_string(),
+                    "/opt/local/lib".to_string(),
+                    "/usr/local/lib".to_string(),
+                    "/usr/lib".to_string(),
+                    "/usr/lib64".to_string(),
+                    "/usr/lib/x86_64-linux-gnu".to_string(),
+                    "/usr/lib/aarch64-linux-gnu".to_string(),
+                    "/lib/x86_64-linux-gnu".to_string(),
+                    r"C:\msys64\ucrt64\lib".to_string(),
+                    r"C:\msys64\clang64\lib".to_string(),
+                    r"C:\msys64\mingw64\lib".to_string(),
+                ] {
+                    let pb = PathBuf::from(static_lib_dir);
+                    if pb.is_dir() && !lib_dirs.contains(&pb) {
+                        lib_dirs.push(pb);
+                    }
+                }
+                if let Some(vcpkg) = std::env::var_os("VCPKG_ROOT") {
+                    let vp = PathBuf::from(vcpkg).join("installed");
+                    for triplet in &["x64-windows", "arm64-windows", "x64-mingw-dynamic", "arm64-osx", "x64-osx", "x64-linux"] {
+                        let ldir = vp.join(triplet).join("lib");
+                        if ldir.is_dir() && !lib_dirs.contains(&ldir) {
+                            lib_dirs.push(ldir);
+                        }
+                    }
+                }
+                for env_key in &["LIBRARY_PATH", "LIB"] {
+                    if let Some(val) = std::env::var_os(env_key) {
+                        for p in std::env::split_paths(&val) {
+                            if p.is_dir() && !lib_dirs.contains(&p) {
+                                lib_dirs.push(p);
+                            }
+                        }
+                    }
+                }
+                let mut found_lib = false;
+                for lib_dir in &lib_dirs {
+                    for so_name in &so_candidates {
+                        let so_path = lib_dir.join(so_name);
+                        if so_path.is_file() && !report.visited_files.contains(&so_path) {
+                            report.visited_files.push(so_path);
+                            found_lib = true;
+                            break;
+                        }
+                    }
+                    if found_lib {
                         break;
                     }
                 }
@@ -1550,6 +1911,38 @@ impl DependencyDriller {
             if matches!(vf.extension().and_then(|e| e.to_str()), Some("h" | "hpp" | "c" | "cpp")) {
                 if let Ok(txt) = fs::read_to_string(vf) {
                     header_blobs.push(txt);
+                }
+            }
+        }
+        // Scan all package sub-headers when resolved inside an `oenv` / `omnicache` package directory,
+        // or sibling sub-headers when `origin` resides in a dedicated system include subdirectory (e.g. `/usr/include/SDL2/SDL_*.h`)
+        if let Some(ref pdir) = matched_pkg_dir {
+            let pinc = pdir.join("include");
+            if pinc.is_dir() {
+                for entry in WalkDir::new(&pinc).max_depth(3).into_iter().take(80).filter_map(|e| e.ok()) {
+                    let p = entry.path();
+                    if entry.file_type().is_file()
+                        && matches!(p.extension().and_then(|e| e.to_str()), Some("h" | "hpp"))
+                        && p != origin
+                    {
+                        if let Ok(txt) = fs::read_to_string(p) {
+                            header_blobs.push(txt);
+                        }
+                    }
+                }
+            }
+        } else if let Some(parent_dir) = origin.parent() {
+            let dir_name = parent_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !dir_name.is_empty() && dir_name != "include" && dir_name != "local" {
+                if let Ok(entries) = fs::read_dir(parent_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let p = entry.path();
+                        if matches!(p.extension().and_then(|e| e.to_str()), Some("h" | "hpp")) && p != origin {
+                            if let Ok(txt) = fs::read_to_string(&p) {
+                                header_blobs.push(txt);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1894,6 +2287,7 @@ impl DependencyDriller {
             return report;
         }
 
+        let mut jvm_semantic_slices = Vec::new();
         if let Some((origin, res_src)) = entry_opt {
             report.resolved_origin = Some(origin.clone());
             report.package_dir = origin.parent().map(|p| p.to_path_buf());
@@ -1901,25 +2295,211 @@ impl DependencyDriller {
             if !report.visited_files.contains(&origin) {
                 report.visited_files.push(origin.clone());
             }
+            jvm_semantic_slices = Self::inspect_jvm_package_semantics(&origin, module);
         }
 
-        for sym in target_symbols {
+        let leaf_sym = module.rsplit('.').next().unwrap_or(module).to_string();
+        if !jvm_semantic_slices.is_empty() {
             report.call_traces.push(CallDependencyTrace {
-                symbol: sym.clone(),
-                defined_at: Some(format!("class {}.{}", module, sym)),
-                signature: Some(format!("public static Object {}(Object... args)", sym)),
-                hop_chain: vec![format!("jvm: {}.{}", module, sym)],
-                drilled_code_slice: vec![format!("jvm_dispatch({}, {})", module, sym)],
-                inferred_mechanism: None,
+                symbol: leaf_sym.clone(),
+                defined_at: report
+                    .resolved_origin
+                    .as_ref()
+                    .map(|p| format!("{}:[JVM-0xCAFEBABE]", p.display())),
+                signature: Some(format!("@interface {}", module)),
+                hop_chain: vec![format!("jvm_bytecode: {} -> constant_pool", module)],
+                drilled_code_slice: jvm_semantic_slices.clone(),
+                inferred_mechanism: Some(DrilledMechanism::CarvedNativeFunction(module.to_string())),
                 is_self_contained: false,
                 extracted_body: None,
                 short_circuit_c_symbol: None,
                 short_circuit_prototype: None,
                 short_circuit_rationale: None,
             });
+        } else {
+            for sym in target_symbols {
+                if report.call_traces.iter().any(|t| t.symbol == *sym) {
+                    continue;
+                }
+                report.call_traces.push(CallDependencyTrace {
+                    symbol: sym.clone(),
+                    defined_at: Some(format!("class {}.{}", module, sym)),
+                    signature: Some(format!("public static Object {}(Object... args)", sym)),
+                    hop_chain: vec![format!("jvm: {}.{}", module, sym)],
+                    drilled_code_slice: vec![format!("jvm_dispatch({}, {})", module, sym)],
+                    inferred_mechanism: None,
+                    is_self_contained: false,
+                    extracted_body: None,
+                    short_circuit_c_symbol: None,
+                    short_circuit_prototype: None,
+                    short_circuit_rationale: None,
+                });
+            }
         }
 
         report
+    }
+
+    /// Generic JVM `0xCAFEBABE` constant-pool UTF-8 extractor (supports `.class` and custom classloader bytecode units).
+    pub fn extract_jvm_utf8_pool(bytes: &[u8]) -> Vec<String> {
+        if bytes.len() < 10 || &bytes[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return Vec::new();
+        }
+        let cp_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+        let mut offset = 10;
+        let mut out = Vec::new();
+        let mut i = 1;
+        while i < cp_count && offset < bytes.len() {
+            let tag = bytes[offset];
+            offset += 1;
+            match tag {
+                1 => {
+                    if offset + 2 > bytes.len() {
+                        break;
+                    }
+                    let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+                    offset += 2;
+                    if offset + len > bytes.len() {
+                        break;
+                    }
+                    if let Ok(s) = std::str::from_utf8(&bytes[offset..offset + len]) {
+                        out.push(s.to_string());
+                    }
+                    offset += len;
+                }
+                3 | 4 => offset += 4,
+                5 | 6 => {
+                    offset += 8;
+                    i += 1;
+                }
+                7 | 8 | 16 => offset += 2,
+                9 | 10 | 11 | 12 | 17 | 18 => offset += 4,
+                15 => offset += 3,
+                _ => break,
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Inspects a resolved JVM `.class` or package directory for annotation metadata and associated
+    /// bytecode annotation-processor handlers (`0xCAFEBABE` constant pools) without framework-specific hardcoding.
+    fn inspect_jvm_package_semantics(origin: &Path, module: &str) -> Vec<String> {
+        let leaf = module.rsplit('.').next().unwrap_or(module);
+        if leaf.is_empty() {
+            return Vec::new();
+        }
+        let class_file = if origin.is_file() {
+            Some(origin.to_path_buf())
+        } else if origin.is_dir() {
+            let cand = origin.join(format!("{}.class", module.replace('.', "/")));
+            cand.is_file().then_some(cand)
+        } else {
+            None
+        };
+
+        let mut is_annotation = false;
+        let mut ann_descriptors = Vec::new();
+        if let Some(ref cf) = class_file {
+            if let Ok(bytes) = fs::read(cf) {
+                let pool = Self::extract_jvm_utf8_pool(&bytes);
+                is_annotation = pool.iter().any(|s| s.contains("java/lang/annotation/Annotation"));
+                for entry in &pool {
+                    if (entry.contains("ElementType")
+                        || entry.contains("RetentionPolicy")
+                        || (entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && entry != "Code"
+                            && entry != "SourceFile"
+                            && entry != "RuntimeVisibleAnnotations"
+                            && entry.len() >= 3
+                            && entry.len() <= 28))
+                        && !ann_descriptors.contains(entry)
+                    {
+                        ann_descriptors.push(entry.clone());
+                        if ann_descriptors.len() >= 12 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Locate package root to scan for matching `0xCAFEBABE` processor/handler bytecode units
+        let pkg_root = if origin.is_dir() {
+            Some(origin.to_path_buf())
+        } else {
+            let depth = module.chars().filter(|&c| c == '.').count() + 1;
+            let mut cur = origin.to_path_buf();
+            for _ in 0..depth {
+                if let Some(p) = cur.parent() {
+                    cur = p.to_path_buf();
+                }
+            }
+            cur.is_dir().then_some(cur)
+        };
+
+        let mut handler_ops = Vec::new();
+        if let Some(root) = pkg_root {
+            let mut stack = vec![(root, 0usize)];
+            let mut scanned_dirs = 0usize;
+            let leaf_lower = leaf.to_lowercase();
+            while let Some((dir, depth)) = stack.pop() {
+                if depth > 6 || scanned_dirs > 250 {
+                    break;
+                }
+                scanned_dirs += 1;
+                let Ok(entries) = fs::read_dir(&dir) else { continue };
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        stack.push((p, depth + 1));
+                    } else if p.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_lowercase();
+                        let matches_handler = fname.contains(&format!("handle{}", leaf_lower))
+                            || fname.contains(&format!("{}processor", leaf_lower))
+                            || fname.contains(&format!("{}handler", leaf_lower));
+                        if !matches_handler {
+                            continue;
+                        }
+                        if let Ok(bytes) = fs::read(&p) {
+                            for s in Self::extract_jvm_utf8_pool(&bytes) {
+                                let sl = s.to_lowercase();
+                                let relevant = (sl.starts_with("handle")
+                                    || sl.starts_with("generate")
+                                    || sl.starts_with("create")
+                                    || sl.contains("getter")
+                                    || sl.contains("setter")
+                                    || sl.contains("constructor")
+                                    || sl.contains("with")
+                                    || sl.contains("builder"))
+                                    && !s.contains('/')
+                                    && !s.contains(';')
+                                    && !s.contains('$')
+                                    && s.len() <= 36;
+                                if relevant && !handler_ops.contains(&s) {
+                                    handler_ops.push(s);
+                                    if handler_ops.len() >= 16 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut slices = Vec::new();
+        if is_annotation || !handler_ops.is_empty() {
+            slices.push(format!(
+                "jvm_bytecode_meta({}): annotation={} descriptors=[{}] processor_ops=[{}]",
+                module,
+                is_annotation,
+                ann_descriptors.join(", "),
+                handler_ops.join(", ")
+            ));
+        }
+        slices
     }
 
     /// C# (.NET) ecosystem driller: locates `.csproj`, NuGet cache (`~/.nuget/packages`),
@@ -2259,7 +2839,7 @@ impl DependencyDriller {
         //    - macOS: `$HOME/Library/Python/*/lib/python/site-packages`
         //    - Windows: `%APPDATA%\Python\Python*\site-packages` & `%LOCALAPPDATA%\Programs\Python\Python*\Lib\site-packages`
         let mut user_sp_candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             let home_path = PathBuf::from(&home);
             let local_lib = home_path.join(".local").join("lib");
             if let Ok(entries) = fs::read_dir(&local_lib) {
@@ -2355,10 +2935,11 @@ impl DependencyDriller {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !stdout.is_empty() && stdout != "None" {
+                        let norm_stdout = stdout.replace('\\', "/").to_ascii_lowercase();
                         let is_stdlib = matches!(
                             top_mod,
                             "threading" | "socket" | "sys" | "os" | "time" | "math" | "asyncio" | "subprocess"
-                        ) || (stdout.contains("/usr/lib/python") && matches!(top_mod, "threading" | "socket"));
+                        ) || (norm_stdout.contains("/lib/python") && matches!(top_mod, "threading" | "socket"));
 
                         if stdout == "built-in" || stdout == "frozen" || is_stdlib {
                             return (None, None, format!("interpreter-builtin (Python stdlib: {})", top_mod));
@@ -3804,5 +4385,34 @@ func (r *RateLimiter) allow() bool {{
         assert_eq!(report_local.resolution_source, "workspace-local");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generic_jvm_constant_pool_introspection() {
+        // Minimal valid 0xCAFEBABE header + 3 constant-pool entries (count = 4, 1-indexed):
+        // #1: UTF8 "java/lang/annotation/Annotation"
+        // #2: UTF8 "handleGetter"
+        // #3: UTF8 "handleSetter"
+        let mut bytes: Vec<u8> = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, 0x00, 0x34, // minor=0, major=52 (Java 8)
+            0x00, 0x04, // constant_pool_count = 4
+        ];
+        for s in [
+            "java/lang/annotation/Annotation",
+            "handleGetter",
+            "handleSetter",
+        ] {
+            bytes.push(1); // CONSTANT_Utf8
+            let len = s.len() as u16;
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(s.as_bytes());
+        }
+
+        let pool = DependencyDriller::extract_jvm_utf8_pool(&bytes);
+        assert_eq!(pool.len(), 3);
+        assert!(pool.iter().any(|u| u.contains("java/lang/annotation/Annotation")));
+        assert!(pool.iter().any(|u| u == "handleGetter"));
+        assert!(pool.iter().any(|u| u == "handleSetter"));
     }
 }

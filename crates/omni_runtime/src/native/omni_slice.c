@@ -82,7 +82,7 @@ void __omni_slice_print(OmniSlice* slice) {
     printf("[");
     for (size_t i = 0; i < slice->len; i++) {
         if (i > 0) printf(", ");
-        printf("%ld", (long)slice->data[i]);
+        printf("%lld", (long long)slice->data[i]);
     }
     printf("]\n");
 }

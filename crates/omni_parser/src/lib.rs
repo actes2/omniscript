@@ -471,7 +471,7 @@ impl OmniParser {
                 .last()
                 .unwrap_or(p_trimmed);
             let name: String = raw_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-            let hint = p_trimmed[pos + 1..].trim().to_string();
+            let hint = p_trimmed[pos + 1..].trim_start_matches(':').trim().to_string();
             return ParamDef {
                 name: if name.is_empty() { "arg".to_string() } else { name },
                 type_hint: Some(hint),
@@ -557,11 +557,16 @@ impl OmniParser {
             }
             if let Some(ci) = close_idx {
                 let mut suffix = after_name[ci + 1..].trim();
-                while suffix.ends_with('{') || suffix.ends_with(':') || suffix.ends_with(';') {
+                while suffix.ends_with('{') || suffix.ends_with(':') || suffix.ends_with(';') || suffix.ends_with('=') {
                     suffix = suffix[..suffix.len() - 1].trim();
                 }
                 if let Some(arrow_rest) = suffix.strip_prefix("->") {
                     let rt = arrow_rest.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+                    if !rt.is_empty() {
+                        return Some(rt.to_string());
+                    }
+                } else if let Some(colon_rest) = suffix.strip_prefix("::").or_else(|| suffix.strip_prefix(':')) {
+                    let rt = colon_rest.trim().trim_matches(|c| c == '"' || c == '\'').trim();
                     if !rt.is_empty() {
                         return Some(rt.to_string());
                     }
@@ -599,7 +604,7 @@ impl OmniParser {
             })
             .collect();
         if let Some(&first) = p_tokens.first() {
-            if !matches!(first, "def" | "fn" | "func" | "function") {
+            if !matches!(first, "def" | "fn" | "func" | "function" | "fun" | "proc") {
                 let joined = p_tokens.drain(..).collect::<Vec<_>>().join(" ");
                 if !joined.is_empty() {
                     return Some(joined);
@@ -610,34 +615,78 @@ impl OmniParser {
         None
     }
 
+    pub fn unwrap_outer_balanced_parens(raw: &str) -> String {
+        let mut s = raw.trim();
+        loop {
+            if !(s.starts_with('(') && s.ends_with(')')) {
+                return s.to_string();
+            }
+            let mut depth = 0i32;
+            let mut in_quote: Option<char> = None;
+            let mut esc = false;
+            let mut wraps_entire = true;
+            let chars: Vec<char> = s.chars().collect();
+            for (idx, &c) in chars.iter().enumerate() {
+                if let Some(q) = in_quote {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == q {
+                        in_quote = None;
+                    }
+                    continue;
+                }
+                if c == '"' || c == '\'' {
+                    in_quote = Some(c);
+                    continue;
+                }
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 && idx + 1 < chars.len() {
+                        wraps_entire = false;
+                        break;
+                    }
+                }
+            }
+            if wraps_entire && depth == 0 {
+                s = s[1..s.len() - 1].trim();
+            } else {
+                return s.to_string();
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
-            // Polyglot function pattern covering Python, Rust, Go, JS, Lua, Java, C#, C/C++ (including Go `(T, error)` multi-returns)
+            // Polyglot function pattern covering Python, Rust, Go, Kotlin, Swift, Julia, Nim, Ruby, Zig, Dart, JS, Lua, Java, C#, C/C++
             fn_re: Regex::new(
-                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|i32|i64|u32|u64|long|float|float32|float64|f32|f64|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*(?:<[^>]*>)?\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|\([^)]*\)|[a-zA-Z_0-9*&\[\]:,"' .<>]+)|\([^)]*\)\s*|[a-zA-Z_0-9*&\[\]:.<>]+\s*)?(?::|\{|\;)?$"#,
+                r#"^(?:(?:(?:public|private|protected|internal|pub|abstract|virtual|override|inline|sealed|open|suspend)\s+)*(?:static\s+)?(?:async\s+)?(?:def|fn|func|fun|proc|function|(?:(?:[A-Z][a-zA-Z0-9_<>*&\[\]:]*|int|int32|int64|i32|i64|u32|u64|long|float|float32|float64|f32|f64|double|bool|boolean|void|char\*|auto|string|String|List\[.*?\])\s+))|(?:local\s+)?function\s+)\s*([a-zA-Z_0-9]+)\s*(?:<[^>]*>)?\s*\((.*?)\)\s*(?:->\s*(?:"[^"]*"|'[^']*'|\([^)]*\)|[a-zA-Z_0-9*&\[\]:,"' .<>]+)|::?\s*[a-zA-Z_0-9*&\[\]:.<>]+\s*|\([^)]*\)\s*|[a-zA-Z_0-9*&\[\]:.<>]+\s*)?(?::|\{|\;|\=)?$"#,
             )
             .unwrap(),
-            // Matches if (x > 10) {, if x > 10 {, if x > 10:
-            if_re: Regex::new(r#"^if\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
-            // Matches elif x == 5:, else if (x == 5) {, else if x == 5 {
-            elif_re: Regex::new(r#"^(?:elif|else\s+if)\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
+            // Matches if (x > 10) {, if x > 10 {, if (a) and (b):
+            if_re: Regex::new(r#"^if\b\s*(.*?)\s*(?::|\{)?$"#).unwrap(),
+            // Matches elif x == 5:, elsif x == 5, else if (x == 5) {, else if x == 5 {
+            elif_re: Regex::new(r#"^(?:elif|elsif|else\s+if)\b\s*(.*?)\s*(?::|\{)?$"#).unwrap(),
             // Matches else:, else {
             else_re: Regex::new(r#"^else\s*(?::|\{)?$"#).unwrap(),
-            // Matches while (x > 0) {, while x > 0 {, while x > 0:
-            while_re: Regex::new(r#"^while\s*(?:\((.*)\)|(.*?))\s*(?::|\{)?$"#).unwrap(),
+            // Matches while (x > 0) {, while x > 0 {, while (f(x)) != 0:
+            while_re: Regex::new(r#"^while\b\s*(.*?)\s*(?::|\{)?$"#).unwrap(),
             // Matches for i in len(items):, for i in range(10):, for i in 10:
             plain_for_re: Regex::new(
-                r#"^for\s+(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*(?::|\{)?$"#,
+                r#"^for\s+(?:(?:int|let|var|val)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*(?::|\{)?$"#,
             )
             .unwrap(),
             // Matches for (i in 10), for (i in items)
             paren_for_re: Regex::new(
-                r#"^for\s*\(\s*(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*\)\s*(?::|\{)?$"#,
+                r#"^for\s*\(\s*(?:(?:int|let|var|val)\s+)?([a-zA-Z_0-9]+)\s+in\s+(?:range\s*\(\s*(.+?)\s*\)|(.+?))\s*\)\s*(?::|\{)?$"#,
             )
             .unwrap(),
             // Matches for (int i = 0; i < 10; i++) {
             c_for_re: Regex::new(
-                r#"^for\s*\(\s*(?:(?:int|let|var)\s+)?([a-zA-Z_0-9]+)\s*=\s*0\s*;\s*[a-zA-Z_0-9]+\s*<\s*(.+?)\s*;\s*[^)]*\)\s*(?::|\{)?$"#,
+                r#"^for\s*\(\s*(?:(?:int|let|var|val)\s+)?([a-zA-Z_0-9]+)\s*=\s*0\s*;\s*[a-zA-Z_0-9]+\s*<\s*(.+?)\s*;\s*[^)]*\)\s*(?::|\{)?$"#,
             )
             .unwrap(),
             print_re: Regex::new(
@@ -651,12 +700,12 @@ impl OmniParser {
             walrus_assign_re: Regex::new(r#"^([a-zA-Z_0-9]+)\s*:=\s*(.+?)\s*;?$"#).unwrap(),
             // Matches x = 5, int x = 0, let count = 10, let mut acc = 20, let total: i64 = 0, self.val = 20, var y = 2, User u = new User(...)
             assign_re: Regex::new(
-                r#"^(?:(let(?:\s+mut)?|const|var|[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|float|double|bool|boolean|String|string|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>\[\]]+)?\s*=\s*(.+?)\s*;?$"#,
+                r#"^(?:(let(?:\s+mut)?|const|var|val|[A-Z][a-zA-Z0-9_<>*&]*|int|int32|int64|float|double|bool|boolean|String|string|auto)\s+)?([a-zA-Z_0-9]+(?:\.[a-zA-Z_0-9]+)*)(?:\s*:\s*[a-zA-Z_0-9*&<>\[\]]+)?\s*=\s*(.+?)\s*;?$"#,
             )
             .unwrap(),
             // Matches ch := make(chan int, 8), ch = Channel(10), let ch = Chan(4)
             make_chan_re: Regex::new(
-                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*(?:make\s*\(\s*chan\s+[a-zA-Z_0-9*]+\s*(?:,\s*([0-9]+))?\s*\)|(?:Channel|Chan)\s*\(\s*([0-9]+)?\s*\))\s*;?$"#,
+                r#"^(?:(let|const|var|val)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*(?:make\s*\(\s*chan\s+[a-zA-Z_0-9*]+\s*(?:,\s*([0-9]+))?\s*\)|(?:Channel|Chan)\s*\(\s*([0-9]+)?\s*\))\s*;?$"#,
             )
             .unwrap(),
             // Matches ch <- 42, out_chan.send(val)
@@ -666,12 +715,12 @@ impl OmniParser {
             .unwrap(),
             // Matches val := <-ch, val = <-ch, val = ch.recv(), <-ch
             chan_recv_re: Regex::new(
-                r#"^(?:(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))\s*;?$"#,
+                r#"^(?:(?:(let|const|var|val)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*)?(?:<-\s*([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+)\.recv\s*\(\s*\))\s*;?$"#,
             )
             .unwrap(),
             // Matches items = [10, 20, 30], items := [], const items = [1, 2]
             list_init_re: Regex::new(
-                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)(?:\s*:\s*[a-zA-Z0-9_*&<>\[\]]+)?\s*(?::=|=)\s*\[(.*)\]\s*;?$"#,
+                r#"^(?:(let|const|var|val)\s+)?([a-zA-Z_0-9]+)(?:\s*:\s*[a-zA-Z0-9_*&<>\[\]]+)?\s*(?::=|=)\s*\[(.*)\]\s*;?$"#,
             )
             .unwrap(),
             // Matches items.append(40), items.push(50), items.add(60)
@@ -686,7 +735,7 @@ impl OmniParser {
             .unwrap(),
             // Matches m = {"alice": 100, "bob": 200}, m := {}
             map_init_re: Regex::new(
-                r#"^(?:(let|const|var)\s+)?([a-zA-Z_0-9]+)\s*(?::=|=)\s*\{(.*)\}\s*;?$"#,
+                r#"^(?:(let|const|var|val)\s+)?([a-zA-Z_0-9]+)(?:\s*:\s*[a-zA-Z_0-9_*&<>\[\], ]+)?\s*(?::=|=)\s*\{(.*)\}\s*;?$"#,
             )
             .unwrap(),
         }
@@ -1591,72 +1640,136 @@ impl OmniParser {
                 continue;
             }
 
-            // Multi-line expressions: `methods = { ... }`, `items = [ ... ]`, `tuple = ( ... )`, or multi-line calls `fn( ... )`
-            let is_dict_assign = trimmed.ends_with('{')
-                && trimmed[..trimmed.len() - 1].trim().ends_with('=');
-            let has_open_delimiter =
-                trimmed.ends_with('(') || trimmed.ends_with('[') || is_dict_assign;
-            if has_open_delimiter {
-                let (open_char, close_char) = if trimmed.ends_with('{') {
-                    ('{', '}')
-                } else if trimmed.ends_with('[') {
-                    ('[', ']')
-                } else {
-                    ('(', ')')
-                };
-                let count_delim_delta = |s: &str| -> isize {
-                    let mut delta = 0isize;
-                    let mut in_q: Option<char> = None;
-                    let mut esc = false;
-                    for ch in s.chars() {
-                        if esc {
-                            esc = false;
-                            continue;
-                        }
-                        if in_q.is_some() {
-                            if ch == '\\' {
-                                esc = true;
-                            } else if Some(ch) == in_q {
-                                in_q = None;
-                            }
-                            continue;
-                        }
-                        if ch == '"' || ch == '\'' || ch == '`' {
-                            in_q = Some(ch);
-                        } else if ch == open_char {
-                            delta += 1;
-                        } else if ch == close_char {
-                            delta -= 1;
-                        }
+            // Generalized multi-line expression/header joining:
+            // Join subsequent lines whenever `( )`, `[ ]`, or dict-literal `{ }` depth > 0,
+            // OR when a line ends with an explicit continuation (`\`) or binary continuation operator.
+            let scan_delim_deltas = |s: &str| -> (isize, isize, isize) {
+                let mut p_d = 0isize;
+                let mut b_d = 0isize;
+                let mut c_d = 0isize;
+                let mut in_q: Option<char> = None;
+                let mut esc = false;
+                for ch in s.chars() {
+                    if esc {
+                        esc = false;
+                        continue;
                     }
-                    delta
-                };
-                let mut delim_depth = count_delim_delta(trimmed);
+                    if in_q.is_some() {
+                        if ch == '\\' {
+                            esc = true;
+                        } else if Some(ch) == in_q {
+                            in_q = None;
+                        }
+                        continue;
+                    }
+                    match ch {
+                        '"' | '\'' | '`' => in_q = Some(ch),
+                        '(' => p_d += 1,
+                        ')' => p_d -= 1,
+                        '[' => b_d += 1,
+                        ']' => b_d -= 1,
+                        '{' => c_d += 1,
+                        '}' => c_d -= 1,
+                        _ => {}
+                    }
+                }
+                (p_d, b_d, c_d)
+            };
+            let has_trailing_cont_op = |s: &str| -> bool {
+                let t = s.trim_end();
+                if t.is_empty() || t.ends_with('{') || t.ends_with('}') || t.ends_with(';') || t.ends_with(':') {
+                    return false;
+                }
+                if t.ends_with('\\') {
+                    return true;
+                }
+                if t.ends_with("++") || t.ends_with("--") || t.ends_with("->") || t.ends_with("=>") || t.ends_with("<-") {
+                    return false;
+                }
+                if t.ends_with("&&")
+                    || t.ends_with("||")
+                    || t.ends_with("==")
+                    || t.ends_with("!=")
+                    || t.ends_with("<=")
+                    || t.ends_with(">=")
+                    || t.ends_with("<<")
+                    || t.ends_with(">>")
+                    || t.ends_with("**")
+                    || t.ends_with("//")
+                    || t.ends_with("|>")
+                    || t.ends_with(" ?")
+                    || t.ends_with(" and")
+                    || t.ends_with(" or")
+                    || t.ends_with('+')
+                {
+                    return true;
+                }
+                // Single-char binary operators `-`, `*`, `/`, `%`, `|`, `^`, `&` when preceded by expression context
+                if (t.ends_with('-') || t.ends_with('*') || t.ends_with('/') || t.ends_with('%') || t.ends_with('|') || t.ends_with('^') || t.ends_with('&'))
+                    && !t.starts_with('|')
+                    && !t.starts_with('@')
+                    && (t.contains('=') || t.starts_with("return ") || t.starts_with("if ") || t.starts_with("while ") || t.starts_with("elif "))
+                {
+                    return true;
+                }
+                false
+            };
+
+            let is_dict_assign = {
+                let t_no_brace = trimmed.strip_suffix('{').map(|s| s.trim_end());
+                matches!(t_no_brace, Some(b) if b.ends_with('=') || b.ends_with(":=") || b == "return")
+            };
+            let (mut p_depth, mut b_depth, mut c_depth) = scan_delim_deltas(trimmed);
+            let track_c_depth = is_dict_assign;
+            let mut cont = p_depth > 0
+                || b_depth > 0
+                || (track_c_depth && c_depth > 0)
+                || has_trailing_cont_op(trimmed);
+
+            let joined_buf: String;
+            if cont {
                 let mut accum_str = trimmed.to_string();
-                while delim_depth > 0 && idx < raw_lines.len() {
+                if accum_str.ends_with('\\') {
+                    accum_str.pop();
+                    accum_str = accum_str.trim_end().to_string();
+                }
+                while cont && idx < raw_lines.len() {
                     let n_raw = raw_lines[idx];
                     idx += 1;
                     let n_stripped = Self::strip_trailing_comment(n_raw).trim();
                     if n_stripped.is_empty() {
                         continue;
                     }
-                    delim_depth += count_delim_delta(n_stripped);
-                    accum_str.push(' ');
+                    let (dp, db, dc) = scan_delim_deltas(n_stripped);
+                    p_depth += dp;
+                    b_depth += db;
+                    c_depth += dc;
+                    if !accum_str.is_empty() {
+                        accum_str.push(' ');
+                    }
                     accum_str.push_str(n_stripped);
+                    let had_backslash = accum_str.ends_with('\\');
+                    if had_backslash {
+                        accum_str.pop();
+                        accum_str = accum_str.trim_end().to_string();
+                    }
+                    cont = p_depth > 0
+                        || b_depth > 0
+                        || (track_c_depth && c_depth > 0)
+                        || had_backslash
+                        || (p_depth == 0 && b_depth == 0 && (!track_c_depth || c_depth <= 0) && has_trailing_cont_op(&accum_str));
                 }
-                if accum_str.ends_with(';') {
-                    accum_str.truncate(accum_str.len() - 1);
-                    accum_str = accum_str.trim_end().to_string();
-                }
-                let current_indent = " ".repeat(Self::indent_level(line).max(brace_depth * 4));
-                if !is_dict_assign && accum_str.ends_with('{') {
-                    accum_str = accum_str[..accum_str.len() - 1].trim_end().to_string();
+                if is_dict_assign {
+                    if accum_str.ends_with(';') {
+                        accum_str.truncate(accum_str.len() - 1);
+                        accum_str = accum_str.trim_end().to_string();
+                    }
+                    let current_indent = " ".repeat(Self::indent_level(line).max(brace_depth * 4));
                     out_lines.push(format!("{}{}", current_indent, accum_str));
-                    brace_depth += 1;
-                } else {
-                    out_lines.push(format!("{}{}", current_indent, accum_str));
+                    continue;
                 }
-                continue;
+                joined_buf = accum_str;
+                trimmed = joined_buf.trim();
             }
 
             // 1. Handle Lua/Ruby/Julia `end` block terminator
@@ -1687,6 +1800,70 @@ impl OmniParser {
                 line_str = line_str[..line_str.len() - 3].trim().to_string();
             }
 
+            // 4.5. Split top-level semicolon-separated statements on a single line (`a = 1; b = 2`)
+            // when `;` occurs at `()[]{}` depth 0 outside quotes and line is not a `for` header.
+            if line_str.contains(';') && !line_str.starts_with("for ") && !line_str.starts_with("for(") {
+                let mut semi_parts = Vec::new();
+                let mut seg_start = 0usize;
+                let mut pd = 0isize;
+                let mut bd = 0isize;
+                let mut cd = 0isize;
+                let mut in_q: Option<char> = None;
+                let mut esc = false;
+                for (bi, ch) in line_str.char_indices() {
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if in_q.is_some() {
+                        if ch == '\\' {
+                            esc = true;
+                        } else if Some(ch) == in_q {
+                            in_q = None;
+                        }
+                        continue;
+                    }
+                    match ch {
+                        '"' | '\'' | '`' => in_q = Some(ch),
+                        '(' => pd += 1,
+                        ')' => pd -= 1,
+                        '[' => bd += 1,
+                        ']' => bd -= 1,
+                        '{' => cd += 1,
+                        '}' => cd -= 1,
+                        ';' if pd == 0 && bd == 0 && cd == 0 => {
+                            let part = line_str[seg_start..bi].trim();
+                            if !part.is_empty() {
+                                semi_parts.push(part.to_string());
+                            }
+                            seg_start = bi + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if !semi_parts.is_empty() {
+                    let tail_part = line_str[seg_start..].trim();
+                    if !tail_part.is_empty() {
+                        semi_parts.push(tail_part.to_string());
+                    }
+                    if semi_parts.len() > 1 {
+                        let count = Self::indent_level(line);
+                        let current_indent = " ".repeat(count.max(brace_depth * 4));
+                        for mut sub in semi_parts {
+                            if let Some(caps) = inc_re.captures(&sub) {
+                                let var = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+                                sub = format!("{} = {} + 1", var, var);
+                            } else if let Some(caps) = dec_re.captures(&sub) {
+                                let var = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+                                sub = format!("{} = {} - 1", var, var);
+                            }
+                            out_lines.push(format!("{}{}", current_indent, sub));
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // 5. Handle C-style increment/decrement: `i++` / `++i` -> `i = i + 1`
             if let Some(caps) = inc_re.captures(&line_str) {
                 let var = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
@@ -1706,7 +1883,13 @@ impl OmniParser {
             let count = Self::indent_level(line);
             let current_indent = " ".repeat(count.max(brace_depth * 4));
 
-            // 7. Handle Ruby/Perl Postfix `if`: `return 0 if x > 10` -> `if x > 10: return 0`
+            // 6.5. Handle Ruby/Perl `unless <cond>` block header -> `if !(<cond>):`
+            if let Some(unless_cond) = line_str.strip_prefix("unless ") {
+                let clean_c = unless_cond.trim().trim_end_matches(':').trim();
+                line_str = format!("if !({})", clean_c);
+            }
+
+            // 7. Handle Ruby/Perl Postfix `if` / `unless`: `return 0 if x > 10` -> `if x > 10: return 0`
             // Ensure we do NOT match inside string literals like print("what if now") or list comprehensions `[x for x in y if ...]`
             if !line_str.starts_with("if ")
                 && !line_str.starts_with("if(")
@@ -1714,6 +1897,13 @@ impl OmniParser {
                 && !line_str.contains('\'')
                 && !(line_str.contains('[') && line_str.contains(" for "))
             {
+                if let Some((stmt_part, unless_cond)) = line_str.rsplit_once(" unless ") {
+                    if !stmt_part.trim().is_empty() && !unless_cond.trim().is_empty() {
+                        out_lines.push(format!("{}if !({}):", current_indent, unless_cond.trim()));
+                        out_lines.push(format!("{}    {}", current_indent, stmt_part.trim()));
+                        continue;
+                    }
+                }
                 if let Some(caps) = postfix_if_re.captures(&line_str) {
                     let stmt = caps[1].trim();
                     let cond = caps[2].trim();
@@ -2500,7 +2690,7 @@ impl OmniParser {
 
                         method_decorators.clear();
 
-                        // Field definitions
+                        // Field definitions (Java `private int width = 760;`, Python/Kotlin/Rust `pub xy: i64,`)
                         if !next_trimmed.contains('(')
                             && !next_trimmed.contains(')')
                             && !next_trimmed.starts_with("return")
@@ -2509,26 +2699,40 @@ impl OmniParser {
                             && !next_trimmed.starts_with(">>>")
                             && !next_trimmed.starts_with(':')
                         {
-                            let clean_line = next_trimmed.trim_end_matches(';').trim();
-                            if clean_line.contains('=') && !clean_line.starts_with("if") {
+                            let clean_line = next_trimmed
+                                .trim_end_matches(';')
+                                .trim_end_matches(',')
+                                .trim();
+                            let (decl_part, default_val_opt) = if clean_line.contains('=') && !clean_line.starts_with("if") {
                                 let parts: Vec<&str> = clean_line.splitn(2, '=').collect();
-                                let decl = parts[0].trim();
-                                let default_val = parts[1].trim().to_string();
-                                let f_tokens: Vec<&str> = decl.split_whitespace().collect();
-                                let f_name = f_tokens.last().unwrap_or(&decl).to_string();
-                                class_fields.push(FieldDef {
-                                    name: f_name,
-                                    type_hint: None,
-                                    default_val: Some(default_val),
-                                });
+                                (parts[0].trim(), Some(parts[1].trim().to_string()))
                             } else {
-                                let clean_decl = clean_line
-                                    .trim_start_matches("public ")
-                                    .trim_start_matches("private ")
-                                    .trim_start_matches("protected ")
-                                    .trim_start_matches("static ")
-                                    .trim_start_matches("final ")
-                                    .trim();
+                                (clean_line, None)
+                            };
+                            let clean_decl = decl_part
+                                .trim_start_matches("public ")
+                                .trim_start_matches("private ")
+                                .trim_start_matches("protected ")
+                                .trim_start_matches("pub ")
+                                .trim_start_matches("static ")
+                                .trim_start_matches("final ")
+                                .trim_start_matches("val ")
+                                .trim_start_matches("var ")
+                                .trim_start_matches("let ")
+                                .trim_start_matches("mut ")
+                                .trim();
+                            if clean_decl.contains(':') {
+                                let cparts: Vec<&str> = clean_decl.splitn(2, ':').collect();
+                                let f_name = cparts[0].split_whitespace().last().unwrap_or(cparts[0]).trim().to_string();
+                                let t_str = cparts[1].trim_start_matches(':').trim().to_string();
+                                if !f_name.is_empty() {
+                                    class_fields.push(FieldDef {
+                                        name: f_name,
+                                        type_hint: if t_str.is_empty() { None } else { Some(t_str) },
+                                        default_val: default_val_opt,
+                                    });
+                                }
+                            } else {
                                 let tokens: Vec<&str> = clean_decl.split_whitespace().collect();
                                 if tokens.len() >= 2 {
                                     let type_str = tokens[0].to_string();
@@ -2536,13 +2740,13 @@ impl OmniParser {
                                     class_fields.push(FieldDef {
                                         name: f_name,
                                         type_hint: Some(type_str),
-                                        default_val: None,
+                                        default_val: default_val_opt,
                                     });
-                                } else if tokens.len() == 1 {
+                                } else if tokens.len() == 1 && !tokens[0].is_empty() {
                                     class_fields.push(FieldDef {
                                         name: tokens[0].to_string(),
                                         type_hint: None,
-                                        default_val: None,
+                                        default_val: default_val_opt,
                                     });
                                 }
                             }
@@ -3014,7 +3218,7 @@ impl OmniParser {
 
             // 1. If statement with optional elif/else
             if let Some(caps) = self.if_re.captures(text) {
-                let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
+                let condition = Self::unwrap_outer_balanced_parens(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
 
                 let (then_branch, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 let mut else_branch = None;
@@ -3024,7 +3228,7 @@ impl OmniParser {
                 while next_i < lines.len() && lines[next_i].0 == indent {
                     let next_text = lines[next_i].1.trim();
                     if let Some(elif_caps) = self.elif_re.captures(next_text) {
-                        let elif_cond = elif_caps.get(1).or_else(|| elif_caps.get(2)).unwrap().as_str().trim().to_string();
+                        let elif_cond = Self::unwrap_outer_balanced_parens(elif_caps.get(1).map(|m| m.as_str()).unwrap_or(""));
                         let (elif_then, after_elif) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
                         *current_else = Some(vec![Statement::If {
                             condition: elif_cond,
@@ -3062,7 +3266,7 @@ impl OmniParser {
 
             // 2. While loop (with optional Python `while ... else:`)
             if let Some(caps) = self.while_re.captures(text) {
-                let condition = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str().trim().to_string();
+                let condition = Self::unwrap_outer_balanced_parens(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
                 let (body, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
                 if next_i < lines.len() && lines[next_i].0 == indent && self.else_re.is_match(lines[next_i].1.trim()) {
                     let (_else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
@@ -3311,7 +3515,68 @@ impl OmniParser {
                 continue;
             }
 
-            // 13. Polyglot Index Assignment: `items[0] = 99`, `m["key"] = 10`
+            // 13. Polyglot Index Assignment: `items[0] = 99`, `grid[1][0] = 99`, `self.items[i] = 10`, `m["key"] = 10`
+            if text.contains('[') && text.contains('=') && !text.starts_with("if ") && !text.starts_with("while ") {
+                let mut eq_split_byte = None;
+                let t_bytes = text.as_bytes();
+                let mut p_d = 0i32;
+                let mut b_d = 0i32;
+                let mut c_d = 0i32;
+                let mut in_dq = false;
+                let mut in_sq = false;
+                let mut bi = 0usize;
+                while bi < t_bytes.len() {
+                    let b = t_bytes[bi];
+                    if in_dq {
+                        if b == b'\\' { bi += 2; continue; }
+                        if b == b'"' { in_dq = false; }
+                    } else if in_sq {
+                        if b == b'\\' { bi += 2; continue; }
+                        if b == b'\'' { in_sq = false; }
+                    } else {
+                        match b {
+                            b'"' => in_dq = true,
+                            b'\'' => in_sq = true,
+                            b'(' => p_d += 1,
+                            b')' => p_d = (p_d - 1).max(0),
+                            b'[' => b_d += 1,
+                            b']' => b_d = (b_d - 1).max(0),
+                            b'{' => c_d += 1,
+                            b'}' => c_d = (c_d - 1).max(0),
+                            b'=' if p_d == 0 && b_d == 0 && c_d == 0 => {
+                                let prev = if bi > 0 { t_bytes[bi - 1] } else { 0 };
+                                let next = t_bytes.get(bi + 1).copied().unwrap_or(0);
+                                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                                    && next != b'='
+                                    && next != b'>'
+                                {
+                                    eq_split_byte = Some(bi);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    bi += 1;
+                }
+                if let Some(eq_idx) = eq_split_byte {
+                    let lhs_trim = text[..eq_idx].trim();
+                    let rhs_trim = text[eq_idx + 1..].trim().trim_end_matches(';').trim();
+                    if lhs_trim.ends_with(']') && !rhs_trim.is_empty() {
+                        if let Ok(lhs_ast) = Self::parse_expr(lhs_trim) {
+                            if let ExprAst::Index { target, index } = lhs_ast.node {
+                                stmts.push(Statement::IndexSet {
+                                    target: target.slice(lhs_trim).to_string(),
+                                    index_expr: index.slice(lhs_trim).to_string(),
+                                    val_expr: rhs_trim.to_string(),
+                                });
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(caps) = self.index_set_re.captures(text) {
                 let target = caps[1].trim().to_string();
                 let index_expr = caps[2].trim().to_string();
@@ -3345,19 +3610,24 @@ impl OmniParser {
                 let is_scoped = caps.get(1).is_some();
 
                 if clean_expr.starts_with('(') && clean_expr.ends_with(')') && clean_expr.contains(',') && !clean_expr.starts_with("(i32)") && !clean_expr.starts_with("(i64)") {
-                    let inner = &clean_expr[1..clean_expr.len() - 1];
-                    let elements = Self::split_respecting_quotes(inner, ',')
-                        .into_iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    stmts.push(Statement::ListInit {
-                        target,
-                        elements,
-                        is_scoped_decl: is_scoped,
-                    });
-                    i += 1;
-                    continue;
+                    let wrapped = Self::unwrap_outer_balanced_parens(clean_expr);
+                    let raw_parts = Self::split_respecting_quotes(&wrapped, ',');
+                    if raw_parts.len() >= 2 {
+                        let elements: Vec<String> = raw_parts
+                            .into_iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !elements.is_empty() {
+                            stmts.push(Statement::ListInit {
+                                target,
+                                elements,
+                                is_scoped_decl: is_scoped,
+                            });
+                            i += 1;
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -3498,6 +3768,1119 @@ impl OmniParser {
 
         let body = self.parse_block(&nested, fn_name, mem_norm);
         (body, j)
+    }
+
+    /// Parses an arbitrary polyglot expression into a span-preserving [`SpannedExpr`] AST
+    /// using the [`PolyglotLexicon`] binding-power table and postfix appliers (`.`, `[]`, `()`).
+    pub fn parse_expr(src: &str) -> Result<SpannedExpr, String> {
+        let tokens = tokenize_expr(src)?;
+        if tokens.is_empty() {
+            return Err("empty expression".to_string());
+        }
+        let mut parser = PrattParser { src, tokens: &tokens, pos: 0 };
+        let expr = parser.parse_bp(0)?;
+        if parser.pos != tokens.len() {
+            return Err(format!(
+                "unexpected trailing token '{}' at byte {}",
+                tokens[parser.pos].text, tokens[parser.pos].span.0
+            ));
+        }
+        Ok(expr)
+    }
+
+    /// Splits `src` at its lowest-precedence top-level binary operator using [`Self::parse_expr`],
+    /// returning `(lhs_slice, op, rhs_slice)` while respecting all parentheses, quotes, generics,
+    /// unary operators, right-associative `**`, and postfix appliers.
+    pub fn pratt_split_top_binary(src: &str) -> Option<(String, String, String)> {
+        let ast = Self::parse_expr(src).ok()?;
+        if let ExprAst::Binary { op, lhs, rhs } = ast.node {
+            Some((lhs.slice(src).to_string(), op, rhs.slice(src).to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+/// Span-preserving wrapper around an [`ExprAst`] node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpannedExpr {
+    pub node: ExprAst,
+    pub span: (usize, usize),
+}
+
+impl SpannedExpr {
+    pub fn slice<'a>(&self, src: &'a str) -> &'a str {
+        src.get(self.span.0..self.span.1).unwrap_or("").trim()
+    }
+}
+
+/// Parsed argument in a function/method/constructor invocation (`pos_val` or `key=val`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallArg {
+    pub name: Option<String>,
+    pub value: SpannedExpr,
+    pub raw: String,
+}
+
+/// Polyglot expression AST produced by [`OmniParser::parse_expr`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprAst {
+    IntLit(i64),
+    FloatLit(f64),
+    BoolLit(bool),
+    NullLit,
+    StrLit(String),
+    Ident(String),
+    ListLit(Vec<SpannedExpr>),
+    MapLit(Vec<(SpannedExpr, SpannedExpr)>),
+    Unary {
+        op: String,
+        rhs: Box<SpannedExpr>,
+    },
+    Binary {
+        op: String,
+        lhs: Box<SpannedExpr>,
+        rhs: Box<SpannedExpr>,
+    },
+    Ternary {
+        cond: Box<SpannedExpr>,
+        then_br: Box<SpannedExpr>,
+        else_br: Box<SpannedExpr>,
+    },
+    Member {
+        target: Box<SpannedExpr>,
+        field: String,
+    },
+    Index {
+        target: Box<SpannedExpr>,
+        index: Box<SpannedExpr>,
+    },
+    Call {
+        callee: Box<SpannedExpr>,
+        args: Vec<CallArg>,
+    },
+    New {
+        class_name: String,
+        args: Vec<CallArg>,
+    },
+    Cast {
+        expr: Box<SpannedExpr>,
+        target_type: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LexTokenKind {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Ident,
+    Op,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+    Comma,
+    Colon,
+    Question,
+    Dot,
+}
+
+#[derive(Debug, Clone)]
+struct LexToken<'a> {
+    kind: LexTokenKind,
+    text: &'a str,
+    span: (usize, usize),
+}
+
+/// Numeric binding-power lexicon for polyglot operators and postfix appliers.
+pub struct PolyglotLexicon;
+
+impl PolyglotLexicon {
+    pub fn prefix_rbp(op: &str) -> Option<u8> {
+        match op {
+            "not" => Some(18),
+            "-" | "+" | "!" | "~" => Some(60),
+            "new" => Some(85),
+            _ => None,
+        }
+    }
+
+    pub fn infix_bp(op: &str) -> Option<(u8, u8)> {
+        match op {
+            "?" | "if" => Some((4, 3)),
+            "|>" => Some((6, 7)),
+            "||" | "or" => Some((10, 11)),
+            "&&" | "and" => Some((14, 15)),
+            "==" | "!=" | "===" | "!==" | "~=" | "<" | "<=" | ">" | ">=" | "is" => Some((20, 21)),
+            "|" => Some((26, 27)),
+            "^" => Some((28, 29)),
+            "&" => Some((30, 31)),
+            "<<" | ">>" | ">>>" => Some((36, 37)),
+            "+" | "-" => Some((40, 41)),
+            "*" | "/" | "//" | "%" => Some((50, 51)),
+            "as" => Some((55, 56)),
+            "**" => Some((66, 65)),
+            _ => None,
+        }
+    }
+
+    pub const POSTFIX_LBP: u8 = 80;
+}
+
+fn is_ident_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+fn is_ident_cont_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn tokenize_expr(src: &str) -> Result<Vec<LexToken<'_>>, String> {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut tokens = Vec::new();
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        // Prefixed string literals: f"...", r"...", b"..."
+        if (b == b'f' || b == b'r' || b == b'b' || b == b'F' || b == b'R' || b == b'B')
+            && i + 1 < len
+            && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\'')
+        {
+            let start = i;
+            let quote = bytes[i + 1];
+            i += 2;
+            let mut esc = false;
+            let mut closed = false;
+            while i < len {
+                let c = bytes[i];
+                i += 1;
+                if esc {
+                    esc = false;
+                    continue;
+                }
+                if c == b'\\' {
+                    esc = true;
+                } else if c == quote {
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return Err("unterminated prefixed string literal".to_string());
+            }
+            let raw = &src[start..i];
+            tokens.push(LexToken {
+                kind: LexTokenKind::Str(raw.to_string()),
+                text: raw,
+                span: (start, i),
+            });
+            continue;
+        }
+
+        // Standard string literals: "...", '...', `...`
+        if b == b'"' || b == b'\'' || b == b'`' {
+            let start = i;
+            let quote = b;
+            i += 1;
+            let mut unescaped = String::new();
+            let mut esc = false;
+            let mut closed = false;
+            while i < len {
+                let ch = src[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+                if esc {
+                    match ch {
+                        'n' => unescaped.push('\n'),
+                        't' => unescaped.push('\t'),
+                        'r' => unescaped.push('\r'),
+                        '0' => unescaped.push('\0'),
+                        other => unescaped.push(other),
+                    }
+                    esc = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    esc = true;
+                } else if ch as u32 == quote as u32 {
+                    closed = true;
+                    break;
+                } else {
+                    unescaped.push(ch);
+                }
+            }
+            if !closed {
+                return Err("unterminated string literal".to_string());
+            }
+            tokens.push(LexToken {
+                kind: LexTokenKind::Str(unescaped),
+                text: &src[start..i],
+                span: (start, i),
+            });
+            continue;
+        }
+
+        // Numeric literals (hex, bin, oct, float, int)
+        let is_leading_dot_float = b == b'.'
+            && i + 1 < len
+            && bytes[i + 1].is_ascii_digit()
+            && !matches!(
+                tokens.last().map(|t: &LexToken<'_>| &t.kind),
+                Some(LexTokenKind::Ident | LexTokenKind::RParen | LexTokenKind::RBracket | LexTokenKind::Int(_))
+            );
+
+        if b.is_ascii_digit() || is_leading_dot_float {
+            let start = i;
+            if b == b'0' && i + 1 < len && matches!(bytes[i + 1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O') {
+                let radix = match bytes[i + 1] {
+                    b'x' | b'X' => 16,
+                    b'b' | b'B' => 2,
+                    _ => 8,
+                };
+                i += 2;
+                let digits_start = i;
+                while i < len
+                    && (bytes[i] == b'_'
+                        || (radix == 16 && bytes[i].is_ascii_hexdigit())
+                        || (radix == 8 && (b'0'..=b'7').contains(&bytes[i]))
+                        || (radix == 2 && (bytes[i] == b'0' || bytes[i] == b'1')))
+                {
+                    i += 1;
+                }
+                let clean: String = src[digits_start..i].chars().filter(|&c| c != '_').collect();
+                // Skip optional integer type suffixes (`u64`, `i64`, `L`, `UL`, etc.)
+                while i < len && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                let val = i64::from_str_radix(&clean, radix)
+                    .or_else(|_| u64::from_str_radix(&clean, radix).map(|u| u as i64))
+                    .map_err(|e| format!("invalid radix literal: {}", e))?;
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Int(val),
+                    text: &src[start..i],
+                    span: (start, i),
+                });
+                continue;
+            }
+
+            let mut is_float = false;
+            if b == b'.' {
+                is_float = true;
+                i += 1;
+            }
+            while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // Fractional part (avoiding Rust `..` range operator and method call `1.to_string()`)
+            if !is_float
+                && i < len
+                && bytes[i] == b'.'
+                && !(i + 1 < len && bytes[i + 1] == b'.')
+                && !(i + 1 < len && is_ident_start_byte(bytes[i + 1]))
+            {
+                is_float = true;
+                i += 1;
+                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                    i += 1;
+                }
+            }
+            // Scientific exponent (`e` / `E`)
+            if i < len && (bytes[i] == b'e' || bytes[i] == b'E') {
+                let mut exp_i = i + 1;
+                if exp_i < len && (bytes[exp_i] == b'+' || bytes[exp_i] == b'-') {
+                    exp_i += 1;
+                }
+                if exp_i < len && bytes[exp_i].is_ascii_digit() {
+                    is_float = true;
+                    i = exp_i + 1;
+                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                }
+            }
+            let num_end = i;
+            // Optional Rust/C suffix (`f64`, `f32`, `i64`, `u64`, `usize`, `L`, `f`)
+            if i < len && is_ident_start_byte(bytes[i]) {
+                let suf_start = i;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let suf = &src[suf_start..i];
+                if matches!(suf, "f" | "F" | "f32" | "f64" | "d" | "D") {
+                    is_float = true;
+                }
+            }
+            let clean: String = src[start..num_end].chars().filter(|&c| c != '_').collect();
+            if is_float {
+                let fv = clean.parse::<f64>().map_err(|e| format!("invalid float literal: {}", e))?;
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Float(fv),
+                    text: &src[start..i],
+                    span: (start, i),
+                });
+            } else {
+                let iv = clean
+                    .parse::<i64>()
+                    .or_else(|_| clean.parse::<u64>().map(|u| u as i64))
+                    .map_err(|e| format!("invalid int literal: {}", e))?;
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Int(iv),
+                    text: &src[start..i],
+                    span: (start, i),
+                });
+            }
+            continue;
+        }
+
+        // Identifiers (including Rust/C++ `::` path segments, `::<T>` turbofish, and `macro!` before `(`/`[`)
+        if is_ident_start_byte(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_cont_byte(bytes[i]) {
+                i += 1;
+            }
+            // Absorb `::Ident` and `::<...>` path segments
+            loop {
+                if i + 1 < len && bytes[i] == b':' && bytes[i + 1] == b':' {
+                    if i + 2 < len && is_ident_start_byte(bytes[i + 2]) {
+                        i += 2;
+                        while i < len && is_ident_cont_byte(bytes[i]) {
+                            i += 1;
+                        }
+                        continue;
+                    } else if i + 2 < len && bytes[i + 2] == b'<' {
+                        // Turbofish `::<...>`
+                        let mut depth = 1usize;
+                        let mut j = i + 3;
+                        while j < len && depth > 0 {
+                            if bytes[j] == b'<' {
+                                depth += 1;
+                            } else if bytes[j] == b'>' {
+                                depth -= 1;
+                            }
+                            j += 1;
+                        }
+                        if depth == 0 {
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            // Rust macro bang: `println!(...)` or `vec![...]`
+            if i + 1 < len && bytes[i] == b'!' && (bytes[i + 1] == b'(' || bytes[i + 1] == b'[') {
+                i += 1;
+            }
+            tokens.push(LexToken {
+                kind: LexTokenKind::Ident,
+                text: &src[start..i],
+                span: (start, i),
+            });
+            continue;
+        }
+
+        // Non-ASCII identifier start (Unicode identifiers)
+        if !b.is_ascii() {
+            let start = i;
+            for ch in src[i..].chars() {
+                if ch.is_alphanumeric() || ch == '_' {
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if i == start {
+                return Err(format!("unexpected non-ASCII character at byte {}", start));
+            }
+            tokens.push(LexToken {
+                kind: LexTokenKind::Ident,
+                text: &src[start..i],
+                span: (start, i),
+            });
+            continue;
+        }
+
+        // 3-character operators
+        if i + 2 < len {
+            let tri = &src[i..i + 3];
+            if matches!(tri, "===" | "!==" | ">>>" | "..." | "..=") {
+                if tri == "..." || tri == "..=" {
+                    return Err(format!("unsupported range/spread token '{}'", tri));
+                }
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Op,
+                    text: tri,
+                    span: (i, i + 3),
+                });
+                i += 3;
+                continue;
+            }
+        }
+
+        // 2-character operators
+        if i + 1 < len {
+            let duo = &src[i..i + 2];
+            if matches!(duo, "=>" | ".." | "<-" | ":=") {
+                return Err(format!("non-scalar expression operator '{}'", duo));
+            }
+            if duo == "?." {
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Dot,
+                    text: duo,
+                    span: (i, i + 2),
+                });
+                i += 2;
+                continue;
+            }
+            if matches!(duo, "**" | "//" | "==" | "!=" | "~=" | "<=" | ">=" | "<<" | ">>" | "&&" | "||" | "|>") {
+                tokens.push(LexToken {
+                    kind: LexTokenKind::Op,
+                    text: duo,
+                    span: (i, i + 2),
+                });
+                i += 2;
+                continue;
+            }
+        }
+
+        // Single-character delimiters & operators
+        let single = &src[i..i + 1];
+        let kind = match b {
+            b'(' => LexTokenKind::LParen,
+            b')' => LexTokenKind::RParen,
+            b'[' => LexTokenKind::LBracket,
+            b']' => LexTokenKind::RBracket,
+            b'{' => LexTokenKind::LBrace,
+            b'}' => LexTokenKind::RBrace,
+            b',' => LexTokenKind::Comma,
+            b':' => LexTokenKind::Colon,
+            b'?' => LexTokenKind::Question,
+            b'.' => LexTokenKind::Dot,
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!' | b'<' | b'>' | b'=' => {
+                LexTokenKind::Op
+            }
+            _ => return Err(format!("unexpected character '{}' at byte {}", single, i)),
+        };
+        tokens.push(LexToken {
+            kind,
+            text: single,
+            span: (i, i + 1),
+        });
+        i += 1;
+    }
+
+    Ok(tokens)
+}
+
+fn is_known_generic_type_ident(s: &str) -> bool {
+    let base = s.rsplit("::").next().unwrap_or(s);
+    base.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+        || matches!(
+            base,
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "int"
+                | "float"
+                | "double"
+                | "bool"
+                | "str"
+                | "string"
+                | "number"
+                | "any"
+                | "void"
+                | "char"
+        )
+}
+
+struct PrattParser<'a> {
+    src: &'a str,
+    tokens: &'a [LexToken<'a>],
+    pos: usize,
+}
+
+impl<'a> PrattParser<'a> {
+    fn peek(&self) -> Option<&'a LexToken<'a>> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Result<&'a LexToken<'a>, String> {
+        let tok = self
+            .tokens
+            .get(self.pos)
+            .ok_or_else(|| "unexpected end of expression".to_string())?;
+        self.pos += 1;
+        Ok(tok)
+    }
+
+    fn expect_kind(&mut self, expected: &LexTokenKind) -> Result<&'a LexToken<'a>, String> {
+        let tok = self.next()?;
+        if &tok.kind != expected {
+            return Err(format!("expected {:?}, got '{}'", expected, tok.text));
+        }
+        Ok(tok)
+    }
+
+    /// Lookahead for generic call type arguments `<T, U>(...)`: returns index AFTER matching `>` if valid.
+    fn try_scan_generic_call_args(&self) -> Option<usize> {
+        let first = self.tokens.get(self.pos)?;
+        if first.text != "<" {
+            return None;
+        }
+        let mut idx = self.pos + 1;
+        let mut depth = 1usize;
+        let mut saw_type_ident = false;
+        while idx < self.tokens.len() && depth > 0 {
+            let t = &self.tokens[idx];
+            match (&t.kind, t.text) {
+                (LexTokenKind::Op, "<") => depth += 1,
+                (LexTokenKind::Op, ">") => depth -= 1,
+                (LexTokenKind::Op, ">>") if depth >= 2 => depth -= 2,
+                (LexTokenKind::Ident, name) => {
+                    if !is_known_generic_type_ident(name) {
+                        return None;
+                    }
+                    saw_type_ident = true;
+                }
+                (LexTokenKind::Comma, _)
+                | (LexTokenKind::LBracket, _)
+                | (LexTokenKind::RBracket, _)
+                | (LexTokenKind::Op, "*" | "&") => {}
+                _ => return None,
+            }
+            idx += 1;
+        }
+        if depth == 0 && saw_type_ident {
+            if matches!(self.tokens.get(idx).map(|t| &t.kind), Some(LexTokenKind::LParen)) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn parse_call_args(&mut self) -> Result<(Vec<CallArg>, usize), String> {
+        let mut args = Vec::new();
+        if let Some(tok) = self.peek() {
+            if tok.kind == LexTokenKind::RParen {
+                let end = tok.span.1;
+                self.pos += 1;
+                return Ok((args, end));
+            }
+        }
+        loop {
+            let arg_start = self.peek().map(|t| t.span.0).unwrap_or(0);
+            let kw_name = if self.pos + 1 < self.tokens.len()
+                && self.tokens[self.pos].kind == LexTokenKind::Ident
+                && self.tokens[self.pos + 1].kind == LexTokenKind::Op
+                && self.tokens[self.pos + 1].text == "="
+            {
+                let name = self.tokens[self.pos].text.to_string();
+                self.pos += 2;
+                Some(name)
+            } else {
+                None
+            };
+            let val = self.parse_bp(0)?;
+            let arg_end = val.span.1;
+            let raw = self.src.get(arg_start..arg_end).unwrap_or("").trim().to_string();
+            args.push(CallArg {
+                name: kw_name,
+                value: val,
+                raw,
+            });
+            match self.peek() {
+                Some(tok) if tok.kind == LexTokenKind::Comma => {
+                    self.pos += 1;
+                    if let Some(after) = self.peek() {
+                        if after.kind == LexTokenKind::RParen {
+                            let end = after.span.1;
+                            self.pos += 1;
+                            return Ok((args, end));
+                        }
+                    }
+                }
+                Some(tok) if tok.kind == LexTokenKind::RParen => {
+                    let end = tok.span.1;
+                    self.pos += 1;
+                    return Ok((args, end));
+                }
+                other => {
+                    return Err(format!(
+                        "expected ',' or ')' in call arguments, got {:?}",
+                        other.map(|t| t.text)
+                    ));
+                }
+            }
+        }
+    }
+
+    fn parse_type_name(&mut self) -> Result<(String, usize), String> {
+        let first = self.next()?;
+        if first.kind != LexTokenKind::Ident && first.kind != LexTokenKind::Op {
+            return Err(format!("expected type name after 'as', got '{}'", first.text));
+        }
+        let start = first.span.0;
+        let mut end = first.span.1;
+        // Optional pointer `*` or generic `<...>` on type cast
+        while let Some(tok) = self.peek() {
+            if tok.text == "*" {
+                end = tok.span.1;
+                self.pos += 1;
+            } else if tok.text == "<" {
+                let mut depth = 1usize;
+                self.pos += 1;
+                while self.pos < self.tokens.len() && depth > 0 {
+                    let t = &self.tokens[self.pos];
+                    if t.text == "<" {
+                        depth += 1;
+                    } else if t.text == ">" {
+                        depth -= 1;
+                    } else if t.text == ">>" && depth >= 2 {
+                        depth -= 2;
+                    }
+                    end = t.span.1;
+                    self.pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok((self.src[start..end].trim().to_string(), end))
+    }
+
+    fn parse_nud(&mut self) -> Result<SpannedExpr, String> {
+        let tok = self.next()?;
+        match &tok.kind {
+            LexTokenKind::Int(v) => Ok(SpannedExpr {
+                node: ExprAst::IntLit(*v),
+                span: tok.span,
+            }),
+            LexTokenKind::Float(v) => Ok(SpannedExpr {
+                node: ExprAst::FloatLit(*v),
+                span: tok.span,
+            }),
+            LexTokenKind::Str(s) => Ok(SpannedExpr {
+                node: ExprAst::StrLit(s.clone()),
+                span: tok.span,
+            }),
+            LexTokenKind::LParen => {
+                if let Some(next_tok) = self.peek() {
+                    if next_tok.kind == LexTokenKind::RParen {
+                        return Err("empty tuple '()' is not a scalar expression".to_string());
+                    }
+                }
+                let mut inner = self.parse_bp(0)?;
+                // Reject tuples `(a, b)` so tuple handling / Pipe destructuring is untouched
+                if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Comma)) {
+                    return Err("tuple literal is not a scalar expression".to_string());
+                }
+                let rp = self.expect_kind(&LexTokenKind::RParen)?;
+                inner.span = (tok.span.0, rp.span.1);
+                Ok(inner)
+            }
+            LexTokenKind::LBracket => {
+                let start = tok.span.0;
+                let mut elems = Vec::new();
+                if let Some(t) = self.peek() {
+                    if t.kind == LexTokenKind::RBracket {
+                        let end = t.span.1;
+                        self.pos += 1;
+                        return Ok(SpannedExpr {
+                            node: ExprAst::ListLit(elems),
+                            span: (start, end),
+                        });
+                    }
+                }
+                loop {
+                    let elem = self.parse_bp(0)?;
+                    // Reject Python list comprehensions `[x for x in items]` so LLM escalation can handle them
+                    if matches!(self.peek().map(|t| t.text), Some("for")) {
+                        return Err("list comprehension requires non-literal lowering".to_string());
+                    }
+                    elems.push(elem);
+                    match self.peek() {
+                        Some(t) if t.kind == LexTokenKind::Comma => {
+                            self.pos += 1;
+                            if let Some(after) = self.peek() {
+                                if after.kind == LexTokenKind::RBracket {
+                                    let end = after.span.1;
+                                    self.pos += 1;
+                                    return Ok(SpannedExpr {
+                                        node: ExprAst::ListLit(elems),
+                                        span: (start, end),
+                                    });
+                                }
+                            }
+                        }
+                        Some(t) if t.kind == LexTokenKind::RBracket => {
+                            let end = t.span.1;
+                            self.pos += 1;
+                            return Ok(SpannedExpr {
+                                node: ExprAst::ListLit(elems),
+                                span: (start, end),
+                            });
+                        }
+                        other => {
+                            return Err(format!(
+                                "expected ',' or ']' in list literal, got {:?}",
+                                other.map(|t| t.text)
+                            ));
+                        }
+                    }
+                }
+            }
+            LexTokenKind::LBrace => {
+                let start = tok.span.0;
+                let mut entries = Vec::new();
+                if let Some(t) = self.peek() {
+                    if t.kind == LexTokenKind::RBrace {
+                        let end = t.span.1;
+                        self.pos += 1;
+                        return Ok(SpannedExpr {
+                            node: ExprAst::MapLit(entries),
+                            span: (start, end),
+                        });
+                    }
+                }
+                loop {
+                    let k = self.parse_bp(0)?;
+                    self.expect_kind(&LexTokenKind::Colon)?;
+                    let v = self.parse_bp(0)?;
+                    entries.push((k, v));
+                    match self.peek() {
+                        Some(t) if t.kind == LexTokenKind::Comma => {
+                            self.pos += 1;
+                            if let Some(after) = self.peek() {
+                                if after.kind == LexTokenKind::RBrace {
+                                    let end = after.span.1;
+                                    self.pos += 1;
+                                    return Ok(SpannedExpr {
+                                        node: ExprAst::MapLit(entries),
+                                        span: (start, end),
+                                    });
+                                }
+                            }
+                        }
+                        Some(t) if t.kind == LexTokenKind::RBrace => {
+                            let end = t.span.1;
+                            self.pos += 1;
+                            return Ok(SpannedExpr {
+                                node: ExprAst::MapLit(entries),
+                                span: (start, end),
+                            });
+                        }
+                        other => {
+                            return Err(format!(
+                                "expected ',' or '}}' in map literal, got {:?}",
+                                other.map(|t| t.text)
+                            ));
+                        }
+                    }
+                }
+            }
+            LexTokenKind::Op => {
+                if let Some(rbp) = PolyglotLexicon::prefix_rbp(tok.text) {
+                    let rhs = self.parse_bp(rbp)?;
+                    let end = rhs.span.1;
+                    Ok(SpannedExpr {
+                        node: ExprAst::Unary {
+                            op: tok.text.to_string(),
+                            rhs: Box::new(rhs),
+                        },
+                        span: (tok.span.0, end),
+                    })
+                } else {
+                    Err(format!("unexpected prefix operator '{}'", tok.text))
+                }
+            }
+            LexTokenKind::Ident => match tok.text {
+                "true" | "True" => Ok(SpannedExpr {
+                    node: ExprAst::BoolLit(true),
+                    span: tok.span,
+                }),
+                "false" | "False" => Ok(SpannedExpr {
+                    node: ExprAst::BoolLit(false),
+                    span: tok.span,
+                }),
+                "null" | "None" | "nil" | "nullptr" | "NULL" => Ok(SpannedExpr {
+                    node: ExprAst::NullLit,
+                    span: tok.span,
+                }),
+                "lambda" | "fn" | "func" => Err("inline lambda/closure expression".to_string()),
+                "not" => {
+                    let rbp = PolyglotLexicon::prefix_rbp("not").unwrap();
+                    let rhs = self.parse_bp(rbp)?;
+                    let end = rhs.span.1;
+                    Ok(SpannedExpr {
+                        node: ExprAst::Unary {
+                            op: "not".to_string(),
+                            rhs: Box::new(rhs),
+                        },
+                        span: (tok.span.0, end),
+                    })
+                }
+                "new" => {
+                    let cls_tok = self.next()?;
+                    if cls_tok.kind != LexTokenKind::Ident {
+                        return Err(format!("expected class name after 'new', got '{}'", cls_tok.text));
+                    }
+                    let mut class_name = cls_tok.text.to_string();
+                    let mut end = cls_tok.span.1;
+                    // Handle dotted class path `new pkg.ClassName(...)`
+                    while matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Dot)) {
+                        self.pos += 1;
+                        let seg = self.next()?;
+                        if seg.kind != LexTokenKind::Ident {
+                            return Err(format!("expected identifier after '.', got '{}'", seg.text));
+                        }
+                        class_name.push('.');
+                        class_name.push_str(seg.text);
+                        end = seg.span.1;
+                    }
+                    // Consume optional generic arguments `new ArrayList<Integer>(...)`
+                    if matches!(self.peek().map(|t| t.text), Some("<")) {
+                        let mut depth = 1usize;
+                        self.pos += 1;
+                        while self.pos < self.tokens.len() && depth > 0 {
+                            let gt = &self.tokens[self.pos];
+                            if gt.text == "<" {
+                                depth += 1;
+                            } else if gt.text == ">" {
+                                depth -= 1;
+                            } else if gt.text == ">>" && depth >= 2 {
+                                depth -= 2;
+                            }
+                            end = gt.span.1;
+                            self.pos += 1;
+                        }
+                    }
+                    let args = if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::LParen)) {
+                        self.pos += 1;
+                        let (parsed_args, call_end) = self.parse_call_args()?;
+                        end = call_end;
+                        parsed_args
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(SpannedExpr {
+                        node: ExprAst::New { class_name, args },
+                        span: (tok.span.0, end),
+                    })
+                }
+                _ => Ok(SpannedExpr {
+                    node: ExprAst::Ident(tok.text.to_string()),
+                    span: tok.span,
+                }),
+            },
+            _ => Err(format!("unexpected token '{}' at start of expression", tok.text)),
+        }
+    }
+
+    fn parse_bp(&mut self, min_bp: u8) -> Result<SpannedExpr, String> {
+        let mut lhs = self.parse_nud()?;
+
+        while let Some(tok) = self.peek() {
+            // 1. Postfix appliers: `.field`, `[index]`, `(args...)`, and `<T>(args...)`
+            if matches!(
+                tok.kind,
+                LexTokenKind::Dot | LexTokenKind::LBracket | LexTokenKind::LParen
+            ) {
+                if PolyglotLexicon::POSTFIX_LBP < min_bp {
+                    break;
+                }
+                match tok.kind {
+                    LexTokenKind::Dot => {
+                        self.pos += 1;
+                        let fld = self.next()?;
+                        if fld.kind != LexTokenKind::Ident {
+                            return Err(format!("expected field/method name after '.', got '{}'", fld.text));
+                        }
+                        let span = (lhs.span.0, fld.span.1);
+                        lhs = SpannedExpr {
+                            node: ExprAst::Member {
+                                target: Box::new(lhs),
+                                field: fld.text.to_string(),
+                            },
+                            span,
+                        };
+                        continue;
+                    }
+                    LexTokenKind::LBracket => {
+                        self.pos += 1;
+                        if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Colon)) {
+                            return Err("slice range indexing requires non-scalar lowering".to_string());
+                        }
+                        let idx_expr = self.parse_bp(0)?;
+                        if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Colon)) {
+                            return Err("slice range indexing requires non-scalar lowering".to_string());
+                        }
+                        let rb = self.expect_kind(&LexTokenKind::RBracket)?;
+                        let span = (lhs.span.0, rb.span.1);
+                        lhs = SpannedExpr {
+                            node: ExprAst::Index {
+                                target: Box::new(lhs),
+                                index: Box::new(idx_expr),
+                            },
+                            span,
+                        };
+                        continue;
+                    }
+                    LexTokenKind::LParen => {
+                        self.pos += 1;
+                        let (args, end) = self.parse_call_args()?;
+                        let span = (lhs.span.0, end);
+                        lhs = SpannedExpr {
+                            node: ExprAst::Call {
+                                callee: Box::new(lhs),
+                                args,
+                            },
+                            span,
+                        };
+                        continue;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            // Generic call applier `func<T>(args...)`
+            if tok.text == "<" && matches!(lhs.node, ExprAst::Ident(_) | ExprAst::Member { .. }) {
+                if let Some(lparen_idx) = self.try_scan_generic_call_args() {
+                    if PolyglotLexicon::POSTFIX_LBP < min_bp {
+                        break;
+                    }
+                    self.pos = lparen_idx + 1; // consume `<...>` and `(`
+                    let (args, end) = self.parse_call_args()?;
+                    let span = (lhs.span.0, end);
+                    lhs = SpannedExpr {
+                        node: ExprAst::Call {
+                            callee: Box::new(lhs),
+                            args,
+                        },
+                        span,
+                    };
+                    continue;
+                }
+            }
+
+            // 2. C/JS Ternary `cond ? then_br : else_br`
+            if tok.kind == LexTokenKind::Question {
+                let (lbp, rbp) = PolyglotLexicon::infix_bp("?").unwrap();
+                if lbp < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let then_br = self.parse_bp(0)?;
+                self.expect_kind(&LexTokenKind::Colon)?;
+                let else_br = self.parse_bp(rbp)?;
+                let span = (lhs.span.0, else_br.span.1);
+                lhs = SpannedExpr {
+                    node: ExprAst::Ternary {
+                        cond: Box::new(lhs),
+                        then_br: Box::new(then_br),
+                        else_br: Box::new(else_br),
+                    },
+                    span,
+                };
+                continue;
+            }
+
+            // 3. Python inline conditional `then_br if cond else else_br`
+            if tok.kind == LexTokenKind::Ident && tok.text == "if" {
+                let (lbp, rbp) = PolyglotLexicon::infix_bp("if").unwrap();
+                if lbp < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let cond = self.parse_bp(0)?;
+                let else_tok = self.next()?;
+                if else_tok.text != "else" {
+                    return Err(format!("expected 'else' in conditional expression, got '{}'", else_tok.text));
+                }
+                let else_br = self.parse_bp(rbp)?;
+                let span = (lhs.span.0, else_br.span.1);
+                lhs = SpannedExpr {
+                    node: ExprAst::Ternary {
+                        cond: Box::new(cond),
+                        then_br: Box::new(lhs),
+                        else_br: Box::new(else_br),
+                    },
+                    span,
+                };
+                continue;
+            }
+
+            // 4. Rust / TypeScript `expr as Type`
+            if tok.kind == LexTokenKind::Ident && tok.text == "as" {
+                let (lbp, _) = PolyglotLexicon::infix_bp("as").unwrap();
+                if lbp < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let (target_type, end) = self.parse_type_name()?;
+                let span = (lhs.span.0, end);
+                lhs = SpannedExpr {
+                    node: ExprAst::Cast {
+                        expr: Box::new(lhs),
+                        target_type,
+                    },
+                    span,
+                };
+                continue;
+            }
+
+            // 5. Infix binary operators (`+`, `*`, `**`, `&&`, `and`, `is`, `is not`, etc.)
+            if matches!(tok.kind, LexTokenKind::Op | LexTokenKind::Ident) {
+                if let Some((lbp, rbp)) = PolyglotLexicon::infix_bp(tok.text) {
+                    if lbp < min_bp {
+                        break;
+                    }
+                    let op_tok = self.next()?;
+                    let op_str = if op_tok.text == "is"
+                        && matches!(self.peek().map(|t| t.text), Some("not"))
+                    {
+                        self.pos += 1;
+                        "is not".to_string()
+                    } else {
+                        op_tok.text.to_string()
+                    };
+                    let rhs = self.parse_bp(rbp)?;
+                    let span = (lhs.span.0, rhs.span.1);
+                    lhs = SpannedExpr {
+                        node: ExprAst::Binary {
+                            op: op_str,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        span,
+                    };
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        Ok(lhs)
     }
 }
 
@@ -3899,5 +5282,139 @@ def py_math(a, b):
         assert!(stripped.contains("(*ptr)"), "stripped broke C deref: {}", stripped);
         assert!(stripped.contains("{-1, -2}"), "stripped broke negative set: {}", stripped);
         assert!(stripped.contains("% (a, b)"), "stripped broke multiline % fmt: {}", stripped);
+    }
+
+    #[test]
+    fn test_pratt_precedence_and_appliers() {
+        // 1. Bitwise precedence: `1 | 2 & 0` -> `1 | (2 & 0)` (root is `|`)
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("1 | 2 & 0").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("1", "|", "2 & 0"));
+
+        // 2. Exponentiation tighter than `*` and right-associative:
+        //    `2 * 3 ** 2` -> `2 * (3 ** 2)` (root is `*`)
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("2 * 3 ** 2").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("2", "*", "3 ** 2"));
+
+        //    `2 ** 3 ** 2` -> `2 ** (3 ** 2)` (right-associative!)
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("2 ** 3 ** 2").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("2", "**", "3 ** 2"));
+
+        // 3. Unary `-` looser than `**`, while `(-3) ** 2` binds `-3` as LHS of `**`
+        assert!(OmniParser::pratt_split_top_binary("-3 ** 2").is_none());
+        let neg_pow = OmniParser::parse_expr("-3 ** 2").unwrap();
+        assert!(matches!(neg_pow.node, ExprAst::Unary { ref op, .. } if op == "-"));
+
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("(-3) ** 2").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("(-3)", "**", "2"));
+
+        // 3b. Parenthesized group inside chained arithmetic `(0 - n) * 2 - 1` must preserve outer parens in slice
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("(0 - n) * 2 - 1").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("(0 - n) * 2", "-", "1"));
+        let (inner_l, inner_op, inner_r) = OmniParser::pratt_split_top_binary(&lhs).unwrap();
+        assert_eq!((inner_l.as_str(), inner_op.as_str(), inner_r.as_str()), ("(0 - n)", "*", "2"));
+
+        // 4. Two calls in a binary expression (`foo(1) + bar(2)`) must split at `+`, never merge args!
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("foo(1) + bar(2)").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("foo(1)", "+", "bar(2)"));
+
+        // 5. Parenthesized boolean precedence: `false && (false || true)` splits at `&&`
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("false && (false || true)").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("false", "&&", "(false || true)"));
+
+        // 6. Chained postfix appliers: `self.items[i + 1].calc(k=10)[0]`
+        let src = "self.items[i + 1].calc(k=10)[0]";
+        let ast = OmniParser::parse_expr(src).unwrap();
+        if let ExprAst::Index { target, index } = &ast.node {
+            assert_eq!(index.slice(src), "0");
+            assert_eq!(target.slice(src), "self.items[i + 1].calc(k=10)");
+            if let ExprAst::Call { callee, args } = &target.node {
+                assert_eq!(callee.slice(src), "self.items[i + 1].calc");
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].name.as_deref(), Some("k"));
+                assert_eq!(args[0].value.slice(src), "10");
+            } else {
+                panic!("Expected Call inside outer Index, got {:?}", target.node);
+            }
+        } else {
+            panic!("Expected outer Index, got {:?}", ast.node);
+        }
+
+        // 7. Generic constructor & generic call appliers
+        let gen_new = OmniParser::parse_expr("new ArrayList<Integer>(10)").unwrap();
+        assert!(matches!(gen_new.node, ExprAst::New { ref class_name, ref args } if class_name == "ArrayList" && args.len() == 1));
+        let gen_call = OmniParser::parse_expr("identity<i64>(42)").unwrap();
+        assert!(matches!(gen_call.node, ExprAst::Call { .. }));
+    }
+
+    #[test]
+    fn test_multiline_and_semicolon_canonicalization() {
+        let src = r#"
+fn calc() -> i64 {
+    a = 10; b = 20; a++;
+    total = a +
+        b *
+        2
+    res = add_vals(
+        total,
+        5
+    )
+    return res
+}
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("canon_test", src);
+        assert_eq!(module.functions.len(), 1);
+        let f = &module.functions[0];
+        // `a = 10`, `b = 20`, `a = a + 1`, `total = a + b * 2`, `res = add_vals( total, 5 )`, `return res`
+        assert_eq!(f.body.len(), 6, "body: {:#?}", f.body);
+    }
+
+    #[test]
+    fn test_polyglot_kotlin_swift_julia_nim_ruby_pipe() {
+        assert_eq!(
+            OmniParser::unwrap_outer_balanced_parens("(frame % 12 == 0) and (b % 3 == 0)"),
+            "(frame % 12 == 0) and (b % 3 == 0)"
+        );
+        assert_eq!(
+            OmniParser::unwrap_outer_balanced_parens("((x > 10))"),
+            "x > 10"
+        );
+
+        let (lhs, op, rhs) = OmniParser::pratt_split_top_binary("b |> mix(frame) |> clamp(0, 255)").unwrap();
+        assert_eq!((lhs.as_str(), op.as_str(), rhs.as_str()), ("b |> mix(frame)", "|>", "clamp(0, 255)"));
+
+        let src = r#"
+fun kt_clamp(v: Int, lo: Int, hi: Int): Int {
+    val low = v < lo ? lo : v
+    return low > hi ? hi : low
+}
+
+func swift_mix(_ a: Double, _ b: Double) -> Double {
+    return a + b
+}
+
+function jl_wave(x::Float64)::Float64
+    return x * 2.0
+end
+
+proc nim_hash(seed: int64): int64 =
+    return seed ^ 42
+
+def rb_curve(ch)
+    unless ch >= 10
+        ch = ch + 5
+    elsif ch > 100
+        ch = 100
+    end
+    ch = ch + 1 unless ch % 2 == 0
+    return ch
+end
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("polyglot_ext", src);
+        let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["kt_clamp", "swift_mix", "jl_wave", "nim_hash", "rb_curve"]);
+        assert_eq!(module.functions[1].params[0].name, "a");
+        assert_eq!(module.functions[2].return_type.as_deref(), Some("Float64"));
     }
 }

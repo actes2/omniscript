@@ -66,6 +66,7 @@ void __omni_sleep_s(int64_t seconds);
 void __omni_sleep_ms(int64_t milliseconds);
 int64_t __omni_random_int(void);
 int64_t __omni_random_range(int64_t min, int64_t max);
+int64_t __omni_ipow64(int64_t base, int64_t exp);
 
 // Thread-Local Stack-Unwinding Exception Frame Runtime (setjmp / longjmp)
 void* __omni_try_push(void);
@@ -75,7 +76,7 @@ void __omni_rethrow(void);
 const char* __omni_catch_msg(void);
 const char* __omni_catch_type(void);
 int64_t __omni_catch_code(void);
-bool __omni_catch_matches(const char* expected_type);
+int32_t __omni_catch_matches(const char* expected_type);
 
 // Interpretive C-Frontier Short-Circuit Intrinsics & OS Socket Syscall Primitives
 char* __omni_c_http_get(const char* url, int32_t* status_out);

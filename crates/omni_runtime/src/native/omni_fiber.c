@@ -1,21 +1,36 @@
-#include "omni_fiber.h"
-#include <stdlib.h>
-#include <string.h>
-
 #if defined(_WIN32)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
-#define OMNI_HAS_WIN32_VM 1
+#define OMNI_HAS_WIN32_FIBERS 1
 #elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #define OMNI_HAS_MMAP 1
 #endif
 
-static OmniFiber* g_current_fiber = NULL;
-static OmniFiber g_main_fiber = {0};
-static OmniFiber* g_dead_fibers = NULL;
-static int g_initialized = 0;
+#include "omni_fiber.h"
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _MSC_VER
+#define OMNI_FIBER_TLS __declspec(thread)
+#else
+#define OMNI_FIBER_TLS _Thread_local
+#endif
+
+static OMNI_FIBER_TLS OmniFiber* g_current_fiber = NULL;
+static OMNI_FIBER_TLS OmniFiber g_main_fiber = {0};
+static OMNI_FIBER_TLS OmniFiber* g_dead_fibers = NULL;
+static OMNI_FIBER_TLS int g_initialized = 0;
 
 #if defined(__x86_64__) && !defined(_WIN32)
 __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__((unused)), void* to_rsp __attribute__((unused))) {
@@ -37,7 +52,7 @@ __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__(
         "retq\n\t"
     );
 }
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) && !defined(_WIN32)
 __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__((unused)), void* to_rsp __attribute__((unused))) {
     __asm__ volatile (
         "stp x19, x20, [sp, #-16]!\n\t"
@@ -58,8 +73,7 @@ __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__(
         "ret\n\t"
     );
 }
-#else
-// Fallback stub for environments without direct naked asm inline
+#elif !defined(_WIN32)
 static void swap_g_context(void** from_rsp, void* to_rsp) {
     (void)from_rsp;
     (void)to_rsp;
@@ -76,9 +90,13 @@ static void cleanup_dead_fibers(void) {
 
 void __omni_fiber_init(void) {
     if (!g_initialized) {
-        g_main_fiber.rsp = NULL;
+        memset(&g_main_fiber, 0, sizeof(g_main_fiber));
+#if defined(OMNI_HAS_WIN32_FIBERS)
+        g_main_fiber.win_fiber_handle = IsThreadAFiber()
+            ? GetCurrentFiber()
+            : ConvertThreadToFiberEx(NULL, 0);
+#endif
         g_main_fiber.status = OMNI_FIBER_RUNNING;
-        g_main_fiber.arena = NULL;
         g_current_fiber = &g_main_fiber;
         g_initialized = 1;
     }
@@ -89,6 +107,25 @@ int __omni_fiber_is_in_fiber(void) {
     return (g_current_fiber != NULL && g_current_fiber != &g_main_fiber);
 }
 
+#if defined(OMNI_HAS_WIN32_FIBERS)
+static VOID WINAPI win32_fiber_entry_stub(LPVOID param) {
+    OmniFiber* f = (OmniFiber*)param;
+    if (f && f->entry) {
+        f->entry(f->arg);
+    }
+    if (f) {
+        f->status = OMNI_FIBER_DEAD;
+        if (f->arena) {
+            __omni_arena_destroy(f->arena);
+            f->arena = NULL;
+        }
+        f->next = g_dead_fibers;
+        g_dead_fibers = f;
+    }
+    g_current_fiber = &g_main_fiber;
+    SwitchToFiber(g_main_fiber.win_fiber_handle);
+}
+#else
 static void fiber_entry_stub(void) {
     OmniFiber* f = g_current_fiber;
     if (f && f->entry) {
@@ -96,62 +133,60 @@ static void fiber_entry_stub(void) {
     }
     if (f) {
         f->status = OMNI_FIBER_DEAD;
-        // Reclaim fiber Task Arena in O(1)
         if (f->arena) {
             __omni_arena_destroy(f->arena);
             f->arena = NULL;
         }
-        // Enqueue on dead-fiber list for reclamation on main stack
         f->next = g_dead_fibers;
         g_dead_fibers = f;
     }
 
-    // Switch back to main fiber
     OmniFiber* target = &g_main_fiber;
     g_current_fiber = target;
     swap_g_context(&f->rsp, target->rsp);
 }
+#endif
 
 OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_size) {
     __omni_fiber_init();
 
+    if (stack_size < 65536) {
+        stack_size = 65536;
+    }
+
+    OmniFiber* fiber = (OmniFiber*)calloc(1, sizeof(OmniFiber));
+    if (!fiber) return NULL;
+
+    fiber->arena = __omni_arena_create(32 * 1024);
+    fiber->status = OMNI_FIBER_RUNNABLE;
+    fiber->entry = entry;
+    fiber->arg = arg;
+    fiber->next = NULL;
+
+#if defined(OMNI_HAS_WIN32_FIBERS)
+    fiber->stack_size = stack_size;
+    fiber->win_fiber_handle = CreateFiberEx(stack_size, stack_size, 0, win32_fiber_entry_stub, fiber);
+    if (!fiber->win_fiber_handle) {
+        if (fiber->arena) __omni_arena_destroy(fiber->arena);
+        free(fiber);
+        return NULL;
+    }
+#else
     size_t page_size = 4096;
 #if defined(OMNI_HAS_MMAP)
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page > 0) page_size = (size_t)sc_page;
 #endif
-
-    // Minimum 64 KB for foreign FFI and nested calls
-    if (stack_size < 65536) {
-        stack_size = 65536;
-    }
-    // Align stack_size to page boundary
     stack_size = (stack_size + page_size - 1) & ~(page_size - 1);
-    size_t total_mmap_size = stack_size + page_size; // +1 guard page at the bottom
+    size_t total_mmap_size = stack_size + page_size;
 
-    OmniFiber* fiber = (OmniFiber*)malloc(sizeof(OmniFiber));
-    if (!fiber) return NULL;
-
-#if defined(OMNI_HAS_WIN32_VM)
-    void* vm_base = VirtualAlloc(NULL, total_mmap_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!vm_base) {
-        free(fiber);
-        return NULL;
-    }
-    DWORD old_protect;
-    VirtualProtect(vm_base, page_size, PAGE_NOACCESS, &old_protect);
-
-    fiber->stack_base = (char*)vm_base + page_size;
-    fiber->stack_size = stack_size;
-    fiber->total_mmap_size = total_mmap_size;
-    fiber->guard_page_size = page_size;
-#elif defined(OMNI_HAS_MMAP)
+#if defined(OMNI_HAS_MMAP)
     void* mmap_base = mmap(NULL, total_mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mmap_base == MAP_FAILED) {
+        if (fiber->arena) __omni_arena_destroy(fiber->arena);
         free(fiber);
         return NULL;
     }
-    // Bottom page is PROT_NONE hardware guard page
     mprotect(mmap_base, page_size, PROT_NONE);
 
     fiber->stack_base = (char*)mmap_base + page_size;
@@ -161,6 +196,7 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
 #else
     fiber->stack_base = malloc(stack_size);
     if (!fiber->stack_base) {
+        if (fiber->arena) __omni_arena_destroy(fiber->arena);
         free(fiber);
         return NULL;
     }
@@ -169,25 +205,12 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
     fiber->guard_page_size = 0;
 #endif
 
-    fiber->arena = __omni_arena_create(32 * 1024); // 32 KB Task Arena per fiber
-    fiber->status = OMNI_FIBER_RUNNABLE;
-    fiber->entry = entry;
-    fiber->arg = arg;
-    fiber->next = NULL;
-
-    // 16-byte aligned stack top for AAPCS64 / System V x86_64 ABI
     uintptr_t stack_top = (uintptr_t)fiber->stack_base + stack_size;
     stack_top &= ~((uintptr_t)15);
 
 #if defined(__x86_64__)
-    // To satisfy System V AMD64 ABI:
-    // At function entry (immediately following a `call` instruction which pushes 8 bytes),
-    // (%rsp + 8) % 16 == 0.
-    // When swap_g_context pops 6 registers (48 bytes) and executes `retq` (8 bytes),
-    // %rsp must equal (stack_top - 8).
-    // Therefore, push an 8-byte dummy alignment word before pushing fiber_entry_stub:
     uint64_t* sp = (uint64_t*)stack_top;
-    *(--sp) = 0;                          // 8-byte dummy alignment padding
+    *(--sp) = 0;                          // 16-byte alignment padding before call retaddr
     *(--sp) = (uint64_t)fiber_entry_stub; // return address for retq
     *(--sp) = 0;                          // r15
     *(--sp) = 0;                          // r14
@@ -197,8 +220,6 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
     *(--sp) = 0;                          // rbp
     fiber->rsp = (void*)sp;
 #elif defined(__aarch64__)
-    // AAPCS64: 12 callee-saved registers (x19-x30) = 96 bytes (aligned to 16 bytes).
-    // x30 is the Link Register (return address for ret instruction).
     uint64_t* sp = (uint64_t*)stack_top;
     *(--sp) = (uint64_t)fiber_entry_stub; // x30 (lr)
     *(--sp) = 0;                          // x29 (fp)
@@ -216,6 +237,7 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
 #else
     fiber->rsp = (void*)stack_top;
 #endif
+#endif
     return fiber;
 }
 
@@ -225,7 +247,12 @@ void __omni_fiber_yield(void) {
         OmniFiber* from = g_current_fiber;
         OmniFiber* to = &g_main_fiber;
         g_current_fiber = to;
+#if defined(OMNI_HAS_WIN32_FIBERS)
+        (void)from;
+        SwitchToFiber(to->win_fiber_handle);
+#else
         swap_g_context(&from->rsp, to->rsp);
+#endif
         cleanup_dead_fibers();
     }
 }
@@ -236,11 +263,10 @@ void __omni_fiber_destroy(OmniFiber* fiber) {
             __omni_arena_destroy(fiber->arena);
             fiber->arena = NULL;
         }
-#if defined(OMNI_HAS_WIN32_VM)
-        if (fiber->total_mmap_size > 0 && fiber->stack_base) {
-            void* vm_base = (char*)fiber->stack_base - fiber->guard_page_size;
-            VirtualFree(vm_base, 0, MEM_RELEASE);
-            fiber->stack_base = NULL;
+#if defined(OMNI_HAS_WIN32_FIBERS)
+        if (fiber->win_fiber_handle) {
+            DeleteFiber(fiber->win_fiber_handle);
+            fiber->win_fiber_handle = NULL;
         }
 #elif defined(OMNI_HAS_MMAP)
         if (fiber->total_mmap_size > 0 && fiber->stack_base) {
@@ -259,11 +285,9 @@ void __omni_fiber_destroy(OmniFiber* fiber) {
 }
 
 void* __omni_fiber_run_on_main_stack(void* (*fn)(void*), void* arg) {
-    // If already running on OS thread / main stack, execute directly
     if (!__omni_fiber_is_in_fiber()) {
         return fn(arg);
     }
-    // Otherwise execute the foreign call (future: can pivot rsp to host thread stack)
     return fn(arg);
 }
 
@@ -272,22 +296,76 @@ void __omni_go_spawn(void (*entry)(void*), void* arg) {
     OmniFiber* fiber = __omni_fiber_create(entry, arg, 65536);
     if (!fiber) return;
 
-    // Switch to new fiber immediately (cooperative run)
     OmniFiber* from = g_current_fiber;
     g_current_fiber = fiber;
+#if defined(OMNI_HAS_WIN32_FIBERS)
+    (void)from;
+    SwitchToFiber(fiber->win_fiber_handle);
+#else
     swap_g_context(&from->rsp, fiber->rsp);
-
-    // Upon return to main stack, reclaim any dead fiber stacks
+#endif
     cleanup_dead_fibers();
 }
 
-#if !defined(_WIN32)
 typedef struct OmniThreadCtx {
     void (*entry)(void*);
     void* arg;
 } OmniThreadCtx;
 
-static pthread_t g_spawned_threads[64];
+#if defined(_WIN32)
+static SRWLOCK g_thread_lock = SRWLOCK_INIT;
+static HANDLE g_spawned_threads[256];
+static size_t g_spawned_thread_count = 0;
+
+static DWORD WINAPI omni_win32_thread_runner(LPVOID raw_ctx) {
+    OmniThreadCtx* ctx = (OmniThreadCtx*)raw_ctx;
+    void (*entry)(void*) = ctx->entry;
+    void* arg = ctx->arg;
+    free(ctx);
+    if (entry) {
+        entry(arg);
+    }
+    return 0;
+}
+
+void __omni_thread_spawn(void (*entry)(void*), void* arg) {
+    OmniThreadCtx* ctx = (OmniThreadCtx*)malloc(sizeof(OmniThreadCtx));
+    if (!ctx) return;
+    ctx->entry = entry;
+    ctx->arg = arg;
+    HANDLE th = CreateThread(NULL, 0, omni_win32_thread_runner, ctx, 0, NULL);
+    if (th != NULL) {
+        AcquireSRWLockExclusive(&g_thread_lock);
+        if (g_spawned_thread_count < 256) {
+            g_spawned_threads[g_spawned_thread_count++] = th;
+            ReleaseSRWLockExclusive(&g_thread_lock);
+        } else {
+            ReleaseSRWLockExclusive(&g_thread_lock);
+            CloseHandle(th);
+        }
+    } else {
+        free(ctx);
+    }
+}
+
+void __omni_thread_join_all(void) {
+    AcquireSRWLockExclusive(&g_thread_lock);
+    size_t count = g_spawned_thread_count;
+    HANDLE local_handles[256];
+    for (size_t i = 0; i < count; ++i) {
+        local_handles[i] = g_spawned_threads[i];
+    }
+    g_spawned_thread_count = 0;
+    ReleaseSRWLockExclusive(&g_thread_lock);
+
+    for (size_t i = 0; i < count; ++i) {
+        WaitForSingleObject(local_handles[i], INFINITE);
+        CloseHandle(local_handles[i]);
+    }
+}
+#else
+static pthread_mutex_t g_thread_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_spawned_threads[256];
 static size_t g_spawned_thread_count = 0;
 
 static void* omni_pthread_runner(void* raw_ctx) {
@@ -308,8 +386,13 @@ void __omni_thread_spawn(void (*entry)(void*), void* arg) {
     ctx->arg = arg;
     pthread_t tid;
     if (pthread_create(&tid, NULL, omni_pthread_runner, ctx) == 0) {
-        if (g_spawned_thread_count < 64) {
+        pthread_mutex_lock(&g_thread_lock);
+        if (g_spawned_thread_count < 256) {
             g_spawned_threads[g_spawned_thread_count++] = tid;
+            pthread_mutex_unlock(&g_thread_lock);
+        } else {
+            pthread_mutex_unlock(&g_thread_lock);
+            pthread_detach(tid);
         }
     } else {
         free(ctx);
@@ -317,14 +400,17 @@ void __omni_thread_spawn(void (*entry)(void*), void* arg) {
 }
 
 void __omni_thread_join_all(void) {
-    for (size_t i = 0; i < g_spawned_thread_count; ++i) {
-        pthread_join(g_spawned_threads[i], NULL);
+    pthread_mutex_lock(&g_thread_lock);
+    size_t count = g_spawned_thread_count;
+    pthread_t local_tids[256];
+    for (size_t i = 0; i < count; ++i) {
+        local_tids[i] = g_spawned_threads[i];
     }
     g_spawned_thread_count = 0;
+    pthread_mutex_unlock(&g_thread_lock);
+
+    for (size_t i = 0; i < count; ++i) {
+        pthread_join(local_tids[i], NULL);
+    }
 }
-#else
-void __omni_thread_spawn(void (*entry)(void*), void* arg) {
-    __omni_go_spawn(entry, arg);
-}
-void __omni_thread_join_all(void) {}
 #endif

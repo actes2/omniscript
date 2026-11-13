@@ -2,7 +2,7 @@ use clap::{Parser as ClapParser, Subcommand};
 use omni_codegen::CodeGenerator;
 use omni_engine::{CandleGgufEngine, FallbackEngine, InferenceEngine, MockSynthesisEngine, OllamaInferenceEngine, VerifiedSynthesisEngine};
 use omni_parser::OmniParser;
-use omni_preamble::{DependencyDriller, ImportDirective, PackageEcosystem, PackageShimmer, PackageSpec, SymbolCarver};
+use omni_preamble::{DependencyDriller, ImportDirective, PackageEcosystem, PackageShimmer, PackageSpec, SymbolCarver, TargetArch, TargetPlatform};
 use omni_verify::LlvmVerifier;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -41,9 +41,13 @@ struct Cli {
     #[arg(short, long, global = true, default_value_t = false)]
     verbose: bool,
 
-    /// Target execution device for AI intent lowering: "auto" (default), "cuda", or "cpu"
+    /// Target execution device for AI intent lowering: "auto" (default), "cuda", "metal", or "cpu"
     #[arg(long, global = true, default_value = "auto")]
     device: String,
+
+    /// Target platform & C package registry preset: "auto" (default), "arch-x86_64", "debian-x86_64", "yum-x86_64", "suse-x86_64", "alpine-x86_64", "macos-arm64", "windows-x86_64" (+ aarch64 variants), or raw LLVM triple
+    #[arg(long, global = true, default_value = "auto")]
+    platform: String,
 
     /// Automatically fetch and cache missing third-party dependencies from package indices
     #[arg(long, global = true, default_value_t = false)]
@@ -78,12 +82,16 @@ enum Commands {
     #[command(
         about = "Install dependencies from an omni-requirements manifest or package spec",
         long_about = "Synchronize polyglot third-party dependencies into a local oenv or ~/.omnicache/.\n\n\
-POLYGLOT ENVIRONMENT (--oenv):\n  \
+POLYGLOT ENVIRONMENT (--oenv) & PLATFORM (--platform):\n  \
 omnic install --oenv [dir]     Wrap all dependencies into an isolated local environment (defaults to './oenv').\n  \
                                Zero-sourcing: omnic run and build automatically scan for ./oenv or ./.oenv\n  \
-                               in the project root with priority over local paths and host caches.\n\n\
+                               in the project root with priority over local paths and host caches.\n  \
+--platform <preset>            Parameterize C upstream package repo & target ABI (auto, arch-x86_64,\n  \
+                               debian-x86_64, yum-x86_64, suse-x86_64, alpine-x86_64, macos-arm64,\n  \
+                               windows-x86_64, etc.) with zero sudo.\n\n\
 MANIFEST SYNTAX (omni-requirements.txt):\n  \
 # Ecosystem Registry Packages:\n  \
+'c'      lz4\n  \
 'python' requests == 2.31.0\n  \
 'java'   org.projectlombok:lombok == 1.18.36\n  \
 'node'   express >= 4.18.2\n  \
@@ -93,15 +101,15 @@ MANIFEST SYNTAX (omni-requirements.txt):\n  \
 [git]'python' https://github.com/psf/requests.git#v2.31.0\n  \
 [git]'rust'   https://github.com/serde-rs/serde.git#v1.0.197\n\n\
 OMNISCRIPT IMPORT STYLES:\n  \
-1. Explicit Dialect:  import 'java' lombok.Data;\n  \
+1. Explicit Dialect:  import 'c' lz4; / import 'java' lombok.Data;\n  \
 2. Bare Polyglot:     import lombok.Data;  (Tier 1 AI / Tier 2 AST cues auto-detects dialect)\n  \
 3. Auto-Fetch Mode:   omnic run --auto-resolve-dependencies app.omni\n\n\
 EXAMPLES:\n  \
-omnic install                            # Installs from ./omni-requirements.txt into active oenv or ~/.omnicache\n  \
-omnic install --oenv oenv                # Creates ./oenv and installs from ./omni-requirements.txt\n  \
-omnic install --oenv oenv 'java' lombok   # Installs lombok into ./oenv\n  \
-omnic install 'java' lombok               # Installs lombok into active oenv (if present) or ~/.omnicache\n  \
-omnic install 'python' fastapi           # Installs fastapi"
+omnic install                                               # Installs from ./omni-requirements.txt\n  \
+omnic install --oenv oenv 'c' lz4                           # Rootless host C package install into ./oenv\n  \
+omnic install --oenv oenv --platform windows-x86_64 'c' lz4 # Rootless MSYS2 UCRT64 Windows C package install\n  \
+omnic install --oenv oenv 'java' lombok                     # Installs lombok into ./oenv\n  \
+omnic install 'python' fastapi                              # Installs fastapi"
     )]
     Install {
         /// Manifest path (e.g. omni-requirements.txt) or ecosystem dialect (e.g. 'java')
@@ -128,20 +136,20 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Commands::Repl) => run_repl()?,
         Some(Commands::Install { target, package }) => {
-            install_dependencies(&target, package.as_deref(), args.oenv.as_deref(), args.verbose)?;
+            install_dependencies(&target, package.as_deref(), args.oenv.as_deref(), &args.platform, args.verbose)?;
         }
         Some(Commands::SynthDataset { count, output }) => {
             synth_dataset(count, &output)?;
         }
         Some(Commands::Run { source, args: prog_args }) => {
-            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
+            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
         }
         Some(Commands::Build { source, output }) => {
-            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
+            build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
         }
         None => {
             if let Some(ref source) = args.source {
-                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, args.auto_resolve_dependencies, args.oenv.as_deref())?;
+                build_file(source, &args.output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
             } else {
                 // If no arguments or subcommands provided, launch interactive REPL
                 run_repl()?;
@@ -179,8 +187,11 @@ fn install_dependencies(
     target: &str,
     package: Option<&str>,
     oenv_arg: Option<&str>,
+    platform_spec: &str,
     verbose: bool,
 ) -> anyhow::Result<()> {
+    let target_platform = TargetPlatform::parse(platform_spec)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let target_path = Path::new(target);
     let effective_oenv: Option<PathBuf> = oenv_arg
         .map(PathBuf::from)
@@ -190,10 +201,28 @@ fn install_dependencies(
         Some(ref p) => {
             PackageShimmer::init_oenv(p)
                 .map_err(|e| anyhow::anyhow!("Failed to initialize oenv directory '{}': {}", p.display(), e))?;
-            println!("[OMNIC] Active polyglot environment target: {}", p.display());
-            (PackageShimmer::with_cache_root(p.clone()), format!("{}/", p.display()))
+            println!(
+                "[OMNIC] Active polyglot environment target: {} (platform: {}, provider: {})",
+                p.display(),
+                target_platform.slug,
+                target_platform.provider.as_str()
+            );
+            (
+                PackageShimmer::with_cache_root(p.clone()).with_platform(target_platform.clone()),
+                format!("{}/", p.display()),
+            )
         }
-        None => (PackageShimmer::new(), "~/.omnicache/".to_string()),
+        None => {
+            println!(
+                "[OMNIC] Target platform: {} (provider: {})",
+                target_platform.slug,
+                target_platform.provider.as_str()
+            );
+            (
+                PackageShimmer::new().with_platform(target_platform.clone()),
+                "~/.omnicache/".to_string(),
+            )
+        }
     };
 
     if package.is_none()
@@ -308,6 +337,16 @@ struct CompilationStats {
     pub total_compile_time: std::time::Duration,
 }
 
+fn is_target_host_runnable(target_platform: &TargetPlatform) -> bool {
+    let same_arch = target_platform.arch == TargetArch::host();
+    let same_os = (cfg!(target_os = "linux") && target_platform.llvm_triple.contains("linux"))
+        || (cfg!(target_os = "macos")
+            && (target_platform.llvm_triple.contains("apple")
+                || target_platform.llvm_triple.contains("macosx")))
+        || (cfg!(target_os = "windows") && target_platform.llvm_triple.contains("windows"));
+    same_arch && same_os
+}
+
 fn run_file(
     source_path: &Path,
     prog_args: &[String],
@@ -317,21 +356,58 @@ fn run_file(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    platform_spec: &str,
     auto_resolve_dependencies: bool,
     oenv: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device, auto_resolve_dependencies, oenv)?;
+    let target_platform = TargetPlatform::parse(platform_spec)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(
+        source_path,
+        temp,
+        opt_level,
+        no_cache,
+        cache_dir,
+        verbose,
+        device,
+        &target_platform,
+        auto_resolve_dependencies,
+        oenv,
+    )?;
     let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
     println!(
         "[COMPILE] Ready in {:.2?} (Parse: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?})",
         stats.total_compile_time, stats.parse_time, stats.codegen_time, cache_str, stats.verify_time
     );
+    if !is_target_host_runnable(&target_platform) {
+        anyhow::bail!(
+            "Target platform '{}' ({}) cannot be executed directly via host JIT on {}/{}. Use `omnic build --platform {} {}` to emit a cross-target binary.",
+            target_platform.slug,
+            target_platform.llvm_triple,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            target_platform.slug,
+            source_path.display()
+        );
+    }
     let verifier = LlvmVerifier::new()?;
     let status = verifier.run_jit(&llvm_ir, opt_level, &foreign_c_files, prog_args)?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+fn normalize_output_binary_path(output: &Path, targeting_windows: bool) -> PathBuf {
+    if targeting_windows || cfg!(windows) {
+        if output == Path::new("a.out") {
+            return PathBuf::from("a.exe");
+        }
+        if output.extension().is_none() {
+            return output.with_extension("exe");
+        }
+    }
+    output.to_path_buf()
 }
 
 fn build_file(
@@ -343,32 +419,75 @@ fn build_file(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    platform_spec: &str,
     auto_resolve_dependencies: bool,
     oenv: Option<&str>,
 ) -> anyhow::Result<()> {
     let build_start = std::time::Instant::now();
+    let target_platform = TargetPlatform::parse(platform_spec)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let targeting_windows = target_platform.llvm_triple.contains("windows");
+    let final_output = normalize_output_binary_path(output, targeting_windows);
     println!("==================================================");
     println!(" OmniScript Compiler (omnic v0.1.0)");
     println!(" Target Source: {}", source_path.display());
+    println!(" Platform: {} ({})", target_platform.slug, target_platform.llvm_triple);
     println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {} | Device: {} | Auto-Resolve: {}", temp, opt_level, !no_cache, device, auto_resolve_dependencies);
     println!("==================================================");
 
-    let (llvm_ir, foreign_c_files, stats) = compile_source(source_path, temp, opt_level, no_cache, cache_dir, verbose, device, auto_resolve_dependencies, oenv)?;
+    let (llvm_ir, foreign_c_files, stats) = compile_source(
+        source_path,
+        temp,
+        opt_level,
+        no_cache,
+        cache_dir,
+        verbose,
+        device,
+        &target_platform,
+        auto_resolve_dependencies,
+        oenv,
+    )?;
     let verifier = LlvmVerifier::new()?;
 
-    println!("\n[5/5] Linking native ELF binary...");
+    let bin_fmt = if targeting_windows {
+        "PE/COFF"
+    } else if target_platform.llvm_triple.contains("apple") || target_platform.llvm_triple.contains("macosx") {
+        "Mach-O"
+    } else {
+        "ELF"
+    };
+    println!("\n[5/5] Linking native {} binary ({})...", bin_fmt, target_platform.llvm_triple);
     let link_start = std::time::Instant::now();
-    verifier.compile_ir_to_binary(&llvm_ir, output, opt_level, &foreign_c_files)?;
+    let target_triple_opt = if target_platform.llvm_triple != omni_codegen::host_target_triple() {
+        Some(target_platform.llvm_triple.as_str())
+    } else {
+        None
+    };
+    verifier.compile_ir_to_binary_for_target(
+        &llvm_ir,
+        &final_output,
+        opt_level,
+        &foreign_c_files,
+        target_triple_opt,
+    )?;
     let link_time = link_start.elapsed();
     let total_build_time = build_start.elapsed();
 
-    println!("  -> Successfully compiled and linked native binary: {}", output.display());
+    println!("  -> Successfully compiled and linked native binary: {}", final_output.display());
     let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
     println!(
         "\n[BUILD COMPLETE] Total: {:.2?} (Parse: {:.2?} | Drill: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?} | Link: {:.2?})",
         total_build_time, stats.parse_time, stats.drill_time, stats.codegen_time, cache_str, stats.verify_time, link_time
     );
-    println!("Run binary with: ./{}", output.display());
+    let out_disp = final_output.display().to_string();
+    let run_hint = if final_output.is_absolute() || out_disp.starts_with("./") || out_disp.starts_with(".\\") {
+        out_disp
+    } else if targeting_windows || cfg!(windows) {
+        format!(".\\{}", out_disp)
+    } else {
+        format!("./{}", out_disp)
+    };
+    println!("Run binary with: {}", run_hint);
     Ok(())
 }
 
@@ -380,6 +499,7 @@ fn compile_source(
     cache_dir: &Path,
     verbose: bool,
     device: &str,
+    target_platform: &TargetPlatform,
     auto_resolve_dependencies: bool,
     oenv: Option<&str>,
 ) -> anyhow::Result<(String, Vec<PathBuf>, CompilationStats)> {
@@ -396,6 +516,13 @@ fn compile_source(
                 std::process::exit(1);
             }
             omni_engine::DevicePreference::Cuda(0)
+        }
+        "metal" | "mps" => {
+            if !omni_engine::metal_is_available() {
+                eprintln!("[ERROR] Explicit device '--device metal' requested, but Apple Metal acceleration is not available (compile with '--features metal' on macOS).");
+                std::process::exit(1);
+            }
+            omni_engine::DevicePreference::Metal(0)
         }
         "cpu" => omni_engine::DevicePreference::Cpu,
         _ => omni_engine::DevicePreference::Auto,
@@ -440,6 +567,7 @@ fn compile_source(
     let carver = SymbolCarver::new();
     let mut foreign_c_files = omni_runtime::runtime_c_sources();
     let mut all_dependency_files = Vec::new();
+    let mut collected_drilled_spines: Vec<String> = Vec::new();
 
     let mut pending_imports = module.imports.clone();
     let mut processed_imports = std::collections::HashSet::new();
@@ -463,7 +591,9 @@ fn compile_source(
                 all_dependency_files.push(full_path.clone());
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "c" || ext == "cpp" {
-                    let mut driller = DependencyDriller::new().with_oenv(effective_oenv_path.clone());
+                    let mut driller = DependencyDriller::new()
+                        .with_oenv(effective_oenv_path.clone())
+                        .with_platform(target_platform.clone());
                     let slice = driller.drill(&full_path);
                     for src in slice.local_sources {
                         if !foreign_c_files.contains(&src) {
@@ -515,7 +645,9 @@ fn compile_source(
                         target_symbols.push(sym.clone());
                     }
                 }
-                let mut driller = DependencyDriller::new().with_oenv(effective_oenv_path.clone());
+                let mut driller = DependencyDriller::new()
+                    .with_oenv(effective_oenv_path.clone())
+                    .with_platform(target_platform.clone());
                 let mut walk = driller.crawl_ecosystem_import(
                     base_dir,
                     &ecosystem,
@@ -567,13 +699,15 @@ fn compile_source(
                                 Some(ref p) => {
                                     let _ = PackageShimmer::init_oenv(p);
                                     PackageShimmer::with_cache_root(p.clone())
+                                        .with_platform(target_platform.clone())
                                 }
-                                None => PackageShimmer::new(),
+                                None => PackageShimmer::new()
+                                    .with_platform(target_platform.clone()),
                             };
                             let dest_label = if let Some(ref p) = effective_oenv_path {
-                                format!("oenv ({})", p.display())
+                                format!("oenv ({}, platform: {})", p.display(), target_platform.slug)
                             } else {
-                                "~/.omnicache".to_string()
+                                format!("~/.omnicache (platform: {})", target_platform.slug)
                             };
 
                             if auto_resolve_dependencies {
@@ -605,10 +739,15 @@ fn compile_source(
                                 } else {
                                     String::new()
                                 };
-                                if let Some(top) = candidates.first() {
-                                    eprintln!("  omnic install{} '{}' {}", env_flag, dial, top.name);
+                                let plat_flag = if target_platform.slug != TargetPlatform::detect_host().slug {
+                                    format!(" --platform {}", target_platform.slug)
                                 } else {
-                                    eprintln!("  omnic install{} '{}' {}", env_flag, dial, mod_name);
+                                    String::new()
+                                };
+                                if let Some(top) = candidates.first() {
+                                    eprintln!("  omnic install{}{} '{}' {}", env_flag, plat_flag, dial, top.name);
+                                } else {
+                                    eprintln!("  omnic install{}{} '{}' {}", env_flag, plat_flag, dial, mod_name);
                                 }
                                 if !candidates.is_empty() {
                                     eprintln!("\nTop 3 candidate packages for {}:", dial);
@@ -637,14 +776,24 @@ fn compile_source(
 
                 let is_cpython_ext = |p: &std::path::Path| -> bool {
                     let s = p.to_string_lossy();
-                    s.contains(".cpython-") || s.contains(".abi3.") || s.contains("lib-dynload")
+                    s.contains(".cpython-")
+                        || s.contains(".abi3.")
+                        || s.contains("lib-dynload")
+                        || s.ends_with(".pyd")
+                };
+                let is_native_linkable = |p: &std::path::Path| -> bool {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "c" | "cpp" | "so" | "dylib" | "a" | "lib" | "dll"
+                    ) || fname.contains(".so.")
                 };
                 for f in &walk.visited_files {
                     if !all_dependency_files.contains(f) {
                         all_dependency_files.push(f.clone());
                     }
-                    let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a")
+                    if is_native_linkable(f)
                         && !is_cpython_ext(f)
                         && !foreign_c_files.contains(f)
                     {
@@ -655,8 +804,7 @@ fn compile_source(
                     if !all_dependency_files.contains(orig) {
                         all_dependency_files.push(orig.clone());
                     }
-                    let ext = orig.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if (ext == "c" || ext == "cpp" || ext == "so" || ext == "dylib" || ext == "a")
+                    if is_native_linkable(orig)
                         && !is_cpython_ext(orig)
                         && !foreign_c_files.contains(orig)
                     {
@@ -672,6 +820,13 @@ fn compile_source(
                     }
                 }
                 for trace in &walk.call_traces {
+                    for slice_line in &trace.drilled_code_slice {
+                        if !slice_line.starts_with("jvm_dispatch(")
+                            && !collected_drilled_spines.contains(slice_line)
+                        {
+                            collected_drilled_spines.push(slice_line.clone());
+                        }
+                    }
                     if !target_symbols.contains(&trace.symbol) {
                         target_symbols.push(trace.symbol.clone());
                     }
@@ -706,8 +861,16 @@ fn compile_source(
                             }
                         }
                     } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
-                        if let Ok(src) = fs::read_to_string(vf) {
+                        if let Ok(raw_src) = fs::read_to_string(vf) {
+                            let src = if ext == "rs" {
+                                raw_src.split("\n#[cfg(test)]").next().unwrap_or(&raw_src).to_string()
+                            } else {
+                                raw_src
+                            };
                             let mut sm = parser.parse_module(&mod_name, &src);
+                            sm.functions.retain(|f| {
+                                !f.annotations.iter().any(|a| a.target_expr == "test" || a.raw_syntax.contains("#[test]"))
+                            });
                             if ext == "go" {
                                 // Go's compiler promotes escaping local addresses (`return &d`) to heap/arena allocations.
                                 for func in &mut sm.functions {
@@ -892,7 +1055,8 @@ fn compile_source(
     let t_codegen_start = std::time::Instant::now();
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_content.as_bytes());
-    hasher.update(omni_codegen::host_target_triple().as_bytes());
+    hasher.update(target_platform.slug.as_bytes());
+    hasher.update(target_platform.llvm_triple.as_bytes());
     hasher.update(&temp.to_le_bytes());
     hasher.update(&[opt_level]);
     for foreign_file in &foreign_c_files {
@@ -915,12 +1079,23 @@ fn compile_source(
         let fallback = MockSynthesisEngine::new();
 
         let generated = if let Some(ref candle_engine) = candle_engine_opt {
-            let dev_tag = if candle_engine.is_cuda() { "CUDA GPU" } else { "CPU (AVX2/SIMD)" };
+            let dev_tag = if candle_engine.is_cuda() {
+                "CUDA GPU"
+            } else if candle_engine.is_metal() {
+                "Apple Metal GPU"
+            } else if cfg!(target_arch = "aarch64") {
+                "CPU (NEON/SIMD)"
+            } else {
+                "CPU (AVX2/SIMD)"
+            };
             if verbose {
+                std::env::set_var("OMNI_VERBOSE", "1");
                 println!("  -> [Inference] Using in-process Candle GGUF engine on {} ({})", dev_tag, candle_engine.model_path.display());
             }
             let primary_verified = VerifiedSynthesisEngine::new(candle_engine, &verifier);
-            let codegen = CodeGenerator::new(&primary_verified);
+            let codegen = CodeGenerator::new(&primary_verified)
+                .with_target_triple(target_platform.llvm_triple.clone())
+                .with_drilled_spines(collected_drilled_spines.clone());
             codegen.generate_module_ir(&module, temp)?
         } else {
             if verbose {
@@ -929,7 +1104,9 @@ fn compile_source(
             let primary = OllamaInferenceEngine::new("omni-coder");
             let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
             let composite = FallbackEngine::new(primary_verified, fallback);
-            let codegen = CodeGenerator::new(&composite);
+            let codegen = CodeGenerator::new(&composite)
+                .with_target_triple(target_platform.llvm_triple.clone())
+                .with_drilled_spines(collected_drilled_spines.clone());
             codegen.generate_module_ir(&module, temp)?
         };
         (generated, false)
@@ -944,9 +1121,14 @@ fn compile_source(
     let t_verify_start = std::time::Instant::now();
     let verifier = LlvmVerifier::new()?;
     if !from_cache {
-        verifier.verify_ir(&llvm_ir)?;
+        let target_triple_opt = if target_platform.llvm_triple != omni_codegen::host_target_triple() {
+            Some(target_platform.llvm_triple.as_str())
+        } else {
+            None
+        };
+        verifier.verify_ir_for_target(&llvm_ir, target_triple_opt)?;
         let _ = fs::create_dir_all(cache_dir);
-        let tmp_cache = cache_dir.join(format!(".tmp_{}.ll", cache_hash));
+        let tmp_cache = cache_dir.join(format!(".tmp_{}_{}.ll", std::process::id(), cache_hash));
         if fs::write(&tmp_cache, &llvm_ir).is_ok() {
             let _ = fs::rename(&tmp_cache, &cache_file);
         }

@@ -45,6 +45,7 @@ fn ensure_hardening_oenv(repo_root: &std::path::Path, omnic_bin: &str) {
     if !oenv_dir.join("packages/python/varint-1.0.2").exists()
         || !oenv_dir.join("packages/node/crc-32-1.2.2").exists()
         || !oenv_dir.join("packages/rust/adler-1.0.2").exists()
+        || !oenv_dir.join("packages/java/lombok-1.18.36").exists()
         || !oenv_dir.join("git/go/github.com/cespare/xxhash@v2.3.0").exists()
     {
         let reqs = repo_root.join("examples/hardening/omni.requirements");
@@ -95,6 +96,40 @@ fn test_compile_and_execute_polyglot_hardening_suite() {
                 "ke_str: 32.5",
                 "caught: neg_frame",
                 "Backbone score: 400",
+            ],
+        ),
+        (
+            "examples/hardening/pratt_types_llm_expr.omni",
+            &[
+                "pow_assoc: 512",
+                "f_sum: 7.0",
+                "m_sum: 6.0",
+                "scaled: 10.0",
+                "llm_mid: 15",
+                "Pratt+Types+LLM score: 798",
+            ],
+        ),
+        (
+            "examples/hardening/magnum_opus_chimera.omni",
+            &[
+                "epoch64: 13794967296",
+                "float_total: 29.5",
+                "caught: chimera_breach",
+                "ai_mid: 121",
+                "6 ecosystems linked: python+node+rust+go+c+csharp",
+                "Magnum Opus Chimera score: 2174",
+            ],
+        ),
+        (
+            "examples/hardening/polyglot_lombok_sdl2_nexus.omni",
+            &[
+                "canvas_title: OmniScript :: Lombok x Python x SDL2 Polyglot Nexus",
+                "stage1_lombok_py: 1811",
+                "stage2_go_sum: 818",
+                "frame_digest: 13520",
+                "frames_processed: 48",
+                "7 ecosystems linked: java+c+python+node+rust+go+csharp",
+                "Polyglot Lombok SDL2 Nexus score: 6594",
             ],
         ),
     ];

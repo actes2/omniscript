@@ -1,0 +1,502 @@
+#!/usr/bin/env omni
+#![allow(unused)]
+; Lisp / Assembly header comment
+#= Julia nested #= inner =# header comment =#
+{- Haskell nested {- inner -} header comment -}
+
+// ============================================================================
+// Foreign Ecosystems: Java Lombok (`0xCAFEBABE` Spine) + Native C `libSDL2.so`
+// ============================================================================
+import 'java' lombok.Data
+import 'java' lombok.AllArgsConstructor
+import 'java' lombok.With
+import 'c' SDL2 as sdl
+
+// ============================================================================
+// 1. Java + Lombok (@Data @AllArgsConstructor @With) Interactive Button Model
+//    Leveraged seamlessly as a Python object + RAII Context Manager!
+// ============================================================================
+@Data
+@AllArgsConstructor
+@With
+public class PolyglotButton {
+    String label;
+    int x;
+    int y;
+    int w;
+    int h;
+    int hovered;
+    int pressed;
+    int clicks;
+    int active_session;
+
+    def __enter__(self):
+        self.active_session = 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.active_session = 0
+        return 0
+}
+
+// ============================================================================
+// 2. Rust #[repr(C)] LP64 Zero-GC Hardware Layouts (`SDL_Rect` & `SDL_Event`)
+// ============================================================================
+#[repr(C)]
+struct SdlRectAbi {
+    pub xy: i64,
+    pub wh: i64,
+}
+
+#[repr(C)]
+struct SdlEventAbi {
+    pub w0: i64,
+    pub w1: i64,
+    pub w2: i64,
+    pub w3: i64,
+    pub w4: i64,
+    pub w5: i64,
+    pub w6: i64,
+    pub w7: i64,
+}
+
+enum ButtonVisualState {
+    Idle,
+    Hovered,
+    Pressed,
+}
+
+// ============================================================================
+// 3. Zig LP64 Bit-Packers & Hardware Event Decoders (`SDL_Event` ABI Offsets)
+//    - `event.type`          @ byte 0  (`w0 & 0xFFFFFFFF`)
+//    - `button.button`       @ byte 16 (`w2 & 0xFF`)
+//    - `key.keysym.scancode` @ byte 16 (`w2 & 0xFFFFFFFF`)
+//    - `motion.x`/`button.x` @ byte 20 (`(w2 >> 32) as i32`)
+//    - `motion.y`/`button.y` @ byte 24 (`(w3 & 0xFFFFFFFF) as i32`)
+// ============================================================================
+pub fn zig_pack_rect(lo: i64, hi: i64) i64 {
+    return ((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF);
+}
+
+pub fn zig_event_x(w2: i64) i64 {
+    return ((w2 >> 32) as i32);
+}
+
+pub fn zig_event_y(w3: i64) i64 {
+    return ((w3 & 0xFFFFFFFF) as i32);
+}
+
+// ============================================================================
+// 4. Kotlin 2D Hit-Testing (`fun` + `val` immutable bindings)
+// ============================================================================
+fun kotlin_point_in_rect(px: Int, py: Int, rx: Int, ry: Int, rw: Int, rh: Int): Int {
+    val in_x = (px >= rx) && (px < (rx + rw)) ? 1 : 0
+    val in_y = (py >= ry) && (py < (ry + rh)) ? 1 : 0
+    return (in_x == 1) && (in_y == 1) ? 1 : 0
+}
+
+// ============================================================================
+// 5. Swift Unlabeled Parameter Glow Interpolator (`func _ ... -> Double`)
+// ============================================================================
+func swift_smooth_glow(_ cur: Double, _ target: Double, _ rate: Double) -> Double {
+    return cur + (target - cur) * rate
+}
+
+// ============================================================================
+// 6. Julia IEEE-754 Reactive Wave Kernel (`function ... ::Float64 ... end`)
+// ============================================================================
+function julia_pulse_wave(phase::Float64, boost::Float64)::Float64
+    whole = float(int(phase))
+    frac = phase - whole
+    arch = 4.0 * frac * (1.0 - frac)
+    return arch * (48.0 + boost * 14.0) + 18.0
+end
+
+// ============================================================================
+// 7. Nim Indented `proc` Palette Synthesizer & 5x7 Bitmap Glyph Renderer
+// ============================================================================
+proc nim_palette_channel(clicks: int64, lane: int64): int64 =
+    var raw = ((clicks * 47 + lane * 83) ^ (clicks * 13)) & 255
+    return raw
+
+proc nim_draw_glyph(ren: int64, bmp: int64, gx: int64, gy: int64, scale: int64): int64 =
+    let px_rect = SdlRectAbi { xy: 0, wh: 0 }
+    px_rect.wh = zig_pack_rect(scale, scale)
+    for row in 0..7:
+        for col in 0..5:
+            bit_idx = row * 5 + col
+            if ((bmp >> bit_idx) & 1) == 1:
+                px_rect.xy = zig_pack_rect(gx + col * scale, gy + row * scale)
+                sdl.SDL_RenderFillRect(ren, px_rect)
+    return 0
+
+// ============================================================================
+// 8. Ruby Expressive Byte Clamper (`unless ... elsif ... end` + postfix)
+// ============================================================================
+def ruby_clamp_byte(val, floor_v)
+    toned = val
+    unless toned >= floor_v
+        toned = toned + floor_v
+    elsif toned > 240
+        toned = 240
+    end
+    toned = 240 unless toned <= 240
+    return toned
+end
+
+// ============================================================================
+// 9. Dart Bar Clamper + 10. TypeScript 3D Bevel Press Offset
+// ============================================================================
+int dart_clamp_bar(int h, int limit_h) {
+    if (h > limit_h) {
+        return limit_h;
+    }
+    if (h < 14) {
+        return 14;
+    }
+    return h;
+}
+
+const ts_bevel_offset = (pressed: number): number => pressed == 1 ? 4 : 0;
+
+// ============================================================================
+// 11. Go M:N Fiber Worker Seeding Baseline Spectrum Offsets
+// ============================================================================
+func go_seed_bars(ch chan int, count int) {
+    for (int i = 0; i < count; ++i) {
+        seed_h := 16 + ((i * 23 + 7) % 36)
+        ch <- seed_h
+    }
+}
+
+// ============================================================================
+// 12. Python + Elixir `|>` Live Interactive SDL2 Window & Button Loop
+// ============================================================================
+def main() -> int:
+    # Instantiate Java Lombok @Data @AllArgsConstructor @With buttons like Python objects!
+    btn_ignite = PolyglotButton(
+        label="IGNITE NEXUS",
+        x=90,
+        y=145,
+        w=390,
+        h=92,
+        hovered=0,
+        pressed=0,
+        clicks=0,
+        active_session=0
+    )
+    btn_ignite = btn_ignite.withX(92).withW(388)
+
+    btn_reset = PolyglotButton(
+        label="RESET",
+        x=508,
+        y=145,
+        w=160,
+        h=92,
+        hovered=0,
+        pressed=0,
+        clicks=0,
+        active_session=0
+    )
+
+    # Seed 10 telemetry bar baselines on a Go M:N cooperative fiber
+    seed_ch := make(chan int, 16)
+    go go_seed_bars(seed_ch, 10)
+    bar_seeds = []
+    for s_idx in 0..10:
+        sv := <-seed_ch
+        bar_seeds.append(sv)
+
+    # 35-bit 5x7 pixel-art glyph arrays (`> 2^32` 64-bit integer bitmaps!)
+    hdr_glyphs = [15621211694, 18842572657, 18842703473, 15170932878, 0, 1108854319, 15621211694, 33320633377, 4433521201, 15621588030, 33320633377, 15621211694, 4433514655, 0, 16660235326, 16694953519, 33320633377, 33322058286]
+    ignite_glyphs = [1145311297, 0, 15170932878, 15621588030, 18842703473, 15170932878, 4433514655, 33321092159, 0, 18842703473, 33321092159, 18834663985, 15621211697, 16660235326, 0, 17452568848]
+    fired_glyphs = [1108854319, 15621211697, 33320633377, 16660235326, 33321092159, 0, 1108837439, 15170932878, 18561353263, 33321092159, 16694953519, 4299296900]
+    reset_glyphs = [18561353263, 33321092159, 16660235326, 33321092159, 4433514655]
+    clicks_lbl = [32246891582, 33320633377, 15170932878, 32246891582, 18560947505, 16660235326, 138416256]
+    digit_glyphs = [15623448110, 15170932932, 33322058286, 16660251151, 8891181448, 16660268095, 15621129262, 2216829471, 15621113390, 15587034670]
+
+    let ev = SdlEventAbi { w0: 0, w1: 0, w2: 0, w3: 0, w4: 0, w5: 0, w6: 0, w7: 0 }
+    let r_box = SdlRectAbi { xy: 0, wh: 0 }
+
+    win_w = 760
+    win_h = 480
+
+    with btn_ignite as primary:
+        init_rc = (sdl.SDL_Init(0x20) as i32)
+        if init_rc < 0:
+            print("SDL_Init failed:", init_rc)
+            return 1
+
+        # 0x24 = SDL_WINDOW_SHOWN (0x04) | SDL_WINDOW_RESIZABLE (0x20)
+        win = sdl.SDL_CreateWindow(
+            "OmniScript Polyglot Interactive UI :: Click [IGNITE NEXUS] or [RESET]",
+            0x2FFF0000,
+            0x2FFF0000,
+            win_w,
+            win_h,
+            0x24
+        )
+        if win == 0:
+            print("SDL_CreateWindow failed")
+            sdl.SDL_Quit()
+            return 1
+
+        # Accelerated / fallback renderer + logical HiDPI coordinate scaling
+        ren = sdl.SDL_CreateRenderer(win, -1, 0)
+        if ren == 0:
+            sdl.SDL_DestroyWindow(win)
+            sdl.SDL_Quit()
+            return 1
+
+        sdl.SDL_RenderSetLogicalSize(ren, win_w, win_h)
+        print("[OmniUI] Interactive Polyglot SDL2 Window spawned! Click [> IGNITE NEXUS <] or [RESET] (ESC / Close to exit).")
+
+        running = 1
+        tick = 0
+        glow = 0.0
+        flash_ticks = 0
+        mouse_x = 0
+        mouse_y = 0
+
+        while running == 1:
+            while (sdl.SDL_PollEvent(ev) as i32) != 0:
+                ev_type = ev.w0 & 0xFFFFFFFF
+
+                # SDL_QUIT (0x100 = 256)
+                if ev_type == 256:
+                    running = 0
+
+                # SDL_KEYDOWN (0x300 = 768)
+                if ev_type == 768:
+                    scancode = ev.w2 & 0xFFFFFFFF
+                    keysym = zig_event_x(ev.w2)
+                    if (scancode == 41) or (keysym == 27):
+                        running = 0
+                    if keysym == 32:
+                        primary.setClicks(primary.getClicks() + 1)
+                        flash_ticks = 14
+                        print("[OmniUI] Spacebar triggered IGNITE -> clicks =", primary.getClicks())
+
+                # SDL_MOUSEMOTION (0x400 = 1024)
+                if ev_type == 1024:
+                    mouse_x = zig_event_x(ev.w2)
+                    mouse_y = zig_event_y(ev.w3)
+                    primary.hovered = kotlin_point_in_rect(
+                        mouse_x,
+                        mouse_y,
+                        primary.getX(),
+                        primary.getY(),
+                        primary.getW(),
+                        primary.getH()
+                    )
+                    btn_reset.hovered = kotlin_point_in_rect(
+                        mouse_x,
+                        mouse_y,
+                        btn_reset.getX(),
+                        btn_reset.getY(),
+                        btn_reset.getW(),
+                        btn_reset.getH()
+                    )
+
+                # SDL_MOUSEBUTTONDOWN (0x401 = 1025)
+                if ev_type == 1025:
+                    btn_code = ev.w2 & 0xFF
+                    mouse_x = zig_event_x(ev.w2)
+                    mouse_y = zig_event_y(ev.w3)
+                    if btn_code == 1:
+                        if kotlin_point_in_rect(mouse_x, mouse_y, primary.getX(), primary.getY(), primary.getW(), primary.getH()) == 1:
+                            primary.pressed = 1
+                        if kotlin_point_in_rect(mouse_x, mouse_y, btn_reset.getX(), btn_reset.getY(), btn_reset.getW(), btn_reset.getH()) == 1:
+                            btn_reset.pressed = 1
+
+                # SDL_MOUSEBUTTONUP (0x402 = 1026)
+                if ev_type == 1026:
+                    btn_code = ev.w2 & 0xFF
+                    mouse_x = zig_event_x(ev.w2)
+                    mouse_y = zig_event_y(ev.w3)
+                    if btn_code == 1:
+                        hit_pri = kotlin_point_in_rect(mouse_x, mouse_y, primary.getX(), primary.getY(), primary.getW(), primary.getH())
+                        if (primary.pressed == 1) and (hit_pri == 1):
+                            primary.setClicks(primary.getClicks() + 1)
+                            flash_ticks = 16
+                            print("[OmniUI] Button [IGNITE NEXUS] clicked! Total clicks:", primary.getClicks())
+
+                        hit_rst = kotlin_point_in_rect(mouse_x, mouse_y, btn_reset.getX(), btn_reset.getY(), btn_reset.getW(), btn_reset.getH())
+                        if (btn_reset.pressed == 1) and (hit_rst == 1):
+                            primary.setClicks(0)
+                            flash_ticks = 0
+                            print("[OmniUI] Button [RESET] clicked! Counter reset to 0.")
+
+                        primary.pressed = 0
+                        btn_reset.pressed = 0
+
+            # Smooth Swift hover glow interpolation
+            target_glow = primary.hovered == 1 ? 1.0 : 0.0
+            glow = swift_smooth_glow(glow, target_glow, 0.22)
+            glow_boost = int(glow * 52.0)
+
+            cur_clicks = primary.getClicks()
+
+            # Elixir `|>` palette pipeline across Nim -> Ruby
+            accent_r = cur_clicks |> nim_palette_channel(1) |> ruby_clamp_byte(55)
+            accent_g = (cur_clicks + 2) |> nim_palette_channel(3) |> ruby_clamp_byte(90)
+            accent_b = (cur_clicks + 5) |> nim_palette_channel(7) |> ruby_clamp_byte(140)
+
+            # 1. Background canvas + top header bar
+            sdl.SDL_SetRenderDrawColor(ren, 14, 18, 30, 255)
+            sdl.SDL_RenderClear(ren)
+
+            r_box.xy = zig_pack_rect(0, 0)
+            r_box.wh = zig_pack_rect(win_w, 72)
+            sdl.SDL_SetRenderDrawColor(ren, 22, 30, 48, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+            sdl.SDL_SetRenderDrawColor(ren, accent_r, accent_g, accent_b, 255)
+            sdl.SDL_RenderDrawLine(ren, 0, 72, win_w, 72)
+
+            # Render header title: "OMNI POLYGLOT SDL2"
+            sdl.SDL_SetRenderDrawColor(ren, 225, 238, 255, 255)
+            hx = 28
+            for hg in hdr_glyphs:
+                if hg != 0:
+                    nim_draw_glyph(ren, hg, hx, 25, 3)
+                hx = hx + 18
+
+            # Render live "CLICKS: NN" counter in top-right header
+            sdl.SDL_SetRenderDrawColor(ren, 120, 240, 210, 255)
+            cx = 520
+            for cg in clicks_lbl:
+                nim_draw_glyph(ren, cg, cx, 25, 3)
+                cx = cx + 18
+            tens = (cur_clicks / 10) % 10
+            ones = cur_clicks % 10
+            nim_draw_glyph(ren, digit_glyphs[tens], 660, 22, 4)
+            nim_draw_glyph(ren, digit_glyphs[ones], 688, 22, 4)
+
+            # 2. Render Primary Interactive Button (`btn_ignite`) using Rust Tagged Enum Match
+            let vis_state = ButtonVisualState::Idle
+            if primary.hovered == 1:
+                vis_state = ButtonVisualState::Hovered
+            if primary.pressed == 1:
+                vis_state = ButtonVisualState::Pressed
+
+            btn_r = 42
+            btn_g = 96
+            btn_b = 190
+            match vis_state {
+                ButtonVisualState::Idle => {
+                    btn_r = 38 + glow_boost / 2
+                    btn_g = 88 + glow_boost
+                    btn_b = 178 + glow_boost
+                }
+                ButtonVisualState::Hovered => {
+                    btn_r = 48 + glow_boost
+                    btn_g = 135 + glow_boost
+                    btn_b = 235
+                }
+                ButtonVisualState::Pressed => {
+                    btn_r = 235
+                    btn_g = 115
+                    btn_b = 48
+                }
+            }
+
+            if flash_ticks > 0:
+                flash_ticks = flash_ticks - 1
+                btn_r = 60 + flash_ticks * 10
+                btn_g = 195
+                btn_b = 155
+
+            # Drop shadow
+            r_box.xy = zig_pack_rect(primary.getX() + 6, primary.getY() + 6)
+            r_box.wh = zig_pack_rect(primary.getW(), primary.getH())
+            sdl.SDL_SetRenderDrawColor(ren, 6, 9, 16, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+
+            # Button face with TypeScript 3D press bevel offset
+            p_off = ts_bevel_offset(primary.pressed)
+            bx = primary.getX() + p_off
+            by = primary.getY() + p_off
+            r_box.xy = zig_pack_rect(bx, by)
+            r_box.wh = zig_pack_rect(primary.getW(), primary.getH())
+            sdl.SDL_SetRenderDrawColor(ren, btn_r, btn_g, btn_b, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+
+            # Crisp highlight border
+            sdl.SDL_SetRenderDrawColor(ren, 195, 242, 255, 255)
+            sdl.SDL_RenderDrawRect(ren, r_box)
+
+            # Button text (`> IGNITE NEXUS <` or `PULSE FIRED!`)
+            sdl.SDL_SetRenderDrawColor(ren, 255, 255, 255, 255)
+            if (primary.pressed == 1) or (flash_ticks > 8):
+                tx = bx + 84
+                for fg in fired_glyphs:
+                    if fg != 0:
+                        nim_draw_glyph(ren, fg, tx, by + 35, 3)
+                    tx = tx + 18
+            else:
+                tx = bx + 50
+                for ig in ignite_glyphs:
+                    if ig != 0:
+                        nim_draw_glyph(ren, ig, tx, by + 35, 3)
+                    tx = tx + 18
+
+            # 3. Render Secondary Interactive `[ RESET ]` Button (`btn_reset`)
+            r_box.xy = zig_pack_rect(btn_reset.getX() + 6, btn_reset.getY() + 6)
+            r_box.wh = zig_pack_rect(btn_reset.getW(), btn_reset.getH())
+            sdl.SDL_SetRenderDrawColor(ren, 6, 9, 16, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+
+            r_off = ts_bevel_offset(btn_reset.pressed)
+            rx = btn_reset.getX() + r_off
+            ry = btn_reset.getY() + r_off
+            r_box.xy = zig_pack_rect(rx, ry)
+            r_box.wh = zig_pack_rect(btn_reset.getW(), btn_reset.getH())
+            rst_r = btn_reset.hovered == 1 ? 185 : 88
+            rst_g = btn_reset.hovered == 1 ? 62 : 46
+            rst_b = btn_reset.hovered == 1 ? 82 : 68
+            sdl.SDL_SetRenderDrawColor(ren, rst_r, rst_g, rst_b, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+            sdl.SDL_SetRenderDrawColor(ren, 245, 190, 205, 255)
+            sdl.SDL_RenderDrawRect(ren, r_box)
+
+            sdl.SDL_SetRenderDrawColor(ren, 255, 245, 248, 255)
+            rtx = rx + 36
+            for rg in reset_glyphs:
+                nim_draw_glyph(ren, rg, rtx, ry + 35, 3)
+                rtx = rtx + 18
+
+            # 4. Lower Reactive Telemetry Bay (Go Fiber Seeds + Julia Wave + Dart Sizing)
+            r_box.xy = zig_pack_rect(48, 272)
+            r_box.wh = zig_pack_rect(win_w - 96, 174)
+            sdl.SDL_SetRenderDrawColor(ren, 19, 25, 42, 255)
+            sdl.SDL_RenderFillRect(ren, r_box)
+            sdl.SDL_SetRenderDrawColor(ren, 55, 78, 120, 255)
+            sdl.SDL_RenderDrawRect(ren, r_box)
+
+            for bi in 0..10:
+                w_phase = float(tick) * 0.045 + float(bi) * 0.19
+                pulse_h = int(julia_pulse_wave(w_phase, float(cur_clicks)))
+                bar_h = dart_clamp_bar(pulse_h + bar_seeds[bi], 148)
+                bar_x = 72 + bi * 62
+                bar_y = 434 - bar_h
+                r_box.xy = zig_pack_rect(bar_x, bar_y)
+                r_box.wh = zig_pack_rect(44, bar_h)
+                sdl.SDL_SetRenderDrawColor(
+                    ren,
+                    (accent_r + bi * 8) & 255,
+                    accent_g,
+                    accent_b,
+                    255
+                )
+                sdl.SDL_RenderFillRect(ren, r_box)
+
+            sdl.SDL_RenderPresent(ren)
+            sdl.SDL_Delay(16)
+            tick = tick + 1
+
+        sdl.SDL_DestroyRenderer(ren)
+        sdl.SDL_DestroyWindow(win)
+        sdl.SDL_Quit()
+
+    print("[OmniUI] Window closed cleanly. Final click count:", btn_ignite.getClicks())
+    return 0

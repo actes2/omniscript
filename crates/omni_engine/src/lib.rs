@@ -113,26 +113,35 @@ impl SsaContextEnvelope {
         let mut short_circuit_hints = Vec::new();
         for imp in &self.import_chain {
             if let Some(sc) = imp.strip_prefix("__OMNI_SHORT_CIRCUIT_IR__:") {
-                short_circuit_hints.push(sc.trim());
+                let sc_t = sc.trim();
+                if !short_circuit_hints.contains(&sc_t) {
+                    short_circuit_hints.push(sc_t);
+                }
             } else if let Some(dm) = imp.strip_prefix("__OMNI_DRILLED_MECH__:") {
-                drilled_contexts.push(dm.trim());
+                let dm_t = dm.trim();
+                if !drilled_contexts.contains(&dm_t) {
+                    drilled_contexts.push(dm_t);
+                }
             } else if !imp.starts_with("__OMNI_DEP_WALK__:")
                 && !imp.starts_with("__OMNI_CARVED_FN__:")
             {
-                clean_imports.push(imp.as_str());
+                let imp_s = imp.as_str();
+                if !clean_imports.contains(&imp_s) {
+                    clean_imports.push(imp_s);
+                }
             }
         }
 
         if !clean_imports.is_empty() {
             out.push_str("  <import_chain>\n");
-            for imp in clean_imports {
+            for imp in clean_imports.into_iter().take(16) {
                 out.push_str(&format!("    <import>{}</import>\n", imp));
             }
             out.push_str("  </import_chain>\n");
         }
         if !drilled_contexts.is_empty() {
             out.push_str("  <drilled_context>\n");
-            for dc in drilled_contexts {
+            for dc in drilled_contexts.into_iter().take(12) {
                 out.push_str(&format!("    <spine>{}</spine>\n", dc));
             }
             out.push_str("  </drilled_context>\n");
@@ -329,6 +338,7 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_sleep_ms",
     "__omni_random_int",
     "__omni_random_range",
+    "__omni_ipow64",
     "__omni_arena_create",
     "__omni_arena_alloc",
     "__omni_arena_mark",
@@ -679,28 +689,92 @@ impl InferenceEngine for OllamaInferenceEngine {
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
 
-        let mut child = std::process::Command::new("curl")
-            .args(["-s", "--connect-timeout", "3", "--max-time", "60", "-X", "POST", &self.endpoint, "-H", "Content-Type: application/json", "-d", "@-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed to execute curl: {}", e)))?;
+        // Pure Rust std::net::TcpStream HTTP/1.1 POST (zero OS curl dependency)
+        let stripped = self
+            .endpoint
+            .strip_prefix("http://")
+            .unwrap_or(&self.endpoint);
+        let (authority, path) = match stripped.find('/') {
+            Some(idx) => (&stripped[..idx], &stripped[idx..]),
+            None => (stripped, "/"),
+        };
+        let addr_str = if authority.contains(':') {
+            authority.to_string()
+        } else {
+            format!("{}:80", authority)
+        };
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpStream, ToSocketAddrs};
+        let sock_addr = addr_str
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .ok_or_else(|| EngineError::InferenceFailed(format!("Cannot resolve '{}'", addr_str)))?;
+        let mut stream = TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(3))
+            .map_err(|e| EngineError::InferenceFailed(format!("TCP connect failed: {}", e)))?;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
 
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = std::io::Write::write_all(&mut stdin, payload_str.as_bytes());
+        let req_bytes = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            path,
+            authority,
+            payload_str.len(),
+            payload_str
+        );
+        stream
+            .write_all(req_bytes.as_bytes())
+            .map_err(|e| EngineError::InferenceFailed(format!("HTTP write failed: {}", e)))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
+            .map_err(|e| EngineError::InferenceFailed(format!("HTTP status read failed: {}", e)))?;
+        if !status_line.contains(" 200") {
+            return Err(EngineError::InferenceFailed(format!(
+                "Ollama HTTP error: {}",
+                status_line.trim()
+            )));
+        }
+        let mut is_chunked = false;
+        loop {
+            let mut hdr = String::new();
+            let n = reader
+                .read_line(&mut hdr)
+                .map_err(|e| EngineError::InferenceFailed(format!("HTTP header read failed: {}", e)))?;
+            if n == 0 || hdr == "\r\n" || hdr == "\n" {
+                break;
+            }
+            if hdr.to_ascii_lowercase().starts_with("transfer-encoding:")
+                && hdr.to_ascii_lowercase().contains("chunked")
+            {
+                is_chunked = true;
+            }
+        }
+        let mut body_bytes = Vec::new();
+        if is_chunked {
+            loop {
+                let mut sz_line = String::new();
+                if reader.read_line(&mut sz_line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let hex = sz_line.trim().split(';').next().unwrap_or("0");
+                let sz = usize::from_str_radix(hex, 16).unwrap_or(0);
+                if sz == 0 {
+                    break;
+                }
+                let start = body_bytes.len();
+                body_bytes.resize(start + sz, 0);
+                let _ = reader.read_exact(&mut body_bytes[start..]);
+                let mut crlf = String::new();
+                let _ = reader.read_line(&mut crlf);
+            }
+        } else {
+            let _ = reader.read_to_end(&mut body_bytes);
         }
 
-        let output = child
-            .wait_with_output()
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed reading curl response: {}", e)))?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(EngineError::InferenceFailed(format!("Ollama HTTP request failed: {}", err)));
-        }
-
-        let resp_json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        let resp_json: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| EngineError::InferenceFailed(format!("Invalid Ollama JSON response: {}", e)))?;
 
         let raw_res = resp_json
@@ -882,6 +956,7 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
                     let needs_store = sc_clean.contains("store ") && !sanitized.contains("store ");
                     let needs_inttoptr = sc_clean.contains("inttoptr ") && !sanitized.contains("inttoptr ");
                     let needs_ptrtoint = sc_clean.contains("ptrtoint ") && !sanitized.contains("ptrtoint ");
+                    let needs_gep = sc_clean.contains("getelementptr ") && !sanitized.contains("getelementptr ");
 
                     if let Some(sym) = missing_sym {
                         last_error = format!(
@@ -890,7 +965,7 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
                         );
                         continue;
                     }
-                    if needs_store || needs_inttoptr || needs_ptrtoint {
+                    if needs_store || needs_inttoptr || needs_ptrtoint || needs_gep {
                         last_error = format!(
                             "AI Attempt 0 omitted required SSA dataflow store/cast for intent '{}'; triggering secondary layer failover",
                             envelope.raw_intent
@@ -919,11 +994,16 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
                 }
             }
             last_ir = sanitized.clone();
+            let active_triple = if envelope.target_abi.trim().is_empty() {
+                omni_runtime::host_target_triple()
+            } else {
+                envelope.target_abi.trim()
+            };
             let (dyn_decls, body) = extract_declarations_and_body(&sanitized);
 
             // Construct verification harness module with dynamic declares at module scope!
             let mut harness = String::new();
-            harness.push_str(&format!("target triple = \"{}\"\n\n", omni_runtime::host_target_triple()));
+            harness.push_str(&format!("target triple = \"{}\"\n\n", active_triple));
             for sd in &envelope.struct_definitions {
                 let sd_trim = sd.trim();
                 if sd_trim.starts_with("%struct.") {
@@ -931,7 +1011,7 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
                     harness.push('\n');
                 }
             }
-            harness.push_str(omni_runtime::runtime_llvm_declarations());
+            harness.push_str(omni_runtime::runtime_llvm_declarations_for_triple(active_triple));
             harness.push_str("\n");
             for decl in &dyn_decls {
                 harness.push_str(decl);
@@ -957,7 +1037,7 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             harness.push_str("\n  ret i32 0\n}\n");
 
             // Verify with Clang
-            match self.verifier.verify_ir(&harness) {
+            match self.verifier.verify_ir_for_target(&harness, Some(active_triple)) {
                 Ok(_) => {
                     return Ok(sanitized);
                 }
@@ -1081,6 +1161,7 @@ pub enum DevicePreference {
     Auto,
     Cpu,
     Cuda(usize),
+    Metal(usize),
 }
 
 /// In-process Candle-based GGUF inference engine executing directly without background daemons.
@@ -1094,14 +1175,14 @@ pub struct CandleGgufEngine {
     pub eos_token_id: u32,
 }
 
-#[cfg(feature = "full-build")]
+#[cfg(all(feature = "full-build", not(all(target_os = "windows", target_env = "msvc"))))]
 extern "C" {
     static omni_embedded_model_start: u8;
     static omni_embedded_model_end: u8;
 }
 
-/// Returns a reference to the embedded model weights linked directly into the binary's `.rodata` section.
-#[cfg(feature = "full-build")]
+/// Returns a reference to the embedded model weights linked directly into the binary's read-only data section.
+#[cfg(all(feature = "full-build", not(all(target_os = "windows", target_env = "msvc"))))]
 pub fn embedded_model_weights() -> &'static [u8] {
     unsafe {
         let start = std::ptr::addr_of!(omni_embedded_model_start);
@@ -1109,6 +1190,12 @@ pub fn embedded_model_weights() -> &'static [u8] {
         let len = (end as usize).saturating_sub(start as usize);
         std::slice::from_raw_parts(start, len)
     }
+}
+
+/// MSVC fallback for embedded model weights (where cl.exe/ml64.exe lacks GNU `.incbin`).
+#[cfg(all(feature = "full-build", target_os = "windows", target_env = "msvc"))]
+pub fn embedded_model_weights() -> &'static [u8] {
+    include_bytes!(env!("OMNI_EMBEDDED_MODEL_ABS_PATH"))
 }
 
 #[cfg(feature = "full-build")]
@@ -1133,8 +1220,24 @@ impl CandleGgufEngine {
                     EngineError::InferenceFailed(format!("Failed to initialize CUDA device {}: {}", ord, e))
                 })?
             }
+            DevicePreference::Metal(ord) => {
+                if !candle_core::utils::metal_is_available() {
+                    return Err(EngineError::InferenceFailed(
+                        format!("Apple Metal acceleration requested (device {}), but Metal is not available (build with '--features metal' on macOS)", ord)
+                    ));
+                }
+                Device::new_metal(ord).map_err(|e| {
+                    EngineError::InferenceFailed(format!("Failed to initialize Metal device {}: {}", ord, e))
+                })?
+            }
             DevicePreference::Auto => {
-                Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+                if candle_core::utils::cuda_is_available() {
+                    Device::new_cuda(0).unwrap_or(Device::Cpu)
+                } else if candle_core::utils::metal_is_available() {
+                    Device::new_metal(0).unwrap_or(Device::Cpu)
+                } else {
+                    Device::Cpu
+                }
             }
         };
 
@@ -1227,13 +1330,36 @@ impl CandleGgufEngine {
         }
 
 
-        let candidate_paths = [
+        let mut candidate_paths = vec![
             PathBuf::from("models/omni-coder.gguf"),
             PathBuf::from("../models/omni-coder.gguf"),
             PathBuf::from("../../models/omni-coder.gguf"),
             PathBuf::from("tests/models/omni-coder.gguf"),
-            PathBuf::from("/var/lib/ollama/.ollama/models/blobs/sha256-a621e8119dfe20fe4bfc788fff29de9f6d5f3ec1b2091735a14a6101e930f7a9"),
         ];
+
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            let home_dir = PathBuf::from(home);
+            candidate_paths.push(home_dir.join(".omnicache").join("models").join("omni-coder.gguf"));
+        }
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            let mut cur = exe_path.parent();
+            for _ in 0..4 {
+                if let Some(dir) = cur {
+                    let cand = dir.join("models").join("omni-coder.gguf");
+                    if !candidate_paths.contains(&cand) {
+                        candidate_paths.push(cand);
+                    }
+                    cur = dir.parent();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        candidate_paths.push(PathBuf::from(
+            "/var/lib/ollama/.ollama/models/blobs/sha256-a621e8119dfe20fe4bfc788fff29de9f6d5f3ec1b2091735a14a6101e930f7a9",
+        ));
 
         for path in &candidate_paths {
             if path.exists() {
@@ -1252,6 +1378,10 @@ impl CandleGgufEngine {
 
     pub fn is_cuda(&self) -> bool {
         matches!(self.device, Device::Cuda(_))
+    }
+
+    pub fn is_metal(&self) -> bool {
+        matches!(self.device, Device::Metal(_))
     }
 
     pub fn with_sample_len(mut self, len: usize) -> Self {
@@ -1349,6 +1479,10 @@ pub fn cuda_is_available() -> bool {
     candle_core::utils::cuda_is_available()
 }
 
+pub fn metal_is_available() -> bool {
+    candle_core::utils::metal_is_available()
+}
+
 impl InferenceEngine for CandleGgufEngine {
     fn lower_intent(
         &self,
@@ -1366,6 +1500,12 @@ impl InferenceEngine for CandleGgufEngine {
             .encode(formatted_prompt, true)
             .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer encode error: {}", e)))?;
         let tokens = encoding.get_ids();
+        let verbose_synth = std::env::var_os("OMNI_VERBOSE").is_some();
+        let synth_start = std::time::Instant::now();
+        if verbose_synth {
+            let preview: String = envelope.raw_intent.lines().next().unwrap_or("").chars().take(96).collect();
+            eprintln!("     [Synth] Prefilling {} tokens for intent: '{}'", tokens.len(), preview);
+        }
 
         let mut model = self
             .model
@@ -1483,6 +1623,14 @@ impl InferenceEngine for CandleGgufEngine {
             .tokenizer
             .decode(&generated_tokens, true)
             .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
+
+        if verbose_synth {
+            eprintln!(
+                "     [Synth] Generated {} tokens in {:.2}s",
+                generated_tokens.len(),
+                synth_start.elapsed().as_secs_f64()
+            );
+        }
 
         Ok(sanitize_llvm_ir(&raw_output))
     }

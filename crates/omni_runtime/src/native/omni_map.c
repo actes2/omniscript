@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <inttypes.h>
 
+#ifdef _WIN32
+#define strdup _strdup
+#endif
+
 static uint64_t fnv1a_hash(const char* str) {
     uint64_t hash = 14695981039346656037ULL;
     for (const unsigned char* p = (const unsigned char*)str; *p; p++) {
