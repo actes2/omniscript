@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use walkdir::WalkDir;
 
+pub mod c_lifter;
 pub mod http;
 pub mod shimmer;
+pub use c_lifter::{ingest_and_splice_c_dependencies, CIngestionReport};
 pub use shimmer::{
     CPackageProvider, PackageEcosystem, PackageShimmer, PackageSpec, TargetArch, TargetPlatform,
 };
@@ -1446,6 +1448,38 @@ impl DependencyDriller {
                         }
                     }
                 }
+                // Headerless binary/IR package fallback inside `<pkg_dir>/lib` or `<pkg_dir>/bin`
+                for sub_bin_dir in &[p.join("lib"), p.join("bin"), p.clone()] {
+                    if !sub_bin_dir.is_dir() {
+                        continue;
+                    }
+                    if let Ok(files) = fs::read_dir(sub_bin_dir) {
+                        for f in files.filter_map(|x| x.ok()) {
+                            let fp = f.path();
+                            if !fp.is_file() {
+                                continue;
+                            }
+                            let fn_low = f.file_name().to_string_lossy().to_lowercase();
+                            if fn_low.ends_with(".ll")
+                                || fn_low.ends_with(".bc")
+                                || fn_low.ends_with(".a")
+                                || fn_low.ends_with(".lib")
+                                || fn_low.ends_with(".o")
+                                || fn_low.ends_with(".obj")
+                                || fn_low.ends_with(".so")
+                                || fn_low.contains(".so.")
+                                || fn_low.ends_with(".dylib")
+                                || fn_low.ends_with(".dll")
+                            {
+                                return Some((
+                                    fp,
+                                    p,
+                                    format!("{}-c-bin [{}] ({})", tier_label, self.platform.slug, raw_name),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             None
         };
@@ -1460,6 +1494,22 @@ impl DependencyDriller {
             } else if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&oenv_c, "oenv") {
                 entry_opt = Some((hdr, label));
                 matched_pkg_dir = Some(pdir);
+            } else if oenv_c.is_dir() {
+                // Cross-architecture oenv fallback: lift foreign-arch C packages installed in `<oenv>/packages/c/<any_slug>/`
+                if let Ok(slug_entries) = fs::read_dir(&oenv_c) {
+                    let mut slug_dirs: Vec<PathBuf> = slug_entries
+                        .filter_map(|e| e.ok().map(|x| x.path()))
+                        .filter(|p| p.is_dir() && p != &oenv_c_plat)
+                        .collect();
+                    slug_dirs.sort();
+                    for sdir in slug_dirs {
+                        if let Some((hdr, pdir, label)) = find_in_c_pkg_root(&sdir, "oenv-cross") {
+                            entry_opt = Some((hdr, label));
+                            matched_pkg_dir = Some(pdir);
+                            break;
+                        }
+                    }
+                }
             }
             if entry_opt.is_none() {
                 let oenv_inc = oenv.join("include");
@@ -1481,7 +1531,7 @@ impl DependencyDriller {
         }
 
         if entry_opt.is_none() {
-            for ext in &["h", "hpp", "c", "cpp", "cc"] {
+            for ext in &["h", "hpp", "c", "cpp", "cc", "ll", "bc", "o", "obj", "a", "lib", "so", "dylib", "dll"] {
                 let cand = base_dir.join(format!("{}.{}", module, ext));
                 if cand.is_file() {
                     entry_opt = Some((cand, format!("workspace-local (.{})", ext)));
@@ -1490,6 +1540,23 @@ impl DependencyDriller {
                 let inc_cand = base_dir.join("include").join(format!("{}.{}", module, ext));
                 if inc_cand.is_file() {
                     entry_opt = Some((inc_cand, format!("workspace-include (.{})", ext)));
+                    break;
+                }
+                let lib_cand = base_dir.join("lib").join(format!("{}.{}", module, ext));
+                if lib_cand.is_file() {
+                    entry_opt = Some((lib_cand, format!("workspace-lib (.{})", ext)));
+                    break;
+                }
+                let lib_pref_cand = base_dir.join(format!("lib{}.{}", module.trim_start_matches("lib"), ext));
+                if lib_pref_cand.is_file() {
+                    entry_opt = Some((lib_pref_cand, format!("workspace-local (lib*.{})", ext)));
+                    break;
+                }
+                let lib_dir_pref = base_dir
+                    .join("lib")
+                    .join(format!("lib{}.{}", module.trim_start_matches("lib"), ext));
+                if lib_dir_pref.is_file() {
+                    entry_opt = Some((lib_dir_pref, format!("workspace-lib (lib*.{})", ext)));
                     break;
                 }
             }
@@ -1685,11 +1752,30 @@ impl DependencyDriller {
         // Check for matching C/C++ implementation files and native binary libraries
         let ext = origin.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "h" || ext == "hpp" {
+            let clean_mod_local = module.trim_start_matches("lib");
             for c_cand in &[
                 base_dir.join(format!("{}.c", module)),
                 base_dir.join("src").join(format!("{}.c", module)),
                 base_dir.join(format!("{}.cpp", module)),
                 base_dir.join("src").join(format!("{}.cpp", module)),
+                base_dir.join(format!("{}.ll", module)),
+                base_dir.join(format!("{}.bc", module)),
+                base_dir.join(format!("{}.o", module)),
+                base_dir.join(format!("{}.obj", module)),
+                base_dir.join(format!("{}.a", module)),
+                base_dir.join(format!("lib{}.a", clean_mod_local)),
+                base_dir.join("lib").join(format!("lib{}.a", clean_mod_local)),
+                base_dir.join(format!("{}.lib", clean_mod_local)),
+                base_dir.join("lib").join(format!("{}.lib", clean_mod_local)),
+                base_dir.join(format!("lib{}.so", clean_mod_local)),
+                base_dir.join("lib").join(format!("lib{}.so", clean_mod_local)),
+                base_dir.join(format!("lib{}.dylib", clean_mod_local)),
+                base_dir.join("lib").join(format!("lib{}.dylib", clean_mod_local)),
+                base_dir.join(format!("{}.dll", clean_mod_local)),
+                base_dir.join(format!("lib{}.dll", clean_mod_local)),
+                base_dir.join("lib").join(format!("{}.dll", clean_mod_local)),
+                base_dir.join("bin").join(format!("{}.dll", clean_mod_local)),
+                base_dir.join("bin").join(format!("lib{}.dll", clean_mod_local)),
             ] {
                 if c_cand.is_file() && !report.visited_files.contains(c_cand) {
                     report.visited_files.push(c_cand.clone());
@@ -1877,6 +1963,12 @@ impl DependencyDriller {
         ).unwrap();
 
         for vf in &report.visited_files {
+            if !matches!(
+                vf.extension().and_then(|e| e.to_str()),
+                Some("h" | "hpp" | "c" | "cc" | "cpp")
+            ) {
+                continue;
+            }
             if let Ok(content) = fs::read_to_string(vf) {
                 for line in content.lines() {
                     let trimmed = line.trim().trim_end_matches(';').trim();

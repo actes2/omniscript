@@ -3545,13 +3545,14 @@ impl<'a> CodeGenerator<'a> {
                                     ));
                                     return TypedValue { reg: ret_reg, ty: IrType::I64 };
                                 } else {
-                                    let is_c_eco = self
-                                        .active_ai_ctx
-                                        .borrow()
-                                        .as_ref()
-                                        .and_then(|c| c.ecosystem_context.as_deref())
-                                        .map(|ec| ec.contains("c (module:") && ec.contains(rec))
-                                        .unwrap_or(false);
+                                    let is_c_eco = scope_tree.c_module_aliases.contains(rec)
+                                        || self
+                                            .active_ai_ctx
+                                            .borrow()
+                                            .as_ref()
+                                            .and_then(|c| c.ecosystem_context.as_deref())
+                                            .map(|ec| ec.contains("c (module:") && ec.contains(rec))
+                                            .unwrap_or(false);
                                     if !is_c_eco
                                         && !scope_tree.is_natively_routed_call(rec, method, &parts, trimmed)
                                         && scope_tree.resolve(rec).is_none()
@@ -5256,9 +5257,10 @@ impl<'a> CodeGenerator<'a> {
                             let callee = trimmed_expr[..open].trim();
                             if let Some((rec, _)) = callee.split_once('.') {
                                 let rec_trim = rec.trim();
-                                ecosystem_context
-                                    .map(|ec| ec.contains("c (module:") && ec.contains(rec_trim))
-                                    .unwrap_or(false)
+                                scope_tree.c_module_aliases.contains(rec_trim)
+                                    || ecosystem_context
+                                        .map(|ec| ec.contains("c (module:") && ec.contains(rec_trim))
+                                        .unwrap_or(false)
                             } else {
                                 false
                             }
@@ -8391,6 +8393,32 @@ impl<'a> CodeGenerator<'a> {
                     import_chain.push(desc);
                 }
                 omni_preamble::ImportDirective::FileAlias { path, alias } => {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let fname = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if matches!(
+                        ext.as_str(),
+                        "h" | "hpp" | "c" | "cc" | "cpp" | "ll" | "bc" | "o" | "obj" | "a" | "lib" | "so" | "dylib" | "dll"
+                    ) || fname.contains(".so.")
+                    {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            c_module_aliases_set.insert(stem.to_string());
+                            let clean = stem.trim_start_matches("lib");
+                            if !clean.is_empty() {
+                                c_module_aliases_set.insert(clean.to_string());
+                            }
+                        }
+                        if let Some(a) = alias {
+                            c_module_aliases_set.insert(a.clone());
+                        }
+                    }
                     let desc = match alias {
                         Some(a) => format!("file: {} as {}", path.display(), a),
                         None => format!("file: {}", path.display()),

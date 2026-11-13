@@ -285,11 +285,15 @@ impl LlvmVerifier {
                 .to_ascii_lowercase();
             let is_binary_archive_or_so = ext == "so"
                 || ext == "a"
+                || ext == "o"
+                || ext == "obj"
                 || ext == "dylib"
                 || ext == "lib"
                 || ext == "dll"
                 || fname.contains(".so.");
-            if is_binary_archive_or_so {
+            if ext == "bc" || ext == "ll" {
+                cmd.arg("-x").arg("ir").arg(extra);
+            } else if is_binary_archive_or_so {
                 cmd.arg("-x").arg("none").arg(extra);
                 if !targeting_windows && (ext == "so" || ext == "dylib" || fname.contains(".so.")) {
                     if let Some(parent) = extra.parent() {
@@ -298,6 +302,12 @@ impl LlvmVerifier {
                         }
                     }
                 }
+            } else if ext == "cpp" || ext == "cc" || ext == "cxx" {
+                if targeting_windows {
+                    cmd.arg("-D_CRT_SECURE_NO_WARNINGS");
+                    cmd.arg("-DWIN32_LEAN_AND_MEAN");
+                }
+                cmd.arg("-x").arg("c++").arg(extra);
             } else {
                 if targeting_windows {
                     cmd.arg("-D_CRT_SECURE_NO_WARNINGS");

@@ -590,7 +590,13 @@ fn compile_source(
                 }
                 all_dependency_files.push(full_path.clone());
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext == "c" || ext == "cpp" {
+                let ext_low = ext.to_ascii_lowercase();
+                let fname_low = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext_low == "c" || ext_low == "cpp" || ext_low == "cc" {
                     let mut driller = DependencyDriller::new()
                         .with_oenv(effective_oenv_path.clone())
                         .with_platform(target_platform.clone());
@@ -602,6 +608,33 @@ fn compile_source(
                     }
                     if verbose && !slice.external_frontier.is_empty() {
                         println!("  -> External frontier dependencies detected: {:?}", slice.external_frontier);
+                    }
+                } else if matches!(
+                    ext_low.as_str(),
+                    "h" | "hpp" | "ll" | "bc" | "o" | "obj" | "a" | "lib" | "so" | "dylib" | "dll"
+                ) || fname_low.contains(".so.")
+                {
+                    if ext_low != "h" && ext_low != "hpp" && !foreign_c_files.contains(&full_path) {
+                        foreign_c_files.push(full_path.clone());
+                    }
+                    // Discover sibling `.h` header for return-type hint extraction if present
+                    if let (Some(parent), Some(stem)) = (
+                        full_path.parent(),
+                        full_path.file_stem().and_then(|s| s.to_str()),
+                    ) {
+                        let clean_stem = stem
+                            .trim_start_matches("lib")
+                            .split('.')
+                            .next()
+                            .unwrap_or(stem);
+                        for h_cand in &[
+                            parent.join(format!("{}.h", clean_stem)),
+                            parent.join("include").join(format!("{}.h", clean_stem)),
+                        ] {
+                            if h_cand.is_file() && !all_dependency_files.contains(h_cand) {
+                                all_dependency_files.push(h_cand.clone());
+                            }
+                        }
                     }
                 } else if ext == "omni" || ext == "py" || ext == "java" || ext == "rs" || ext == "js" {
                     if let Ok(src) = fs::read_to_string(&full_path) {
@@ -786,7 +819,7 @@ fn compile_source(
                     let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
                     matches!(
                         ext.to_ascii_lowercase().as_str(),
-                        "c" | "cpp" | "so" | "dylib" | "a" | "lib" | "dll"
+                        "c" | "cc" | "cpp" | "ll" | "bc" | "o" | "obj" | "so" | "dylib" | "a" | "lib" | "dll"
                     ) || fname.contains(".so.")
                 };
                 for f in &walk.visited_files {
@@ -860,7 +893,7 @@ fn compile_source(
                                 sub_mods.push(sm);
                             }
                         }
-                    } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" || ext == "c" {
+                    } else if ext == "rs" || ext == "py" || ext == "js" || ext == "go" || ext == "java" || ext == "cs" || ext == "lua" {
                         if let Ok(raw_src) = fs::read_to_string(vf) {
                             let src = if ext == "rs" {
                                 raw_src.split("\n#[cfg(test)]").next().unwrap_or(&raw_src).to_string()
@@ -1071,14 +1104,24 @@ fn compile_source(
     }
     let cache_hash = hasher.finalize().to_hex().to_string();
     let cache_file = cache_dir.join(format!("{}.ll", cache_hash));
+    let cache_links_file = cache_dir.join(format!("{}.links", cache_hash));
 
     let (llvm_ir, from_cache) = if !no_cache && cache_file.exists() {
-        (fs::read_to_string(&cache_file)?, true)
+        let cached_ir = fs::read_to_string(&cache_file)?;
+        if let Ok(links_txt) = fs::read_to_string(&cache_links_file) {
+            foreign_c_files = links_txt
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+        (cached_ir, true)
     } else {
         let verifier = LlvmVerifier::new()?;
         let fallback = MockSynthesisEngine::new();
 
-        let generated = if let Some(ref candle_engine) = candle_engine_opt {
+        let mut generated = if let Some(ref candle_engine) = candle_engine_opt {
             let dev_tag = if candle_engine.is_cuda() {
                 "CUDA GPU"
             } else if candle_engine.is_metal() {
@@ -1109,6 +1152,19 @@ fn compile_source(
                 .with_drilled_spines(collected_drilled_spines.clone());
             codegen.generate_module_ir(&module, temp)?
         };
+
+        let c_ingest = omni_preamble::ingest_and_splice_c_dependencies(
+            &mut generated,
+            &mut foreign_c_files,
+            &all_dependency_files,
+            target_platform,
+            cache_dir,
+        );
+        if verbose {
+            for diag in &c_ingest.diagnostics {
+                println!("  -> {}", diag);
+            }
+        }
         (generated, false)
     };
     let codegen_time = t_codegen_start.elapsed();
@@ -1131,6 +1187,15 @@ fn compile_source(
         let tmp_cache = cache_dir.join(format!(".tmp_{}_{}.ll", std::process::id(), cache_hash));
         if fs::write(&tmp_cache, &llvm_ir).is_ok() {
             let _ = fs::rename(&tmp_cache, &cache_file);
+        }
+        let links_blob = foreign_c_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tmp_links = cache_dir.join(format!(".tmp_{}_{}.links", std::process::id(), cache_hash));
+        if fs::write(&tmp_links, &links_blob).is_ok() {
+            let _ = fs::rename(&tmp_links, &cache_links_file);
         }
     }
     let verify_time = t_verify_start.elapsed();
