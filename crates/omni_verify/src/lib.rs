@@ -1,3 +1,5 @@
+pub mod cortex_m;
+
 use regex::Regex;
 use std::fs;
 use std::io::Write;
@@ -5,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
+
+use cortex_m::chip::RpChipProfile;
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -30,7 +34,7 @@ pub enum VerifyError {
 }
 
 pub struct LlvmVerifier {
-    clang_path: PathBuf,
+    clang_path: Option<PathBuf>,
     macos_sysroot: Option<PathBuf>,
     diag_re: Regex,
 }
@@ -72,10 +76,10 @@ impl LlvmVerifier {
 
     pub fn new() -> Result<Self, VerifyError> {
         let mut found_path = None;
+        let explicit_override = std::env::var_os("OMNI_CLANG_PATH")
+            .or_else(|| std::env::var_os("CLANG_PATH"));
 
-        if let Some(custom) = std::env::var_os("OMNI_CLANG_PATH")
-            .or_else(|| std::env::var_os("CLANG_PATH"))
-        {
+        if let Some(ref custom) = explicit_override {
             let p = PathBuf::from(custom);
             if p.exists() {
                 found_path = Some(p);
@@ -110,7 +114,7 @@ impl LlvmVerifier {
             PathBuf::from("clang.exe"),
         ];
 
-        if found_path.is_none() {
+        if found_path.is_none() && explicit_override.is_none() {
             for c in &candidates {
                 if c.exists() {
                     found_path = Some(c.clone());
@@ -126,15 +130,20 @@ impl LlvmVerifier {
             }
         }
 
-        let clang_path = found_path.ok_or(VerifyError::ClangNotFound)?;
         let macos_sysroot = Self::detect_macos_sysroot();
         let diag_re = Regex::new(r"^(.*?):(\d+):(\d+):\s+(?:error|fatal error):\s+(.*)$").unwrap();
 
         Ok(Self {
-            clang_path,
+            clang_path: found_path,
             macos_sysroot,
             diag_re,
         })
+    }
+
+    fn require_clang(&self) -> Result<&Path, VerifyError> {
+        self.clang_path
+            .as_deref()
+            .ok_or(VerifyError::ClangNotFound)
     }
 
     /// Verify validity of LLVM IR bitcode without generating executable
@@ -148,6 +157,14 @@ impl LlvmVerifier {
         ir: &str,
         target_triple: Option<&str>,
     ) -> Result<(), VerifyError> {
+        // Zero-External-Dependency Bare-Metal Cortex-M (`RP2040` / `RP2350`) Pure-Rust Verification
+        if let Some(triple) = target_triple {
+            if RpChipProfile::from_target_triple(triple).is_some() {
+                return cortex_m::verify_cortex_m_ir(ir);
+            }
+        }
+
+        let clang_bin = self.require_clang()?;
         let temp_dir = std::env::temp_dir();
         let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_ll = temp_dir.join(format!("omni_verify_{}_{}.ll", std::process::id(), unique_id));
@@ -157,7 +174,7 @@ impl LlvmVerifier {
             .map_err(|e| VerifyError::Io(e.to_string()))?;
 
         let dev_null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        let mut cmd = Command::new(&self.clang_path);
+        let mut cmd = Command::new(clang_bin);
         if let Some(triple) = target_triple {
             if !triple.trim().is_empty() {
                 cmd.arg(format!("--target={}", triple.trim()));
@@ -247,7 +264,8 @@ impl LlvmVerifier {
         link_inputs: &[PathBuf],
         target_triple: Option<&str>,
     ) -> Result<std::process::Output, VerifyError> {
-        let mut cmd = Command::new(&self.clang_path);
+        let clang_bin = self.require_clang()?;
+        let mut cmd = Command::new(clang_bin);
         if let Some(triple) = target_triple {
             if !triple.trim().is_empty() {
                 cmd.arg(format!("--target={}", triple.trim()));
@@ -356,6 +374,13 @@ impl LlvmVerifier {
         extra_c_files: &[PathBuf],
         target_triple: Option<&str>,
     ) -> Result<(), VerifyError> {
+        // Zero-External-Dependency Bare-Metal `RP2040` (`ARMv6-M`) & `RP2350` (`ARMv8-M.main`) Backend!
+        if let Some(triple) = target_triple {
+            if let Some(chip) = RpChipProfile::from_target_triple(triple) {
+                return cortex_m::compile_ir_to_rp_firmware(ir, out_path, &chip);
+            }
+        }
+
         let temp_dir = std::env::temp_dir();
         let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_ll = temp_dir.join(format!("omni_build_{}_{}.ll", std::process::id(), unique_id));

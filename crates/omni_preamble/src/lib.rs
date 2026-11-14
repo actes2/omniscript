@@ -7,8 +7,10 @@ use walkdir::WalkDir;
 
 pub mod c_lifter;
 pub mod http;
+pub mod pio_asm;
 pub mod shimmer;
 pub use c_lifter::{ingest_and_splice_c_dependencies, CIngestionReport};
+pub use pio_asm::{assemble_pio_source, synthesize_omni_pio_module, AssembledPioProgram};
 pub use shimmer::{
     CPackageProvider, PackageEcosystem, PackageShimmer, PackageSpec, TargetArch, TargetPlatform,
 };

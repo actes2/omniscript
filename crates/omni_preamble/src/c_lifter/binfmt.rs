@@ -1427,8 +1427,8 @@ fn unwrap_macho_fat_slice(bytes: &[u8], preferred_arch: TargetArch) -> Result<&[
     let is_64 = magic_be == 0xCAFE_BABF;
     let nfat = rd_u32_be(bytes, 4).unwrap_or(0) as usize;
     let want_cpu: u32 = match preferred_arch {
-        TargetArch::X86_64 => 0x0100_0007,  // CPU_TYPE_X86_64
         TargetArch::Aarch64 => 0x0100_000C, // CPU_TYPE_ARM64
+        _ => 0x0100_0007,                   // CPU_TYPE_X86_64
     };
 
     let mut fallback: Option<&[u8]> = None;

@@ -398,7 +398,25 @@ fn run_file(
     Ok(())
 }
 
-fn normalize_output_binary_path(output: &Path, targeting_windows: bool) -> PathBuf {
+fn normalize_output_binary_path(
+    output: &Path,
+    source_path: &Path,
+    targeting_windows: bool,
+    targeting_rp_mcu: bool,
+) -> PathBuf {
+    if targeting_rp_mcu {
+        if output == Path::new("a.out") {
+            let stem = source_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("firmware");
+            return PathBuf::from(format!("{}.uf2", stem));
+        }
+        if output.extension().is_none() {
+            return output.with_extension("uf2");
+        }
+        return output.to_path_buf();
+    }
     if targeting_windows || cfg!(windows) {
         if output == Path::new("a.out") {
             return PathBuf::from("a.exe");
@@ -427,7 +445,13 @@ fn build_file(
     let target_platform = TargetPlatform::parse(platform_spec)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let targeting_windows = target_platform.llvm_triple.contains("windows");
-    let final_output = normalize_output_binary_path(output, targeting_windows);
+    let targeting_rp_mcu = target_platform.is_rp_mcu();
+    let final_output = normalize_output_binary_path(
+        output,
+        source_path,
+        targeting_windows,
+        targeting_rp_mcu,
+    );
     println!("==================================================");
     println!(" OmniScript Compiler (omnic v0.1.0)");
     println!(" Target Source: {}", source_path.display());
@@ -449,7 +473,9 @@ fn build_file(
     )?;
     let verifier = LlvmVerifier::new()?;
 
-    let bin_fmt = if targeting_windows {
+    let bin_fmt = if targeting_rp_mcu {
+        "Bare-Metal UF2 + ARM-ELF"
+    } else if targeting_windows {
         "PE/COFF"
     } else if target_platform.llvm_triple.contains("apple") || target_platform.llvm_triple.contains("macosx") {
         "Mach-O"
@@ -474,20 +500,42 @@ fn build_file(
     let total_build_time = build_start.elapsed();
 
     println!("  -> Successfully compiled and linked native binary: {}", final_output.display());
+    if targeting_rp_mcu {
+        let ext_low = final_output
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext_low != "bin" {
+            let companion = if ext_low == "elf" {
+                final_output.with_extension("uf2")
+            } else {
+                final_output.with_extension("elf")
+            };
+            println!("  -> Companion image emitted: {}", companion.display());
+        }
+    }
     let cache_str = if stats.from_cache { " [CACHE HIT]" } else { " [LIVE AI SYNTHESIS]" };
     println!(
         "\n[BUILD COMPLETE] Total: {:.2?} (Parse: {:.2?} | Drill: {:.2?} | Codegen: {:.2?}{} | Verify: {:.2?} | Link: {:.2?})",
         total_build_time, stats.parse_time, stats.drill_time, stats.codegen_time, cache_str, stats.verify_time, link_time
     );
     let out_disp = final_output.display().to_string();
-    let run_hint = if final_output.is_absolute() || out_disp.starts_with("./") || out_disp.starts_with(".\\") {
-        out_disp
-    } else if targeting_windows || cfg!(windows) {
-        format!(".\\{}", out_disp)
+    if targeting_rp_mcu {
+        println!(
+            "Flash firmware via BOOTSEL mass-storage copy or: picotool load -f {}",
+            out_disp
+        );
     } else {
-        format!("./{}", out_disp)
-    };
-    println!("Run binary with: {}", run_hint);
+        let run_hint = if final_output.is_absolute() || out_disp.starts_with("./") || out_disp.starts_with(".\\") {
+            out_disp
+        } else if targeting_windows || cfg!(windows) {
+            format!(".\\{}", out_disp)
+        } else {
+            format!("./{}", out_disp)
+        };
+        println!("Run binary with: {}", run_hint);
+    }
     Ok(())
 }
 
@@ -565,7 +613,11 @@ fn compile_source(
     // 2. Preamble Assembly & Symbol Carving
     let t_drill_start = std::time::Instant::now();
     let carver = SymbolCarver::new();
-    let mut foreign_c_files = omni_runtime::runtime_c_sources();
+    let mut foreign_c_files = if target_platform.is_rp_mcu() {
+        Vec::new()
+    } else {
+        omni_runtime::runtime_c_sources()
+    };
     let mut all_dependency_files = Vec::new();
     let mut collected_drilled_spines: Vec<String> = Vec::new();
 
@@ -635,6 +687,29 @@ fn compile_source(
                                 all_dependency_files.push(h_cand.clone());
                             }
                         }
+                    }
+                } else if ext_low == "pio" {
+                    let pio_src = fs::read_to_string(&full_path)?;
+                    let progs = omni_preamble::assemble_pio_source(&pio_src).map_err(|e| {
+                        anyhow::anyhow!("PIO assembly error in '{}': {}", full_path.display(), e)
+                    })?;
+                    let synth_src =
+                        omni_preamble::synthesize_omni_pio_module(&progs, alias.as_deref());
+                    let sub_mod = parser.parse_module(
+                        path.file_stem().and_then(|s| s.to_str()).unwrap_or("pio"),
+                        &synth_src,
+                    );
+                    for f in sub_mod.functions {
+                        if !module.functions.iter().any(|existing| existing.name == f.name) {
+                            module.functions.push(f);
+                        }
+                    }
+                    if verbose {
+                        println!(
+                            "  -> Assembled {} PIO state-machine program(s) from '{}' (pure-Rust pioasm)",
+                            progs.len(),
+                            path.display()
+                        );
                     }
                 } else if ext == "omni" || ext == "py" || ext == "java" || ext == "rs" || ext == "js" {
                     if let Ok(src) = fs::read_to_string(&full_path) {

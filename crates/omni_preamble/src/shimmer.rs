@@ -64,6 +64,8 @@ pub enum CPackageProvider {
     AlpineApk,
     MacosHomebrew,
     WindowsMsys2,
+    BareMetalRp2040,
+    BareMetalRp2350,
 }
 
 impl CPackageProvider {
@@ -76,6 +78,8 @@ impl CPackageProvider {
             CPackageProvider::AlpineApk => "alpine-apk",
             CPackageProvider::MacosHomebrew => "macos-homebrew",
             CPackageProvider::WindowsMsys2 => "windows-msys2",
+            CPackageProvider::BareMetalRp2040 => "baremetal-rp2040",
+            CPackageProvider::BareMetalRp2350 => "baremetal-rp2350",
         }
     }
 }
@@ -84,6 +88,8 @@ impl CPackageProvider {
 pub enum TargetArch {
     X86_64,
     Aarch64,
+    ArmV6M,
+    ArmV8MMain,
 }
 
 impl TargetArch {
@@ -99,7 +105,13 @@ impl TargetArch {
         match self {
             TargetArch::X86_64 => "x86_64",
             TargetArch::Aarch64 => "aarch64",
+            TargetArch::ArmV6M => "thumbv6m",
+            TargetArch::ArmV8MMain => "thumbv8m.main",
         }
+    }
+
+    pub fn is_cortex_m(&self) -> bool {
+        matches!(self, TargetArch::ArmV6M | TargetArch::ArmV8MMain)
     }
 }
 
@@ -204,8 +216,8 @@ impl TargetPlatform {
 
     pub fn arch(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
-            TargetArch::X86_64 => ("arch-x86_64", "x86_64-unknown-linux-gnu"),
             TargetArch::Aarch64 => ("arch-aarch64", "aarch64-unknown-linux-gnu"),
+            _ => ("arch-x86_64", "x86_64-unknown-linux-gnu"),
         };
         Self {
             slug: slug.to_string(),
@@ -217,8 +229,8 @@ impl TargetPlatform {
 
     pub fn debian(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
-            TargetArch::X86_64 => ("debian-x86_64", "x86_64-unknown-linux-gnu"),
             TargetArch::Aarch64 => ("debian-aarch64", "aarch64-unknown-linux-gnu"),
+            _ => ("debian-x86_64", "x86_64-unknown-linux-gnu"),
         };
         Self {
             slug: slug.to_string(),
@@ -230,8 +242,8 @@ impl TargetPlatform {
 
     pub fn yum(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
-            TargetArch::X86_64 => ("yum-x86_64", "x86_64-unknown-linux-gnu"),
             TargetArch::Aarch64 => ("yum-aarch64", "aarch64-unknown-linux-gnu"),
+            _ => ("yum-x86_64", "x86_64-unknown-linux-gnu"),
         };
         Self {
             slug: slug.to_string(),
@@ -243,8 +255,8 @@ impl TargetPlatform {
 
     pub fn suse(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
-            TargetArch::X86_64 => ("suse-x86_64", "x86_64-unknown-linux-gnu"),
             TargetArch::Aarch64 => ("suse-aarch64", "aarch64-unknown-linux-gnu"),
+            _ => ("suse-x86_64", "x86_64-unknown-linux-gnu"),
         };
         Self {
             slug: slug.to_string(),
@@ -256,8 +268,8 @@ impl TargetPlatform {
 
     pub fn alpine(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
-            TargetArch::X86_64 => ("alpine-x86_64", "x86_64-unknown-linux-musl"),
             TargetArch::Aarch64 => ("alpine-aarch64", "aarch64-unknown-linux-musl"),
+            _ => ("alpine-x86_64", "x86_64-unknown-linux-musl"),
         };
         Self {
             slug: slug.to_string(),
@@ -270,7 +282,7 @@ impl TargetPlatform {
     pub fn macos(arch: TargetArch) -> Self {
         let (slug, triple) = match arch {
             TargetArch::Aarch64 => ("macos-arm64", "arm64-apple-macosx11.0.0"),
-            TargetArch::X86_64 => ("macos-x86_64", "x86_64-apple-macosx10.15.0"),
+            _ => ("macos-x86_64", "x86_64-apple-macosx10.15.0"),
         };
         Self {
             slug: slug.to_string(),
@@ -282,10 +294,10 @@ impl TargetPlatform {
 
     pub fn windows(arch: TargetArch, gnu_abi: bool) -> Self {
         let (slug, triple) = match (arch, gnu_abi) {
-            (TargetArch::X86_64, false) => ("windows-x86_64", "x86_64-pc-windows-msvc"),
-            (TargetArch::X86_64, true) => ("windows-x86_64", "x86_64-w64-windows-gnu"),
             (TargetArch::Aarch64, false) => ("windows-aarch64", "aarch64-pc-windows-msvc"),
             (TargetArch::Aarch64, true) => ("windows-aarch64", "aarch64-w64-windows-gnu"),
+            (_, false) => ("windows-x86_64", "x86_64-pc-windows-msvc"),
+            (_, true) => ("windows-x86_64", "x86_64-w64-windows-gnu"),
         };
         Self {
             slug: slug.to_string(),
@@ -293,6 +305,31 @@ impl TargetPlatform {
             provider: CPackageProvider::WindowsMsys2,
             arch,
         }
+    }
+
+    pub fn rp2040(wireless: bool) -> Self {
+        Self {
+            slug: if wireless { "picow" } else { "rp2040" }.to_string(),
+            llvm_triple: "thumbv6m-none-eabi".to_string(),
+            provider: CPackageProvider::BareMetalRp2040,
+            arch: TargetArch::ArmV6M,
+        }
+    }
+
+    pub fn rp2350(wireless: bool) -> Self {
+        Self {
+            slug: if wireless { "pico2w" } else { "rp2350" }.to_string(),
+            llvm_triple: "thumbv8m.main-none-eabihf".to_string(),
+            provider: CPackageProvider::BareMetalRp2350,
+            arch: TargetArch::ArmV8MMain,
+        }
+    }
+
+    pub fn is_rp_mcu(&self) -> bool {
+        matches!(
+            self.provider,
+            CPackageProvider::BareMetalRp2040 | CPackageProvider::BareMetalRp2350
+        ) || self.arch.is_cortex_m()
     }
 
     /// Parse a `--platform <spec>` string (friendly OS/distro preset or raw LLVM target triple)
@@ -356,14 +393,26 @@ impl TargetPlatform {
             "msys2-clangarm64" | "mingw-aarch64" | "windows-aarch64-gnu" => {
                 Ok(Self::windows(TargetArch::Aarch64, true))
             }
+            "pico" | "rp2040" | "rpi-pico" | "cortex-m0" | "cortex-m0+" | "cortex-m0plus"
+            | "thumbv6m" | "thumbv6m-none-eabi" => Ok(Self::rp2040(false)),
+            "picow" | "pico-w" | "rp2040-w" => Ok(Self::rp2040(true)),
+            "pico2" | "pico-2" | "rp2350" | "rp2350-arm" | "cortex-m33" | "thumbv8m.main"
+            | "thumbv8m.main-none-eabi" | "thumbv8m.main-none-eabihf" => Ok(Self::rp2350(false)),
+            "pico2w" | "pico-2-w" | "pico2-w" | "rp2350-w" => Ok(Self::rp2350(true)),
             _ if lower.contains('-') => {
+                if lower.starts_with("thumbv6m") || lower.contains("rp2040") {
+                    return Ok(Self::rp2040(false));
+                }
+                if lower.starts_with("thumbv8m") || lower.contains("rp2350") {
+                    return Ok(Self::rp2350(false));
+                }
                 let arch = if lower.contains("aarch64") || lower.contains("arm64") {
                     TargetArch::Aarch64
                 } else if lower.contains("x86_64") || lower.contains("amd64") {
                     TargetArch::X86_64
                 } else {
                     return Err(PreambleError::PathNotFound(format!(
-                        "Unsupported architecture in platform spec '{}'. Expected x86_64 or aarch64/arm64.",
+                        "Unsupported architecture in platform spec '{}'. Expected x86_64, aarch64/arm64, rp2040/pico, or rp2350/pico2w.",
                         trimmed
                     )));
                 };
@@ -961,6 +1010,12 @@ impl PackageShimmer {
             CPackageProvider::WindowsMsys2 => {
                 self.shim_c_windows(clean_name, version, &pkg_platform_dir)
             }
+            CPackageProvider::BareMetalRp2040 | CPackageProvider::BareMetalRp2350 => {
+                Err(PreambleError::DependencyNotFound(format!(
+                    "Platform '{}' uses OmniScript's zero-dependency freestanding Cortex-M runtime; external hosted C packages ('{}') are not required.",
+                    self.platform.slug, clean_name
+                )))
+            }
         };
 
         match upstream_res {
@@ -1013,7 +1068,9 @@ impl PackageShimmer {
         match provider {
             CPackageProvider::ArchPacman
             | CPackageProvider::MacosHomebrew
-            | CPackageProvider::WindowsMsys2 => {
+            | CPackageProvider::WindowsMsys2
+            | CPackageProvider::BareMetalRp2040
+            | CPackageProvider::BareMetalRp2350 => {
                 push_uniq(lower.clone());
                 push_uniq(no_lib.to_string());
                 push_uniq(format!("lib{}", no_lib));
@@ -1395,8 +1452,8 @@ impl PackageShimmer {
     ) -> Result<PathBuf, PreambleError> {
         let lower_req = name.to_lowercase();
         let deb_arch = match self.platform.arch {
-            TargetArch::X86_64 => "amd64",
             TargetArch::Aarch64 => "arm64",
+            _ => "amd64",
         };
         let candidates = Self::c_package_name_candidates(name, CPackageProvider::DebianApt);
 
@@ -1500,8 +1557,8 @@ impl PackageShimmer {
         match self.platform.provider {
             CPackageProvider::RpmZypper => {
                 let base = match self.platform.arch {
-                    TargetArch::X86_64 => "https://download.opensuse.org/tumbleweed/repo/oss".to_string(),
                     TargetArch::Aarch64 => "https://download.opensuse.org/ports/aarch64/tumbleweed/repo/oss".to_string(),
+                    _ => "https://download.opensuse.org/tumbleweed/repo/oss".to_string(),
                 };
                 vec![("opensuse-oss".to_string(), base, true)]
             }
@@ -2076,7 +2133,7 @@ impl PackageShimmer {
         if let Some(files) = files_obj {
             let preferred_tags: &[&str] = match self.platform.arch {
                 TargetArch::Aarch64 => &["arm64_sequoia", "arm64_sonoma", "arm64_ventura", "arm64_monterey", "all"],
-                TargetArch::X86_64 => &["sequoia", "sonoma", "ventura", "monterey", "big_sur", "all"],
+                _ => &["sequoia", "sonoma", "ventura", "monterey", "big_sur", "all"],
             };
             for tag in preferred_tags {
                 if let Some(u) = files.get(*tag).and_then(|v| v.get("url")).and_then(|v| v.as_str()) {
@@ -2090,7 +2147,7 @@ impl PackageShimmer {
                     let is_arm = tag.starts_with("arm64_");
                     let matches_arch = match self.platform.arch {
                         TargetArch::Aarch64 => !is_linux && (is_arm || tag == "all"),
-                        TargetArch::X86_64 => !is_linux && (!is_arm || tag == "all"),
+                        _ => !is_linux && (!is_arm || tag == "all"),
                     };
                     if matches_arch {
                         if let Some(u) = val.get("url").and_then(|v| v.as_str()) {
@@ -2173,8 +2230,8 @@ impl PackageShimmer {
     ) -> Result<PathBuf, PreambleError> {
         let lower_req = name.to_lowercase();
         let (msys_repo, pkg_prefix) = match self.platform.arch {
-            TargetArch::X86_64 => ("ucrt64", "mingw-w64-ucrt-x86_64-"),
             TargetArch::Aarch64 => ("clangarm64", "mingw-w64-clang-aarch64-"),
+            _ => ("ucrt64", "mingw-w64-ucrt-x86_64-"),
         };
 
         let base_cands = Self::c_package_name_candidates(name, CPackageProvider::WindowsMsys2);
@@ -2539,6 +2596,7 @@ impl PackageShimmer {
                 let deb_arch = match self.platform.arch {
                     TargetArch::X86_64 => "amd64",
                     TargetArch::Aarch64 => "arm64",
+                    TargetArch::ArmV6M | TargetArch::ArmV8MMain => "armhf",
                 };
                 if let Ok(idx) = self.load_debian_main_packages_index(deb_arch) {
                     for stanza in idx.split("\n\n") {
@@ -2616,8 +2674,8 @@ impl PackageShimmer {
             }
             CPackageProvider::WindowsMsys2 => {
                 let msys_repo = match self.platform.arch {
-                    TargetArch::X86_64 => "ucrt64",
                     TargetArch::Aarch64 => "clangarm64",
+                    _ => "ucrt64",
                 };
                 let db = Self::shared_index_cache_dir(&self.tmp_dir())
                     .join(format!("msys2_{}.db", msys_repo));
@@ -2632,6 +2690,7 @@ impl PackageShimmer {
                     }
                 }
             }
+            CPackageProvider::BareMetalRp2040 | CPackageProvider::BareMetalRp2350 => {}
         }
 
         Self::rank_c_candidates_with_origin(query, pool, prefer_dev, limit)

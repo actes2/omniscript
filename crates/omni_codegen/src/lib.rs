@@ -106,7 +106,7 @@ const NATIVE_CALL_PATTERNS: &[&str] = &[
 // Self/class receiver keywords excluded from external foreign-module classification.
 const SELF_RECEIVERS: &[&str] = &["self", "this", "cls"];
 
-// Standard C / system library functions invoked via direct vararg FFI.
+// Standard C / system & bare-metal MCU hardware functions invoked via direct FFI.
 const NATIVE_C_LIB_FNS: &[&str] = &[
     "compressBound", "compress", "uncompress", "crc32", "adler32",
     "sqlite3_open", "sqlite3_close", "sqlite3_exec", "sqlite3_errmsg",
@@ -115,6 +115,10 @@ const NATIVE_C_LIB_FNS: &[&str] = &[
     "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
     "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
     "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
+    "gpio_init", "gpio_set_dir", "gpio_put", "gpio_toggle", "gpio_get",
+    "mmio_read32", "mmio_write32", "sleep_ms", "sleep_us", "time_us", "time_us_64",
+    "pio_instr_write", "pio_sm_config_and_enable", "pio_sm_put", "pio_sm_get", "pio_sm_exec",
+    "uart_putc", "uart_puts",
 ];
 
 // Subset of `NATIVE_C_LIB_FNS` whose C ABI return width on LP64 / 64-bit targets is `i64` (`uLong` / `size_t` / `long` / pointer).
@@ -122,6 +126,10 @@ const NATIVE_C_LIB_I64_FNS: &[&str] = &[
     "compressBound", "strlen", "atol", "labs", "time", "ftell",
     "calloc", "realloc", "strcpy", "strncpy", "strcat", "strchr", "strstr",
     "memcpy", "memmove", "memset", "fopen", "getenv", "sqlite3_errmsg", "fread", "fwrite",
+    "gpio_init", "gpio_set_dir", "gpio_put", "gpio_toggle", "gpio_get",
+    "mmio_read32", "mmio_write32", "sleep_ms", "sleep_us", "time_us", "time_us_64",
+    "pio_instr_write", "pio_sm_config_and_enable", "pio_sm_put", "pio_sm_get", "pio_sm_exec",
+    "uart_putc", "uart_puts",
 ];
 
 /// Classifies whether a parsed type annotation maps to IEEE-754 `double`.

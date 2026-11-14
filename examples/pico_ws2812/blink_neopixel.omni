@@ -1,0 +1,37 @@
+// Zero-dependency bare-metal firmware for Raspberry Pi Pico (RP2040) & Pico 2 W (RP2350)
+// Build for RP2040:  omnic build --platform pico   examples/pico_ws2812/blink_neopixel.omni
+// Build for RP2350:  omnic build --platform pico2w examples/pico_ws2812/blink_neopixel.omni
+
+import "ws2812.pio" as ws
+
+fn pack_grb(r: int, g: int, b: int) -> int {
+    return ((g << 16) | (r << 8) | b) << 8;
+}
+
+fn main() -> int {
+    // Onboard GPIO 25 status LED + PIO0 SM0 WS2812 driver on GP16
+    gpio_init(25);
+    gpio_set_dir(25, 1);
+    gpio_put(25, 1);
+
+    ws_program_load(0, 0);
+    ws_sm_init(0, 0, 0, 16, 2);
+
+    let colors = [
+        pack_grb(255, 0, 64),
+        pack_grb(0, 220, 120),
+        pack_grb(32, 96, 255)
+    ];
+
+    print("OmniScript Bare-Metal PIO + GPIO Ready");
+
+    let frame = 0;
+    while frame < 3 {
+        pio_sm_put(0, 0, colors[frame]);
+        gpio_toggle(25);
+        sleep_ms(50);
+        frame = frame + 1;
+    }
+
+    return 0;
+}
