@@ -8,9 +8,10 @@ This directory houses the local distilled language models utilized by OmniScript
 
 - **Filename**: `omni-coder.gguf`
 - **Format**: GGUF v3 (Quantized weights optimized for in-process Candle inference on CPU AVX2/NEON and CUDA).
-- **Footprint**: ~1.05 GB (1,125,049,856 bytes).
+- **Footprint**: ~1.07 GB (1,125,050,080 bytes).
+- **SHA-256**: `70a3e3191072ad5aee3fbd52c95f3ec976eb40215cad92344ce322def42aaf66`
 - **Base Architecture**: 1.5B Parameter Code LLM (Qwen2.5-Coder derivative).
-- **Quantization Level**: 4-bit / 5-bit mixed block quantization (`Q4_K_M` / `Q5_K_M`).
+- **Quantization Level**: Imatrix-calibrated 5-bit mixed block quantization (`Q5_K_M`: 168 `Q5_K`, 29 `Q6_K`, 141 `F32` tensors).
 
 ---
 
@@ -39,11 +40,11 @@ flowchart TD
 
 ## 3. Placement & Download
 
-### Direct Download from Release v0.1.0
+### Direct Download from Release v0.2.0
 To download the compiled model weights into the `models/` directory:
 ```bash
 mkdir -p models
-curl -L -o models/omni-coder.gguf https://github.com/actes2/omniscript/releases/download/v0.1.0/omni-coder.gguf
+curl -L -o models/omni-coder.gguf https://github.com/actes2/omniscript/releases/download/v0.2.0/omni-coder.gguf
 ```
 
 You can customize the model directory path via the environment variable:

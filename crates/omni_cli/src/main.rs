@@ -453,7 +453,7 @@ fn build_file(
         targeting_rp_mcu,
     );
     println!("==================================================");
-    println!(" OmniScript Compiler (omnic v0.1.0)");
+    println!(" OmniScript Compiler (omnic v{})", env!("CARGO_PKG_VERSION"));
     println!(" Target Source: {}", source_path.display());
     println!(" Platform: {} ({})", target_platform.slug, target_platform.llvm_triple);
     println!(" Temp: {:.2} | Opt-Level: -O{} | Cache: {} | Device: {} | Auto-Resolve: {}", temp, opt_level, !no_cache, device, auto_resolve_dependencies);
@@ -1290,7 +1290,7 @@ fn compile_source(
 
 fn run_repl() -> anyhow::Result<()> {
     println!("============================================================");
-    println!(" OmniScript Interactive Polyglot REPL (omnic v0.1.0)");
+    println!(" OmniScript Interactive Polyglot REPL (omnic v{})", env!("CARGO_PKG_VERSION"));
     println!(" Type polyglot statements (Python, Go, C) or :help for commands");
     println!(" Zero-GC runtime | Live JIT Execution");
     println!("============================================================");
