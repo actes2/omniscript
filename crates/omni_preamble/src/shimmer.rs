@@ -2217,6 +2217,34 @@ impl PackageShimmer {
             "source_url": src_url,
         });
         Self::normalize_c_package_layout(&stage_dir, &final_dir, &symlinks, &meta)?;
+        #[cfg(target_os = "macos")]
+        {
+            // Raw GHCR Homebrew bottles embed un-relocated `@@HOMEBREW_PREFIX@@/...` install names;
+            // rewrite each real `.dylib` to `@rpath/<filename>` and re-sign ad-hoc for Apple Silicon AMFI.
+            let lib_dir = final_dir.join("lib");
+            if let Ok(entries) = fs::read_dir(&lib_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let p = entry.path();
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_file()
+                            && p.extension().and_then(|e| e.to_str()) == Some("dylib")
+                        {
+                            if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                                let rpath_id = format!("@rpath/{}", fname);
+                                let _ = std::process::Command::new("install_name_tool")
+                                    .args(["-id", &rpath_id])
+                                    .arg(&p)
+                                    .output();
+                                let _ = std::process::Command::new("codesign")
+                                    .args(["-f", "-s", "-"])
+                                    .arg(&p)
+                                    .output();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&stage_dir);
         Ok(final_dir)
     }

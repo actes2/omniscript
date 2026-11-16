@@ -28,5 +28,6 @@ default = []
 cuda = ["omni_engine/cuda"]
 metal = ["omni_engine/metal"]
 accelerate = ["omni_engine/accelerate"]
+accelerated = ["accelerate"]
 full-build = ["omni_engine/full-build"]
 

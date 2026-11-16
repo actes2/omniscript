@@ -1883,6 +1883,9 @@ impl DependencyDriller {
                     format!("lib{}.dylib", module),
                     format!("lib{}.dylib", clean_mod),
                     format!("lib{}.dylib", module.to_uppercase()),
+                    format!("lib{}.tbd", module),
+                    format!("lib{}.tbd", clean_mod),
+                    format!("lib{}.tbd", module.to_uppercase()),
                     format!("{}.lib", module),
                     format!("{}.lib", clean_mod),
                     format!("{}.lib", module.to_uppercase()),
@@ -1895,12 +1898,14 @@ impl DependencyDriller {
                 for pkg_lib in &pkg_lib_names {
                     so_candidates.insert(0, format!("lib{}.dll.a", pkg_lib));
                     so_candidates.insert(0, format!("{}.lib", pkg_lib));
+                    so_candidates.insert(0, format!("lib{}.tbd", pkg_lib));
                     so_candidates.insert(0, format!("lib{}.dylib", pkg_lib));
                     so_candidates.insert(0, format!("lib{}.so", pkg_lib));
                 }
                 if module == "zlib" {
                     so_candidates.push("libz.so".to_string());
                     so_candidates.push("libz.dylib".to_string());
+                    so_candidates.push("libz.tbd".to_string());
                     so_candidates.push("zlib.lib".to_string());
                     so_candidates.push("zdll.lib".to_string());
                     so_candidates.push("libz.dll.a".to_string());
@@ -1913,6 +1918,7 @@ impl DependencyDriller {
                     "/usr/local/lib".to_string(),
                     "/usr/lib".to_string(),
                     "/usr/lib64".to_string(),
+                    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib".to_string(),
                     "/usr/lib/x86_64-linux-gnu".to_string(),
                     "/usr/lib/aarch64-linux-gnu".to_string(),
                     "/lib/x86_64-linux-gnu".to_string(),
@@ -1923,6 +1929,24 @@ impl DependencyDriller {
                     let pb = PathBuf::from(static_lib_dir);
                     if pb.is_dir() && !lib_dirs.contains(&pb) {
                         lib_dirs.push(pb);
+                    }
+                }
+                if let Some(sdk) = std::env::var_os("SDKROOT") {
+                    let slib = PathBuf::from(sdk).join("usr").join("lib");
+                    if slib.is_dir() && !lib_dirs.contains(&slib) {
+                        lib_dirs.push(slib);
+                    }
+                } else if cfg!(target_os = "macos") {
+                    if let Ok(out) = std::process::Command::new("xcrun").arg("--show-sdk-path").output() {
+                        if out.status.success() {
+                            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !s.is_empty() {
+                                let slib = PathBuf::from(s).join("usr").join("lib");
+                                if slib.is_dir() && !lib_dirs.contains(&slib) {
+                                    lib_dirs.push(slib);
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(vcpkg) = std::env::var_os("VCPKG_ROOT") {

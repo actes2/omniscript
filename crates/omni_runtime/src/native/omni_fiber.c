@@ -61,9 +61,17 @@ __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__(
         "stp x25, x26, [sp, #-16]!\n\t"
         "stp x27, x28, [sp, #-16]!\n\t"
         "stp x29, x30, [sp, #-16]!\n\t"
+        "stp d8,  d9,  [sp, #-16]!\n\t"
+        "stp d10, d11, [sp, #-16]!\n\t"
+        "stp d12, d13, [sp, #-16]!\n\t"
+        "stp d14, d15, [sp, #-16]!\n\t"
         "mov x2, sp\n\t"
         "str x2, [x0]\n\t"
         "mov sp, x1\n\t"
+        "ldp d14, d15, [sp], #16\n\t"
+        "ldp d12, d13, [sp], #16\n\t"
+        "ldp d10, d11, [sp], #16\n\t"
+        "ldp d8,  d9,  [sp], #16\n\t"
         "ldp x29, x30, [sp], #16\n\t"
         "ldp x27, x28, [sp], #16\n\t"
         "ldp x25, x26, [sp], #16\n\t"
@@ -220,19 +228,22 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
     *(--sp) = 0;                          // rbp
     fiber->rsp = (void*)sp;
 #elif defined(__aarch64__)
-    uint64_t* sp = (uint64_t*)stack_top;
-    *(--sp) = (uint64_t)fiber_entry_stub; // x30 (lr)
-    *(--sp) = 0;                          // x29 (fp)
-    *(--sp) = 0;                          // x28
-    *(--sp) = 0;                          // x27
-    *(--sp) = 0;                          // x26
-    *(--sp) = 0;                          // x25
-    *(--sp) = 0;                          // x24
-    *(--sp) = 0;                          // x23
-    *(--sp) = 0;                          // x22
-    *(--sp) = 0;                          // x21
-    *(--sp) = 0;                          // x20
-    *(--sp) = 0;                          // x19
+    /* AAPCS64 context frame: 10 register pairs = 160 bytes (16-byte SP aligned).
+     * Restore order in swap_g_context (ascending from saved sp):
+     *   sp[0..1]   = d14, d15
+     *   sp[2..3]   = d12, d13
+     *   sp[4..5]   = d10, d11
+     *   sp[6..7]   = d8,  d9
+     *   sp[8..9]   = x29 (fp), x30 (lr -> fiber_entry_stub)
+     *   sp[10..11] = x27, x28
+     *   sp[12..13] = x25, x26
+     *   sp[14..15] = x23, x24
+     *   sp[16..17] = x21, x22
+     *   sp[18..19] = x19, x20
+     */
+    uint64_t* sp = (uint64_t*)(stack_top - 160);
+    memset(sp, 0, 160);
+    sp[9] = (uint64_t)fiber_entry_stub;
     fiber->rsp = (void*)sp;
 #else
     fiber->rsp = (void*)stack_top;

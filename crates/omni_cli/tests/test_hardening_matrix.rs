@@ -146,6 +146,7 @@ fn test_compile_and_execute_polyglot_hardening_suite() {
             .arg("build")
             .arg(&target_file)
             .arg("--no-cache")
+            .arg("--auto-resolve-dependencies")
             .arg("-o")
             .arg(&bin_out)
             .current_dir(repo_root)

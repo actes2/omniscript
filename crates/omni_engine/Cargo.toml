@@ -18,6 +18,10 @@ candle-transformers = { git = "https://github.com/PCfVW/candle", branch = "fix/c
 tokenizers = "0.23.2"
 memmap2 = "0.9.12"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-count-unsafe", features = ["accelerate"] }
+candle-transformers = { git = "https://github.com/PCfVW/candle", branch = "fix/cpuid-count-unsafe", features = ["accelerate"] }
+
 [build-dependencies]
 cc = "1.0"
 
@@ -26,4 +30,5 @@ default = []
 cuda = ["candle-core/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-transformers/accelerate"]
+accelerated = ["accelerate"]
 full-build = []

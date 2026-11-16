@@ -199,6 +199,9 @@ impl LlvmVerifier {
 
     fn is_non_system_lib_dir(dir: &Path) -> bool {
         let s = dir.to_string_lossy();
+        if s.ends_with(".sdk/usr/lib") {
+            return false;
+        }
         !matches!(
             s.as_ref(),
             "/usr/lib"
@@ -306,6 +309,7 @@ impl LlvmVerifier {
                 || ext == "o"
                 || ext == "obj"
                 || ext == "dylib"
+                || ext == "tbd"
                 || ext == "lib"
                 || ext == "dll"
                 || fname.contains(".so.");

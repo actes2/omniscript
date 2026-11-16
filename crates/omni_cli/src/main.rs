@@ -894,7 +894,7 @@ fn compile_source(
                     let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
                     matches!(
                         ext.to_ascii_lowercase().as_str(),
-                        "c" | "cc" | "cpp" | "ll" | "bc" | "o" | "obj" | "so" | "dylib" | "a" | "lib" | "dll"
+                        "c" | "cc" | "cpp" | "ll" | "bc" | "o" | "obj" | "so" | "dylib" | "tbd" | "a" | "lib" | "dll"
                     ) || fname.contains(".so.")
                 };
                 for f in &walk.visited_files {

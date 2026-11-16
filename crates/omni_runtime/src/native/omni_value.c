@@ -592,7 +592,11 @@ void __omni_throw(int64_t code, const char* exc_type, const char* msg) {
     g_omni_last_exc_msg = msg ? msg : "";
     if (g_omni_try_depth > 0) {
         g_omni_try_depth--;
+#ifdef _WIN32
         longjmp(g_omni_try_stack[g_omni_try_depth].env, 1);
+#else
+        _longjmp(g_omni_try_stack[g_omni_try_depth].env, 1);
+#endif
     }
     fprintf(stderr, "Uncaught %s: %s\n", g_omni_last_exc_type, g_omni_last_exc_msg);
     fflush(stderr);
