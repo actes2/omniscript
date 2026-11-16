@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "omni_cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "omni_codegen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "omni_engine",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "omni_engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "omni_mem"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "regex",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "omni_parser"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "omni_mem",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "omni_preamble"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "omni_runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "omni_verify"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "regex",
