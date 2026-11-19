@@ -43,10 +43,19 @@ Or for windows folks:
 Make sure you've installed `clang.exe` and its available in your `%PATH%`
 
 ___
-#### Disclaimer
-As of this readme, 
+#### What OmniScript Actually Compiles Today (Beyond Syntax Mixing)
+Unlike polyglot wrappers that embed heavy foreign runtimes (`libpython`, V8, JVM, or Go's GC) or bridge languages over slow IPC/FFI shims, `omnic` acts as a **whole-program cross-ecosystem static compiler & binary lifter**:
+* **Dependency Carving:**
+`omni_preamble` statically traces reachable call spines across **C/C++**, **Python**, **Go**, **Rust**, **Java/JVM Bytecode**, **JavaScript/TypeScript**, **C#**, and **Lua** (plus procedural idioms from Zig, Julia, Nim, Ruby, Kotlin, and Swift), dead-stripping 99%+ of unused package code and compiling the surviving cross-language graph into **one single LLVM IR translation unit** (`clang -O2` inlines across Python, Go, and C simultaneously, linking only the OS syscall libc).
+> We basically drill through every dependency chain until we find the lowest level possible and translate back-up the 'spine' the intentions of those dependencies; which are converted to LLVM IR
 
-We only have true syntax parity with Rust, Python and C right now -- so there's definitely some glitches and outright problems to be identified when trying to compile other languages as of right this moment. *Mileage may vary*
+- **Direct Cross-ISA / Cross-OS C Binary Lifting (`c_lifter`)**: Lifts precompiled C objects, static archives, and shared libraries (`ELF`, `Mach-O` thin & universal, `PE/COFF`, `.a`, `.lib`, `Wasm`, `.bc`/`.ll`) across `x86_64`, `AArch64`, `RISC-V 64`, and `Wasm32` directly into target-neutral LLVM IR.
+
+> Omnic is notoriously good at consuming C into LLVM IR
+
+- **Zero-Toolchain Bare-Metal ARM Cortex-M & PIO Firmware (`--platform rp2040` / `rp2350`)**: Emits flashable `.uf2` and `.elf` microcontroller firmware for Raspberry Pi Pico / Pico 2 W (including inline `.pio` state-machine assembly) using a pure-Rust Thumb-1/Thumb-2 backend—zero `arm-none-eabi-gcc`, `clang`, `lld`, `cmake`, or `pioasm` required.
+
+- **Abductive Semantic Verification & Known Frontier Boundaries**: Lowered blocks are checked against both Clang SSA/type verification and a **Semantic Obligation Ledger** (live-operand dataflow, destination stores, and proof-bearing abductive diagnostics with edit-distance symbol evidence rather than silent no-op fallbacks). Active frontier limitations include mutable heap-captured closures, dynamic trait vtables, and CPython C-API extension `.so` modules.
 ___
 ### Background
 OmniScript is a language I wrote over a weekend, after considering the paradigm of: *"What if I could just put python, into my Go, and Java, and C, and Rust, and Javascript"* 

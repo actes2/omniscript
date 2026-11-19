@@ -84,17 +84,72 @@ impl SsaContextEnvelope {
         if let Some(ref ye) = self.yield_expectation {
             out.push_str(&format!("  <yield_expectation>{}</yield_expectation>\n", ye));
         }
+        let is_method_synth = self.action_directive.as_deref() == Some("SYNTHESIZE_ANNOTATED_METHOD");
+        let intent_head = self
+            .raw_intent
+            .split("\n[Compiler Diagnostic Feedback:")
+            .next()
+            .unwrap_or(&self.raw_intent);
+        let phys_head = self.physical_source.as_deref().unwrap_or(intent_head);
+        let ref_tokens: std::collections::HashSet<&str> = intent_head
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .chain(phys_head.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let kept_symbols: Vec<&SsaVariable> = if is_method_synth || self.active_symbols.len() <= 8 {
+            self.active_symbols.iter().collect()
+        } else {
+            let ye_str = self.yield_expectation.as_deref().unwrap_or("");
+            let filtered: Vec<&SsaVariable> = self
+                .active_symbols
+                .iter()
+                .filter(|v| {
+                    ref_tokens.contains(v.name.as_str())
+                        || ye_str.contains(v.llvm_name.as_str())
+                        || v.name == "self"
+                        || v.name == "this"
+                })
+                .collect();
+            if filtered.is_empty() {
+                let start = self.active_symbols.len().saturating_sub(4);
+                self.active_symbols[start..].iter().collect()
+            } else {
+                filtered
+            }
+        };
+
         out.push_str("  <live_registers>\n");
-        for var in &self.active_symbols {
+        for var in &kept_symbols {
             out.push_str(&format!(
                 "    <reg var=\"{}\" llvm=\"{}\" type=\"{}\"/>\n",
                 var.name, var.llvm_name, var.type_hint
             ));
         }
         out.push_str("  </live_registers>\n");
-        if !self.struct_definitions.is_empty() {
+
+        let kept_structs: Vec<&String> = if is_method_synth {
+            self.struct_definitions.iter().collect()
+        } else {
+            self.struct_definitions
+                .iter()
+                .filter(|s| {
+                    let s_name = s
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches("%struct.")
+                        .trim_start_matches("%enum.");
+                    !s_name.is_empty()
+                        && (ref_tokens.contains(s_name)
+                            || self.enclosing_fn.contains(s_name)
+                            || kept_symbols.iter().any(|v| v.type_hint.contains(s_name)))
+                })
+                .collect()
+        };
+        if !kept_structs.is_empty() {
             out.push_str("  <structs>\n");
-            for s in &self.struct_definitions {
+            for s in kept_structs {
                 out.push_str(&format!("    <type>{}</type>\n", s));
             }
             out.push_str("  </structs>\n");
@@ -102,15 +157,11 @@ impl SsaContextEnvelope {
         if let Some(ref hint) = self.idiom_hint {
             out.push_str(&format!("  <idiom_hint>{}</idiom_hint>\n", hint));
         }
-        if let Some(ref eco) = self.ecosystem_context {
-            out.push_str(&format!("  <ecosystem_context>{}</ecosystem_context>\n", eco));
-        }
-        if let Some(ref lc) = self.lifetime_context {
-            out.push_str(&format!("  <lifetime_context>{}</lifetime_context>\n", lc));
-        }
         let mut clean_imports = Vec::new();
         let mut drilled_contexts = Vec::new();
         let mut short_circuit_hints = Vec::new();
+        let mut abductive_evidence = Vec::new();
+        let mut semantic_obligations = Vec::new();
         for imp in &self.import_chain {
             if let Some(sc) = imp.strip_prefix("__OMNI_SHORT_CIRCUIT_IR__:") {
                 let sc_t = sc.trim();
@@ -119,11 +170,26 @@ impl SsaContextEnvelope {
                 }
             } else if let Some(dm) = imp.strip_prefix("__OMNI_DRILLED_MECH__:") {
                 let dm_t = dm.trim();
-                if !drilled_contexts.contains(&dm_t) {
+                let relevant_spine = is_method_synth
+                    || ref_tokens
+                        .iter()
+                        .any(|tok| tok.len() >= 3 && dm_t.contains(*tok));
+                if relevant_spine && !drilled_contexts.contains(&dm_t) {
                     drilled_contexts.push(dm_t);
+                }
+            } else if let Some(ae) = imp.strip_prefix("__OMNI_ABDUCTIVE_EVIDENCE__:") {
+                let ae_t = ae.trim();
+                if !abductive_evidence.contains(&ae_t) {
+                    abductive_evidence.push(ae_t);
+                }
+            } else if let Some(so) = imp.strip_prefix("__OMNI_SEMANTIC_OBLIGATION__:") {
+                let so_t = so.trim();
+                if !semantic_obligations.contains(&so_t) {
+                    semantic_obligations.push(so_t);
                 }
             } else if !imp.starts_with("__OMNI_DEP_WALK__:")
                 && !imp.starts_with("__OMNI_CARVED_FN__:")
+                && !imp.starts_with("__OMNI_C_SYM__:")
             {
                 let imp_s = imp.as_str();
                 if !clean_imports.contains(&imp_s) {
@@ -132,9 +198,113 @@ impl SsaContextEnvelope {
             }
         }
 
-        if !clean_imports.is_empty() {
+        // Abductive Ecosystem Narrowing: resolve which imported module/namespace can lexically
+        // provide the target statement's symbols:
+        //   Tier 1: Explicit alias (`alias: X`) or module leaf (`module: a.b.Leaf`) appears in `ref_tokens`.
+        //   Tier 2: Eliminate provably non-providing imports — unused explicit `alias:` bindings,
+        //           unreferenced module-scoped packages (`python`/`node`/`rust`/`go`), and imports
+        //           bound exclusively to `@Decorator` annotations on structs in scope.
+        let decorator_leaves: std::collections::HashSet<&str> = self
+            .struct_definitions
+            .iter()
+            .filter_map(|s| s.split("decorators: [").nth(1))
+            .filter_map(|rest| rest.split(']').next())
+            .flat_map(|list| list.split(','))
+            .map(|d| {
+                let trimmed = d.trim().trim_start_matches('@').trim_start_matches("#[");
+                trimmed
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+            })
+            .filter(|d| !d.is_empty())
+            .collect();
+
+        fn parse_import_parts(imp: &str) -> (&str, &str, Option<&str>) {
+            let eco = imp.split_whitespace().next().unwrap_or("");
+            let mod_part = imp
+                .split("module:")
+                .nth(1)
+                .map(|s| s.split([',', ')']).next().unwrap_or("").trim())
+                .unwrap_or("");
+            let alias_part = imp
+                .split("alias:")
+                .nth(1)
+                .map(|s| s.split(')').next().unwrap_or("").trim())
+                .filter(|s| !s.is_empty());
+            (eco, mod_part, alias_part)
+        }
+
+        let scoped_imports: Vec<&str> = if !is_method_synth && clean_imports.len() > 1 {
+            let tier1: Vec<&str> = clean_imports
+                .iter()
+                .copied()
+                .filter(|imp| {
+                    let (_, mod_path, alias_opt) = parse_import_parts(imp);
+                    if let Some(alias) = alias_opt {
+                        return ref_tokens.contains(alias);
+                    }
+                    let leaf = mod_path
+                        .rsplit(['.', '/', ':', '-'])
+                        .next()
+                        .unwrap_or(mod_path);
+                    !leaf.is_empty() && ref_tokens.contains(leaf)
+                })
+                .collect();
+
+            if !tier1.is_empty() {
+                tier1
+            } else {
+                let tier2_open_ns: Vec<&str> = clean_imports
+                    .iter()
+                    .copied()
+                    .filter(|imp| {
+                        let (eco, mod_path, alias_opt) = parse_import_parts(imp);
+                        // An explicit `as <alias>` binding cannot introduce unqualified symbols
+                        if alias_opt.is_some() {
+                            return false;
+                        }
+                        let leaf = mod_path
+                            .rsplit(['.', '/', ':'])
+                            .next()
+                            .unwrap_or(mod_path);
+                        // Annotation/decorator imports (`@Data`, `@With`, etc.) do not provide call targets
+                        if !leaf.is_empty() && decorator_leaves.contains(leaf) {
+                            return false;
+                        }
+                        // Module-scoped imports (`import 'python' varint`, `import 'rust' adler`) require qualification
+                        if matches!(eco, "python" | "node" | "rust" | "go") && !mod_path.contains('*') {
+                            return false;
+                        }
+                        true
+                    })
+                    .collect();
+
+                if tier2_open_ns.is_empty() {
+                    clean_imports
+                } else {
+                    tier2_open_ns
+                }
+            }
+        } else {
+            clean_imports
+        };
+
+        if let Some(ref eco) = self.ecosystem_context {
+            let eff_eco = if !is_method_synth && !scoped_imports.is_empty() && scoped_imports.len() <= 3 {
+                scoped_imports.join(", ")
+            } else {
+                eco.clone()
+            };
+            out.push_str(&format!("  <ecosystem_context>{}</ecosystem_context>\n", eff_eco));
+        }
+        if let Some(ref lc) = self.lifetime_context {
+            out.push_str(&format!("  <lifetime_context>{}</lifetime_context>\n", lc));
+        }
+
+        if !scoped_imports.is_empty() {
             out.push_str("  <import_chain>\n");
-            for imp in clean_imports.into_iter().take(16) {
+            for imp in scoped_imports.into_iter().take(16) {
                 out.push_str(&format!("    <import>{}</import>\n", imp));
             }
             out.push_str("  </import_chain>\n");
@@ -145,6 +315,20 @@ impl SsaContextEnvelope {
                 out.push_str(&format!("    <spine>{}</spine>\n", dc));
             }
             out.push_str("  </drilled_context>\n");
+        }
+        if feedback.is_some() && !abductive_evidence.is_empty() {
+            out.push_str("  <abductive_evidence>\n");
+            for ev in abductive_evidence.into_iter().take(12) {
+                out.push_str(&format!("    <proof>{}</proof>\n", ev));
+            }
+            out.push_str("  </abductive_evidence>\n");
+        }
+        if feedback.is_some() && !semantic_obligations.is_empty() {
+            out.push_str("  <semantic_obligations>\n");
+            for ob in semantic_obligations.into_iter().take(12) {
+                out.push_str(&format!("    <must>{}</must>\n", ob));
+            }
+            out.push_str("  </semantic_obligations>\n");
         }
         // Only surface pre-assembled failover hints when retrying after a diagnostic failure
         if feedback.is_some() && !short_circuit_hints.is_empty() {
@@ -289,22 +473,47 @@ impl InferenceEngine for MockSynthesisEngine {
         source_context: &str,
         candidate_import: &str,
     ) -> Result<String, EngineError> {
-        let lower_imp = candidate_import.to_lowercase();
+        let clean_imp = candidate_import.trim().trim_end_matches(';').trim();
+        let lower_imp = clean_imp.to_lowercase();
         let lower_ctx = source_context.to_lowercase();
-        if lower_imp.contains("lombok") || lower_imp.contains("java.") || lower_imp.contains("javax.") || lower_ctx.contains("public class") || lower_ctx.contains("package ") {
-            return Ok("java".to_string());
-        }
-        if lower_imp.contains("requests") || lower_imp.contains("numpy") || lower_imp.contains("torch") || lower_ctx.contains("def ") {
-            return Ok("python".to_string());
-        }
-        if lower_imp.contains("express") || lower_imp.contains("react") || lower_ctx.contains("console.log") {
-            return Ok("javascript".to_string());
-        }
-        if lower_imp.contains("serde") || lower_imp.contains("tokio") || lower_ctx.contains("fn ") {
+        if clean_imp.contains("::") || lower_ctx.contains("fn ") || lower_ctx.contains("let mut ") {
             return Ok("rust".to_string());
         }
-        if lower_imp.contains("gin") || lower_ctx.contains("func ") {
+        if lower_imp.ends_with(".h") || lower_imp.ends_with(".hpp") || lower_ctx.contains("#include") {
+            return Ok("c".to_string());
+        }
+        let dot_parts: Vec<&str> = clean_imp.split('.').collect();
+        let has_java_pkg_grammar = dot_parts.len() >= 2
+            && dot_parts[..dot_parts.len() - 1]
+                .iter()
+                .all(|s| s.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false))
+            && dot_parts
+                .last()
+                .and_then(|l| l.chars().next())
+                .map(|c| c.is_ascii_uppercase() || c == '*')
+                .unwrap_or(false);
+        if lower_imp.starts_with("java.")
+            || lower_imp.starts_with("javax.")
+            || has_java_pkg_grammar
+            || lower_ctx.contains("public class")
+            || lower_ctx.contains("package ")
+        {
+            return Ok("java".to_string());
+        }
+        if (clean_imp.contains('/') && clean_imp.split('/').next().unwrap_or("").contains('.'))
+            || lower_ctx.contains("func ")
+            || lower_ctx.contains(":=")
+        {
             return Ok("go".to_string());
+        }
+        if (clean_imp.starts_with('@') && clean_imp.contains('/'))
+            || lower_ctx.contains("console.log")
+            || lower_ctx.contains("require(")
+        {
+            return Ok("javascript".to_string());
+        }
+        if lower_ctx.contains("def ") || lower_ctx.contains("self.") {
+            return Ok("python".to_string());
         }
         Err(EngineError::InferenceFailed("Dialect not determined".to_string()))
     }
@@ -322,6 +531,22 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "strcmp",
     "_setjmp",
     "__omni_str_concat",
+    "__omni_str_len",
+    "__omni_str_char_at",
+    "__omni_str_byte_at",
+    "__omni_str_ord",
+    "__omni_str_chr",
+    "__omni_str_slice_step",
+    "__omni_str_contains",
+    "__omni_str_starts_with",
+    "__omni_str_ends_with",
+    "__omni_str_find",
+    "__omni_str_upper",
+    "__omni_str_lower",
+    "__omni_str_trim",
+    "__omni_str_replace",
+    "__omni_str_split",
+    "__omni_str_to_chars",
     "__omni_int_to_str",
     "__omni_float_to_str",
     "__omni_c_str_to_f64",
@@ -364,6 +589,8 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_slice_set",
     "__omni_slice_len",
     "__omni_slice_pop",
+    "__omni_slice_subslice",
+    "__omni_slice_contains",
     "__omni_slice_print",
     "__omni_slice_destroy",
     "__omni_map_create",
@@ -414,6 +641,12 @@ const FUZZY_STEM_MAP: &[(&[&str], &str)] = &[
     (&["print_int"], "__omni_print_int"),
     (&["float_to_str", "f64_to_str", "ftoa"], "__omni_float_to_str"),
     (&["int_to_str", "i64_to_str", "itoa"], "__omni_int_to_str"),
+    (&["str_len", "strlen", "string_len"], "__omni_str_len"),
+    (&["str_char_at", "char_at"], "__omni_str_char_at"),
+    (&["str_contains", "contains_str"], "__omni_str_contains"),
+    (&["str_upper", "toupper"], "__omni_str_upper"),
+    (&["str_lower", "tolower"], "__omni_str_lower"),
+    (&["str_trim", "str_strip"], "__omni_str_trim"),
     (&["str_concat", "concat"], "__omni_str_concat"),
     (&["try_push"], "__omni_try_push"),
     (&["try_pop"], "__omni_try_pop"),
@@ -900,6 +1133,177 @@ impl<'a> VerifiedSynthesisEngine<'a> {
         }
         out
     }
+
+    /// Strips quoted string literals so identifier scanning only inspects actual code tokens.
+    fn strip_quoted_literals(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        let mut quote: Option<char> = None;
+        while let Some(c) = chars.next() {
+            if let Some(q) = quote {
+                if c == '\\' {
+                    let _ = chars.next();
+                } else if c == q {
+                    quote = None;
+                    out.push(' ');
+                }
+            } else if c == '"' || c == '\'' {
+                quote = Some(c);
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Post-condition semantic obligation verifier: ensures synthesized LLVM IR not only compiles
+    /// cleanly in Clang, but actually honors live-variable dataflow, target stores, and side-effects.
+    pub fn verify_semantic_obligations(
+        envelope: &SsaContextEnvelope,
+        sanitized_ir: &str,
+    ) -> Result<(), String> {
+        let exec_lines: Vec<&str> = sanitized_ir
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with(';') && !l.starts_with("declare "))
+            .collect();
+
+        if exec_lines.is_empty() {
+            return Err(format!(
+                "Semantic obligation violated: synthesized block for '{}' contains zero executable instructions (no-op comments are forbidden).",
+                envelope.physical_source.as_deref().unwrap_or(&envelope.raw_intent).trim()
+            ));
+        }
+
+        let phys_raw = envelope
+            .physical_source
+            .as_deref()
+            .unwrap_or(&envelope.raw_intent)
+            .split("\n[Compiler Diagnostic Feedback:")
+            .next()
+            .unwrap_or("")
+            .trim();
+
+        let dst_ptr_opt = envelope
+            .yield_expectation
+            .as_deref()
+            .and_then(|ye| ye.rsplit(" to ").next())
+            .filter(|dst| dst.starts_with('%'));
+
+        let (lhs_ident_opt, rhs_slice) = if let Some((l, r)) = phys_raw.split_once('=') {
+            let l_end = l.as_bytes().last().copied().unwrap_or(b' ');
+            let r_start = r.as_bytes().first().copied().unwrap_or(b' ');
+            if !matches!(l_end, b'=' | b'!' | b'<' | b'>') && r_start != b'=' && r_start != b'>' {
+                let lhs_clean = l.trim().trim_end_matches(':').split_whitespace().last().unwrap_or("").trim();
+                (Some(lhs_clean), r.trim())
+            } else {
+                (None, phys_raw)
+            }
+        } else {
+            (None, phys_raw)
+        };
+
+        if let Some(dst_ptr) = dst_ptr_opt {
+            let stores_to_dst = exec_lines.iter().any(|l| {
+                l.starts_with("store ") && l.contains(dst_ptr)
+            });
+            if !stores_to_dst {
+                return Err(format!(
+                    "Semantic obligation violated: expected assignment store into '{}' for '{}', but synthesized IR never wrote to '{}'.",
+                    dst_ptr, phys_raw, dst_ptr
+                ));
+            }
+
+            let rhs_trim = rhs_slice.trim().trim_end_matches(';').trim();
+            let rhs_is_zero_lit = matches!(
+                rhs_trim,
+                "0" | "0.0" | "false" | "False" | "null" | "None" | "nil" | "\"\"" | "''"
+            );
+            if !rhs_is_zero_lit && exec_lines.len() == 1 {
+                let only = exec_lines[0];
+                if only.starts_with("store i64 0,")
+                    || only.starts_with("store i32 0,")
+                    || only.starts_with("store i8* null,")
+                {
+                    return Err(format!(
+                        "Semantic obligation violated: trivial zero/null placeholder '{}' emitted instead of evaluating '{}'.",
+                        only, rhs_trim
+                    ));
+                }
+            }
+        } else {
+            let has_effect = exec_lines.iter().any(|l| {
+                l.contains("call ")
+                    || l.starts_with("store ")
+                    || l.starts_with("ret ")
+                    || l.starts_with("br ")
+            });
+            if !has_effect {
+                return Err(format!(
+                    "Semantic obligation violated: statement '{}' produced pure dead instructions with no call, store, or branch.",
+                    phys_raw
+                ));
+            }
+        }
+
+        let unquoted = Self::strip_quoted_literals(rhs_slice);
+        let bytes = unquoted.as_bytes();
+        let mut idx = 0usize;
+        let mut referenced_idents: Vec<&str> = Vec::new();
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b.is_ascii_alphabetic() || b == b'_' {
+                let start = idx;
+                let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+                idx += 1;
+                while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_') {
+                    idx += 1;
+                }
+                let mut look = idx;
+                while look < bytes.len() && bytes[look].is_ascii_whitespace() {
+                    look += 1;
+                }
+                let is_kwarg_label = look < bytes.len()
+                    && bytes[look] == b'='
+                    && (look + 1 >= bytes.len() || bytes[look + 1] != b'=');
+                let ident = &unquoted[start..idx];
+                if !preceded_by_dot && !is_kwarg_label && Some(ident) != lhs_ident_opt {
+                    if !referenced_idents.contains(&ident) {
+                        referenced_idents.push(ident);
+                    }
+                }
+            } else {
+                idx += 1;
+            }
+        }
+
+        for ident in referenced_idents {
+            if matches!(
+                ident,
+                "true" | "false" | "True" | "False" | "None" | "null" | "nil"
+                    | "and" | "or" | "not" | "in" | "is" | "as" | "if" | "else"
+                    | "new" | "go" | "chan" | "int" | "float" | "double" | "str"
+                    | "string" | "i32" | "i64" | "f64" | "arena"
+            ) {
+                continue;
+            }
+            if let Some(sym) = envelope.active_symbols.iter().find(|s| s.name == ident) {
+                if dst_ptr_opt == Some(sym.llvm_name.as_str()) {
+                    continue;
+                }
+                let used_in_exec = exec_lines.iter().any(|l| l.contains(&sym.llvm_name));
+                if !used_in_exec {
+                    return Err(format!(
+                        "Semantic obligation violated: source expression '{}' depends on live variable '{}' ({}, type {}), which was never read in synthesized IR.",
+                        phys_raw, sym.name, sym.llvm_name, sym.type_hint
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
@@ -1036,11 +1440,16 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             harness.push_str(&body);
             harness.push_str("\n  ret i32 0\n}\n");
 
-            // Verify with Clang
+            // Verify syntactic/type well-formedness with Clang AND semantic obligations
             match self.verifier.verify_ir_for_target(&harness, Some(active_triple)) {
-                Ok(_) => {
-                    return Ok(sanitized);
-                }
+                Ok(_) => match Self::verify_semantic_obligations(envelope, &sanitized) {
+                    Ok(()) => {
+                        return Ok(sanitized);
+                    }
+                    Err(sem_err) => {
+                        last_error = sem_err;
+                    }
+                },
                 Err(err) => {
                     last_error = err.to_string();
                 }
@@ -1056,15 +1465,33 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             .iter()
             .filter_map(|imp| imp.strip_prefix("__OMNI_DEP_WALK__:"))
             .collect();
+        let abductive_proofs: Vec<&str> = envelope
+            .import_chain
+            .iter()
+            .filter_map(|imp| imp.strip_prefix("__OMNI_ABDUCTIVE_EVIDENCE__:"))
+            .collect();
         let imports_str = if !dep_walks.is_empty() {
             dep_walks.join(", ")
         } else if envelope.import_chain.is_empty() {
             "none".to_string()
         } else {
-            envelope.import_chain.join(", ")
+            envelope
+                .import_chain
+                .iter()
+                .filter(|i| !i.starts_with("__OMNI_"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let evidence_str = if abductive_proofs.is_empty() {
+            "none".to_string()
+        } else {
+            abductive_proofs.join(" | ")
         };
 
-        let human_reason = if last_error.contains("use of undefined value '@") {
+        let human_reason = if last_error.starts_with("Semantic obligation violated:") {
+            last_error.clone()
+        } else if last_error.contains("use of undefined value '@") {
             let undef_sym = last_error
                 .split("use of undefined value '")
                 .nth(1)
@@ -1083,22 +1510,24 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
 
         let stumped_report = format!(
             "\n======================================================================\n\
-             [OMNIC COMPILER STUMPED] Unable to lower polyglot intent\n\
+             [OMNIC SEMANTIC / LOWERING ERROR] Unable to prove & lower polyglot intent\n\
              ----------------------------------------------------------------------\n\
                Function  : {}\n\
                Ecosystem : {}\n\
                Dep Walk  : {}\n\
+               Evidence  : {}\n\
                Statement : {}\n\
                Last IR   :\n{}\n\
                Why       : {}\n\
-               Clang Err : {}\n\
-               Action    : Provide a concrete C/Omni implementation for the native\n\
-                           frontier symbols above, or use supported runtime primitives.\n\
+               Diag      : {}\n\
+               Action    : Check symbol/method spelling against Evidence above, import\n\
+                           the providing module, or provide a concrete C/Omni definition.\n\
              ======================================================================",
             envelope.enclosing_fn,
             eco_str,
             imports_str,
-            envelope.raw_intent,
+            evidence_str,
+            envelope.physical_source.as_deref().unwrap_or(&envelope.raw_intent),
             last_ir.trim_end(),
             human_reason,
             last_error.lines().next().unwrap_or(&last_error)
@@ -1823,6 +2252,55 @@ Let me know if you need any adjustments!
                 println!("Error in {:?}: {:?}", elapsed, e);
             }
         }
+    }
+
+    #[test]
+    fn test_abductive_lexical_ecosystem_narrowing_without_hardcoding() {
+        let env = SsaContextEnvelope {
+            target_abi: "x86_64-unknown-linux-gnu".to_string(),
+            enclosing_fn: "main".to_string(),
+            return_type: "i32".to_string(),
+            next_ssa_idx: 10,
+            active_symbols: vec![SsaVariable {
+                name: "jitter".to_string(),
+                llvm_name: "%var_jitter_1".to_string(),
+                type_hint: "i64".to_string(),
+            }],
+            struct_definitions: vec![
+                "%struct.TelemetryCanvas = type { i64 } ; decorators: [@Data, @AllArgsConstructor, @With] ; fields: [0: width (i64)]".to_string(),
+            ],
+            raw_intent: "jitter = RandomNumberGenerator.GetInt32(7, 8)".to_string(),
+            idiom_hint: Some("ForeignModuleAssignment".to_string()),
+            anchor_id: Some(1),
+            physical_source: Some("jitter = RandomNumberGenerator.GetInt32(7, 8)".to_string()),
+            concurrency_mode: None,
+            yield_expectation: Some("store 64-bit scalar result to %var_jitter_1".to_string()),
+            action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+            ecosystem_context: Some("java (module: lombok.Data), java (module: lombok.AllArgsConstructor), java (module: lombok.With), c (module: SDL2, alias: sdl), python (module: varint), node (module: crc-32, alias: crc32), rust (module: adler), go (module: github.com/cespare/xxhash, alias: xxhash), csharp (module: System.Security.Cryptography)".to_string()),
+            lifetime_context: None,
+            import_chain: vec![
+                "java (module: lombok.Data)".to_string(),
+                "java (module: lombok.AllArgsConstructor)".to_string(),
+                "java (module: lombok.With)".to_string(),
+                "c (module: SDL2, alias: sdl)".to_string(),
+                "python (module: varint)".to_string(),
+                "node (module: crc-32, alias: crc32)".to_string(),
+                "rust (module: adler)".to_string(),
+                "go (module: github.com/cespare/xxhash, alias: xxhash)".to_string(),
+                "csharp (module: System.Security.Cryptography)".to_string(),
+            ],
+        };
+        let prompt = env.to_prompt_micro_tags();
+        assert!(
+            prompt.contains("<ecosystem_context>csharp (module: System.Security.Cryptography)</ecosystem_context>"),
+            "Expected pure lexical/decorator elimination to isolate csharp open namespace, got:\n{}",
+            prompt
+        );
+        assert!(
+            !prompt.contains("SDL2") && !prompt.contains("varint") && !prompt.contains("lombok.Data"),
+            "Unused aliased, module-scoped, and @Decorator-bound imports must be eliminated:\n{}",
+            prompt
+        );
     }
 
     #[test]

@@ -1902,13 +1902,13 @@ impl DependencyDriller {
                     so_candidates.insert(0, format!("lib{}.dylib", pkg_lib));
                     so_candidates.insert(0, format!("lib{}.so", pkg_lib));
                 }
-                if module == "zlib" {
-                    so_candidates.push("libz.so".to_string());
-                    so_candidates.push("libz.dylib".to_string());
-                    so_candidates.push("libz.tbd".to_string());
-                    so_candidates.push("zlib.lib".to_string());
-                    so_candidates.push("zdll.lib".to_string());
-                    so_candidates.push("libz.dll.a".to_string());
+                if let Some(short_stem) = clean_mod.strip_suffix("lib").filter(|s| !s.is_empty()) {
+                    so_candidates.push(format!("lib{}.so", short_stem));
+                    so_candidates.push(format!("lib{}.dylib", short_stem));
+                    so_candidates.push(format!("lib{}.tbd", short_stem));
+                    so_candidates.push(format!("{}lib.lib", short_stem));
+                    so_candidates.push(format!("{}dll.lib", short_stem));
+                    so_candidates.push(format!("lib{}.dll.a", short_stem));
                 }
                 let mut lib_dirs: Vec<PathBuf> = pkg_lib_dirs;
                 for static_lib_dir in &[
@@ -3350,9 +3350,8 @@ impl DependencyDriller {
                                     if let Ok(pcontent) = fs::read_to_string(pf) {
                                         for pline in pcontent.lines() {
                                             let pt = pline.trim();
-                                            if pt.starts_with("self.view_functions")
-                                                || pt.starts_with("self.url_map")
-                                                || (pt.starts_with("self.") && pt.ends_with("= {}"))
+                                            if pt.starts_with("self.")
+                                                && (pt.ends_with("= {}") || pt.contains(": dict") || pt.ends_with("= dict()"))
                                             {
                                                 if trace.drilled_code_slice.len() < 6 {
                                                     trace.drilled_code_slice.push(pt.to_string());
@@ -3417,8 +3416,7 @@ impl DependencyDriller {
                                 for b_line in &body_lines {
                                     let tb = b_line.trim();
                                     if tb.starts_with("def decorator(")
-                                        || tb.contains("self.view_functions[")
-                                        || tb.contains("self.url_map.add(")
+                                        || (tb.starts_with("self.") && tb.contains('[') && tb.contains("] ="))
                                     {
                                         trace.drilled_code_slice.push(tb.to_string());
                                     }
@@ -3448,15 +3446,28 @@ impl DependencyDriller {
                                             next_hop_fn = Some(callee_tail.to_string());
                                         }
                                         break;
-                                    } else if tb.starts_with("run_simple(") || tb.starts_with("self.add_url_rule(") {
-                                        trace.hop_chain.push(format!("delegates: `{}`", tb));
-                                        trace.drilled_code_slice.push(tb.to_string());
+                                    } else if !tb.contains('=')
+                                        && !tb.starts_with("if ")
+                                        && !tb.starts_with("for ")
+                                        && !tb.starts_with("while ")
+                                        && !tb.starts_with("raise ")
+                                        && !tb.starts_with("assert ")
+                                        && tb.contains('(')
+                                    {
                                         let callee = tb.split('(').next().unwrap_or("").trim();
-                                        let callee_tail = callee.split('.').last().unwrap_or(callee).trim();
-                                        if !callee_tail.is_empty() && callee_tail != sym {
-                                            next_hop_fn = Some(callee_tail.to_string());
+                                        let is_ident_chain = !callee.is_empty()
+                                            && callee
+                                                .chars()
+                                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+                                        if is_ident_chain {
+                                            trace.hop_chain.push(format!("delegates: `{}`", tb));
+                                            trace.drilled_code_slice.push(tb.to_string());
+                                            let callee_tail = callee.split('.').last().unwrap_or(callee).trim();
+                                            if !callee_tail.is_empty() && callee_tail != sym {
+                                                next_hop_fn = Some(callee_tail.to_string());
+                                            }
+                                            break;
                                         }
-                                        break;
                                     }
                                 }
 
@@ -3526,9 +3537,9 @@ impl DependencyDriller {
                                                         ));
                                                         for hb in hlines.iter().skip(hidx + 1).take(60) {
                                                             let hbt = hb.trim();
-                                                            if hbt.contains("self.view_functions[")
-                                                                || hbt.contains("self.url_map.add(")
-                                                                || hbt.contains("session.request(")
+                                                            if (hbt.starts_with("self.") && hbt.contains('[') && hbt.contains("] ="))
+                                                                || hbt.contains(".request(")
+                                                                || hbt.contains("urlopen(")
                                                             {
                                                                 trace.drilled_code_slice.push(hbt.to_string());
                                                             }
@@ -3677,15 +3688,13 @@ impl DependencyDriller {
                 || f.starts_with("_socket")
                 || f.starts_with("ssl")
                 || f.starts_with("_ssl")
-                || f.starts_with("urllib3")
                 || f.starts_with("http")
+                || f.starts_with("net")
         });
 
-        // 1. Class constructor initializing internal dispatch/handler maps (`class ...` + `= {}` / `view_functions` / `url_map`)
+        // 1. Class constructor initializing internal dispatch/handler maps (`class ...` + `= {}` / `= dict()`)
         if sig.starts_with("class ")
-            && (drilled_joined.contains("= {}")
-                || drilled_joined.contains("view_functions")
-                || drilled_joined.contains("url_map"))
+            && (drilled_joined.contains("= {}") || drilled_joined.contains("= dict("))
         {
             trace.inferred_mechanism = Some(DrilledMechanism::StateContainerCreate);
             trace.short_circuit_c_symbol = Some("__omni_map_create".to_string());
@@ -3698,10 +3707,9 @@ impl DependencyDriller {
             return;
         }
 
-        // 2. Higher-order decorator or callback map registrar (`def decorator(` or `view_functions[...] = ` or `url_map.add`)
+        // 2. Higher-order decorator or callback map registrar (`def decorator(` or `self.<map>[...] =`)
         if drilled_joined.contains("def decorator(")
-            || drilled_joined.contains("view_functions[")
-            || drilled_joined.contains("url_map.add(")
+            || (drilled_joined.contains("self.") && drilled_joined.contains("[") && drilled_joined.contains("] ="))
         {
             trace.inferred_mechanism = Some(DrilledMechanism::CallbackMapRegister);
             trace.short_circuit_c_symbol = Some("__omni_map_set".to_string());
@@ -4151,17 +4159,10 @@ impl DependencyDriller {
             "socket" | "_socket" | "ssl" | "_ssl" | "select" | "posix" | "nt" | "os" | "sys" => {
                 format!("{} (OS/C-ABI syscall boundary)", pkg)
             }
-            "json" | "_json" | "zlib" | "hashlib" | "ctypes" | "struct" | "io" | "time" => {
+            "json" | "_json" | "zlib" | "hashlib" | "ctypes" | "struct" | "io" | "time" | "math" | "re" => {
                 format!("{} (C-stdlib native module)", pkg)
             }
-            "urllib3" | "idna" | "certifi" | "charset_normalizer" | "chardet" => {
-                format!("{} (external package dependency)", pkg)
-            }
-            "werkzeug" => "werkzeug (WSGI HTTP/socket server dependency)".to_string(),
-            "jinja2" | "click" | "itsdangerous" | "blinker" | "markupsafe" => {
-                format!("{} (Flask ecosystem dependency)", pkg)
-            }
-            _ => pkg.to_string(),
+            _ => format!("{} (external package dependency)", pkg),
         }
     }
 
@@ -4216,77 +4217,84 @@ impl DependencyDriller {
     }
 }
 
-/// Tier 2 static heuristic fallback when LLM is unavailable or undecided
+/// Tier 2 static structural fallback when LLM is unavailable or undecided:
+/// classifies imports strictly from import-path grammar and surrounding AST syntax cues
+/// (zero hardcoded third-party package or framework names).
 pub fn static_infer_dialect(source_context: &str, candidate_import: &str) -> Option<String> {
-    let lower_import = candidate_import.to_lowercase();
+    let clean_imp = candidate_import.trim().trim_end_matches(';').trim();
+    let lower_import = clean_imp.to_lowercase();
     let lower_ctx = source_context.to_lowercase();
 
-    // Java hints
-    if lower_import.starts_with("lombok")
-        || lower_import.starts_with("java.")
+    // 1. Unambiguous import-path grammar cues
+    if clean_imp.contains("::") {
+        return Some("rust".to_string());
+    }
+    if lower_import.ends_with(".h") || lower_import.ends_with(".hpp") {
+        return Some("c".to_string());
+    }
+    if clean_imp.starts_with('@') && clean_imp.contains('/') {
+        return Some("javascript".to_string());
+    }
+    if clean_imp.contains('/') {
+        let first_seg = clean_imp.split('/').next().unwrap_or("");
+        if first_seg.contains('.') {
+            return Some("go".to_string());
+        }
+    }
+    if clean_imp.starts_with("System.") || clean_imp.starts_with("Microsoft.") {
+        return Some("csharp".to_string());
+    }
+    let dot_parts: Vec<&str> = clean_imp.split('.').collect();
+    let has_java_pkg_grammar = dot_parts.len() >= 2
+        && dot_parts[..dot_parts.len() - 1]
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false))
+        && dot_parts
+            .last()
+            .and_then(|leaf| leaf.chars().next())
+            .map(|c| c.is_ascii_uppercase() || c == '*')
+            .unwrap_or(false);
+    if lower_import.starts_with("java.")
         || lower_import.starts_with("javax.")
-        || lower_import.starts_with("org.projectlombok")
-        || lower_ctx.contains("public class ")
-        || lower_ctx.contains("private class ")
-        || lower_ctx.contains("public static void main")
-        || lower_ctx.contains("system.out.print")
-        || lower_ctx.contains("@data")
-        || lower_ctx.contains("@builder")
+        || has_java_pkg_grammar
     {
         return Some("java".to_string());
     }
 
-    // Python hints
-    if lower_import.starts_with("requests")
-        || lower_import.starts_with("numpy")
-        || lower_import.starts_with("torch")
-        || lower_import.starts_with("scipy")
-        || lower_import.starts_with("flask")
-        || lower_import.starts_with("fastapi")
-        || lower_import.starts_with("pytest")
-        || lower_ctx.contains("def ")
-        || lower_ctx.contains("self.")
-        || lower_ctx.contains("__init__")
+    // 2. Surrounding AST syntax cues
+    if lower_ctx.contains("public class ")
+        || lower_ctx.contains("private class ")
+        || lower_ctx.contains("public static void main")
+        || lower_ctx.contains("system.out.print")
     {
-        return Some("python".to_string());
+        return Some("java".to_string());
     }
-
-    // Rust hints
-    if lower_import.starts_with("serde")
-        || lower_import.starts_with("tokio")
-        || lower_import.contains("::")
-        || lower_ctx.contains("fn ")
+    if lower_ctx.contains("fn ")
         || lower_ctx.contains("let mut ")
         || lower_ctx.contains("impl ")
     {
         return Some("rust".to_string());
     }
-
-    // Go hints
-    if lower_import.contains('/')
-        || lower_ctx.contains("func ")
+    if lower_ctx.contains("func ")
         || lower_ctx.contains(":=")
         || lower_ctx.contains("chan ")
         || lower_ctx.contains("fmt.println")
     {
         return Some("go".to_string());
     }
-
-    // JS / Node hints
-    if lower_import.starts_with("express")
-        || lower_import.starts_with("react")
-        || lower_ctx.contains("console.log")
+    if lower_ctx.contains("def ")
+        || lower_ctx.contains("self.")
+        || lower_ctx.contains("__init__")
+    {
+        return Some("python".to_string());
+    }
+    if lower_ctx.contains("console.log")
         || lower_ctx.contains("require(")
         || lower_ctx.contains("export ")
     {
         return Some("javascript".to_string());
     }
-
-    // C / C++ hints
-    if lower_import.ends_with(".h")
-        || lower_ctx.contains("#include")
-        || lower_ctx.contains("malloc(")
-    {
+    if lower_ctx.contains("#include") || lower_ctx.contains("malloc(") {
         return Some("c".to_string());
     }
 

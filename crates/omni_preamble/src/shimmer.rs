@@ -896,24 +896,54 @@ impl PackageShimmer {
         let pkg_dir = self.packages_dir(&PackageEcosystem::Java);
         let _ = fs::create_dir_all(&pkg_dir);
 
-        // Formats: `org.apache.commons:commons-lang3` or `org.json:json`
-        let (group, artifact) = if let Some((g, a)) = group_and_artifact.split_once(':') {
-            (g, a)
+        // Formats: `groupId:artifactId` or bare `artifactId` / `pkg.ClassName` resolved via Maven Central search
+        let (group, artifact, eff_version) = if let Some((g, a)) = group_and_artifact.split_once(':') {
+            let ver = if version.is_empty() || version == "latest" {
+                self.query_maven_central(&format!("g:{} AND a:{}", g, a), 1)
+                    .into_iter()
+                    .next()
+                    .map(|(_, _, v)| v)
+                    .unwrap_or_else(|| version.to_string())
+            } else {
+                version.to_string()
+            };
+            (g.to_string(), a.to_string(), ver)
         } else {
-            ("org.apache", group_and_artifact)
+            let resolved = self
+                .query_maven_central(&format!("a:{}", group_and_artifact), 1)
+                .into_iter()
+                .next()
+                .or_else(|| {
+                    self.query_maven_central(&format!("fc:{}", group_and_artifact), 1)
+                        .into_iter()
+                        .next()
+                });
+            if let Some((g, a, latest_v)) = resolved {
+                let ver = if version.is_empty() || version == "latest" {
+                    latest_v
+                } else {
+                    version.to_string()
+                };
+                (g, a, ver)
+            } else {
+                return Err(PreambleError::PathNotFound(format!(
+                    "Unqualified Java package '{}' requires 'groupId:artifactId' coordinates or reachable Maven Central index",
+                    group_and_artifact
+                )));
+            }
         };
 
         let group_path = group.replace('.', "/");
-        let target_dir = pkg_dir.join(format!("{}-{}", artifact, version));
+        let target_dir = pkg_dir.join(format!("{}-{}", artifact, eff_version));
         if target_dir.is_dir() {
             return Ok(target_dir);
         }
 
         let download_url = format!(
             "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.jar",
-            group_path, artifact, version, artifact, version
+            group_path, artifact, eff_version, artifact, eff_version
         );
-        let jar_file = self.tmp_dir().join(format!("{}-{}.jar", artifact, version));
+        let jar_file = self.tmp_dir().join(format!("{}-{}.jar", artifact, eff_version));
 
         self.download_file(&download_url, &jar_file)?;
         let _ = fs::create_dir_all(&target_dir);
@@ -3374,6 +3404,47 @@ impl PackageShimmer {
         json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
     }
 
+    /// Query Maven Central Solr REST API for `(groupId, artifactId, latestVersion)` coordinates
+    fn query_maven_central(&self, solr_query: &str, rows: usize) -> Vec<(String, String, String)> {
+        let encoded_q: String = solr_query
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':' => (b as char).to_string(),
+                b' ' => "+".to_string(),
+                _ => format!("%{:02X}", b),
+            })
+            .collect();
+        let url = format!(
+            "https://search.maven.org/solrsearch/select?q={}&rows={}&wt=json",
+            encoded_q, rows
+        );
+        let Ok(resp) = self.fetch_url_string(&url) else {
+            return Vec::new();
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp) else {
+            return Vec::new();
+        };
+        let Some(docs) = json
+            .get("response")
+            .and_then(|r| r.get("docs"))
+            .and_then(|d| d.as_array())
+        else {
+            return Vec::new();
+        };
+        docs.iter()
+            .filter_map(|doc| {
+                let g = doc.get("g")?.as_str()?.to_string();
+                let a = doc.get("a")?.as_str()?.to_string();
+                let v = doc
+                    .get("latestVersion")
+                    .or_else(|| doc.get("v"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                Some((g, a, v))
+            })
+            .collect()
+    }
+
     /// Unpack a .tar.gz / .tgz archive into target_dir with optional stripped leading path components
     fn extract_tar_gz(archive_path: &Path, target_dir: &Path, strip_components: usize) -> Result<(), PreambleError> {
         let file = fs::File::open(archive_path)
@@ -3469,110 +3540,86 @@ impl PackageShimmer {
 
         match eco {
             PackageEcosystem::Java => {
-                if root == "lombok" || clean_name.contains("lombok") {
-                    vec![
-                        PackageSpec {
-                            ecosystem: PackageEcosystem::Java,
-                            name: "org.projectlombok:lombok".to_string(),
-                            version: Some("1.18.36".to_string()),
-                            is_git: false,
-                            git_url: None,
-                            git_ref: None,
-                            raw_line: "'java' org.projectlombok:lombok == 1.18.36".to_string(),
-                        },
-                        PackageSpec {
-                            ecosystem: PackageEcosystem::Java,
-                            name: "org.projectlombok:lombok-mapstruct-binding".to_string(),
-                            version: Some("0.2.0".to_string()),
-                            is_git: false,
-                            git_url: None,
-                            git_ref: None,
-                            raw_line: "'java' org.projectlombok:lombok-mapstruct-binding == 0.2.0".to_string(),
-                        },
-                        PackageSpec {
-                            ecosystem: PackageEcosystem::Java,
-                            name: "org.projectlombok:lombok-utils".to_string(),
-                            version: Some("0.1.0".to_string()),
-                            is_git: false,
-                            git_url: None,
-                            git_ref: None,
-                            raw_line: "'java' org.projectlombok:lombok-utils == 0.1.0".to_string(),
-                        },
-                    ]
-                } else if clean_name.contains(':') {
+                if clean_name.contains(':') {
+                    let ver = if let Some((g, a)) = clean_name.split_once(':') {
+                        self.query_maven_central(&format!("g:{} AND a:{}", g, a), 1)
+                            .into_iter()
+                            .next()
+                            .map(|(_, _, v)| v)
+                            .unwrap_or_else(|| "latest".to_string())
+                    } else {
+                        "latest".to_string()
+                    };
                     vec![PackageSpec {
                         ecosystem: PackageEcosystem::Java,
                         name: clean_name.to_string(),
-                        version: Some("latest".to_string()),
+                        version: Some(ver.clone()),
                         is_git: false,
                         git_url: None,
                         git_ref: None,
-                        raw_line: format!("'java' {}", clean_name),
+                        raw_line: format!("'java' {} == {}", clean_name, ver),
                     }]
                 } else {
-                    let segments: Vec<&str> = clean_name.split('.').collect();
-                    if segments.len() >= 3 && (segments[0] == "org" || segments[0] == "com" || segments[0] == "io" || segments[0] == "net") {
-                        let group_id = format!("{}.{}.{}", segments[0], segments[1], segments[2]);
-                        let artifact_id = segments[2];
-                        vec![
-                            PackageSpec {
+                    let mut hits = Vec::new();
+                    if clean_name.contains('.') {
+                        hits.extend(self.query_maven_central(&format!("fc:{}", clean_name), 3));
+                    }
+                    if hits.len() < 3 {
+                        for item in self.query_maven_central(&format!("a:{}", root), 3) {
+                            if !hits.iter().any(|(g, a, _)| g == &item.0 && a == &item.1) {
+                                hits.push(item);
+                            }
+                        }
+                    }
+                    if !hits.is_empty() {
+                        hits.into_iter()
+                            .take(3)
+                            .map(|(g, a, v)| PackageSpec {
                                 ecosystem: PackageEcosystem::Java,
-                                name: format!("{}:{}", group_id, artifact_id),
-                                version: Some("latest".to_string()),
+                                name: format!("{}:{}", g, a),
+                                version: Some(v.clone()),
                                 is_git: false,
                                 git_url: None,
                                 git_ref: None,
-                                raw_line: format!("'java' {}:{}", group_id, artifact_id),
-                            },
-                            PackageSpec {
-                                ecosystem: PackageEcosystem::Java,
-                                name: format!("{}.{}:{}", segments[0], segments[1], artifact_id),
-                                version: Some("latest".to_string()),
-                                is_git: false,
-                                git_url: None,
-                                git_ref: None,
-                                raw_line: format!("'java' {}.{}:{}", segments[0], segments[1], artifact_id),
-                            },
-                            PackageSpec {
-                                ecosystem: PackageEcosystem::Java,
-                                name: format!("{}:{}-core", group_id, artifact_id),
-                                version: Some("latest".to_string()),
-                                is_git: false,
-                                git_url: None,
-                                git_ref: None,
-                                raw_line: format!("'java' {}:{}-core", group_id, artifact_id),
-                            },
-                        ]
+                                raw_line: format!("'java' {}:{} == {}", g, a, v),
+                            })
+                            .collect()
                     } else {
-                        vec![
-                            PackageSpec {
+                        let segments: Vec<&str> = clean_name.split('.').collect();
+                        if segments.len() >= 3 {
+                            let group_id = format!("{}.{}.{}", segments[0], segments[1], segments[2]);
+                            let artifact_id = segments[2];
+                            vec![
+                                PackageSpec {
+                                    ecosystem: PackageEcosystem::Java,
+                                    name: format!("{}:{}", group_id, artifact_id),
+                                    version: Some("latest".to_string()),
+                                    is_git: false,
+                                    git_url: None,
+                                    git_ref: None,
+                                    raw_line: format!("'java' {}:{}", group_id, artifact_id),
+                                },
+                                PackageSpec {
+                                    ecosystem: PackageEcosystem::Java,
+                                    name: format!("{}.{}:{}", segments[0], segments[1], artifact_id),
+                                    version: Some("latest".to_string()),
+                                    is_git: false,
+                                    git_url: None,
+                                    git_ref: None,
+                                    raw_line: format!("'java' {}.{}:{}", segments[0], segments[1], artifact_id),
+                                },
+                            ]
+                        } else {
+                            vec![PackageSpec {
                                 ecosystem: PackageEcosystem::Java,
-                                name: format!("org.apache.{}:{}", root, root),
+                                name: root.to_string(),
                                 version: Some("latest".to_string()),
                                 is_git: false,
                                 git_url: None,
                                 git_ref: None,
-                                raw_line: format!("'java' org.apache.{}:{}", root, root),
-                            },
-                            PackageSpec {
-                                ecosystem: PackageEcosystem::Java,
-                                name: format!("com.google.{}:{}", root, root),
-                                version: Some("latest".to_string()),
-                                is_git: false,
-                                git_url: None,
-                                git_ref: None,
-                                raw_line: format!("'java' com.google.{}:{}", root, root),
-                            },
-                            PackageSpec {
-                                ecosystem: PackageEcosystem::Java,
-                                name: format!("io.{}:{}", root, root),
-                                version: Some("latest".to_string()),
-                                is_git: false,
-                                git_url: None,
-                                git_ref: None,
-                                raw_line: format!("'java' io.{}:{}", root, root),
-                            },
-                        ]
+                                raw_line: format!("'java' {}", root),
+                            }]
+                        }
                     }
                 }
             }

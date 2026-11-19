@@ -416,6 +416,104 @@ pub fn emit_bare_metal_runtime(
     }
     asm.end_function(base_vma)?;
 
+    // `__omni_str_len(i8* s=r0) -> i64 r0:r1`
+    asm.begin_function("__omni_str_len");
+    {
+        asm.emit_push(1 << 4, true);
+        asm.emit_bl_sym("strlen");
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop(1 << 4, true);
+    }
+    asm.end_function(base_vma)?;
+
+    // `__omni_str_ord(i8* s=r0) -> i64 r0:r1`
+    asm.begin_function("__omni_str_ord");
+    {
+        let null_lbl = asm.new_label();
+        asm.emit_cmp_imm8(0, 0);
+        asm.emit_bcond_label_short(Cond::Eq, null_lbl);
+        asm.emit_ldrb_imm(0, 0, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bx(14);
+        asm.bind_label(null_lbl);
+        asm.emit_movs_imm8(0, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bx(14);
+    }
+    asm.end_function(base_vma)?;
+
+    // `__omni_str_chr(i64 code=r0:r1) -> i8* r0`
+    asm.begin_function("__omni_str_chr");
+    {
+        asm.emit_push(1 << 4, true);
+        asm.emit_movs_reg(4, 0);
+        asm.emit_movs_imm8(0, 2);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bl_sym("malloc");
+        asm.emit_strb_imm(4, 0, 0);
+        asm.emit_movs_imm8(2, 0);
+        asm.emit_strb_imm(2, 0, 1);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop(1 << 4, true);
+    }
+    asm.end_function(base_vma)?;
+
+    // `__omni_str_char_at(i8* s=r0, i64 idx=r2:r3) -> i8* r0`
+    asm.begin_function("__omni_str_char_at");
+    {
+        asm.emit_push((1 << 4) | (1 << 5) | (1 << 6), true);
+        asm.emit_movs_reg(4, 0);
+        asm.emit_movs_reg(5, 2);
+        asm.emit_movs_reg(6, 3);
+        asm.emit_bl_sym("strlen");
+        asm.emit_cmp_imm8(6, 0);
+        let non_neg = asm.new_label();
+        asm.emit_bcond_label_short(Cond::Pl, non_neg);
+        asm.emit_adds_reg(5, 5, 0);
+        asm.bind_label(non_neg);
+        asm.emit_cmp_reg(5, 0);
+        let oob = asm.new_label();
+        asm.emit_bcond_label_short(Cond::Cs, oob);
+        asm.emit_adds_reg(4, 4, 5);
+        asm.emit_ldrb_imm(0, 4, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bl_sym("__omni_str_chr");
+        asm.emit_pop((1 << 4) | (1 << 5) | (1 << 6), true);
+        asm.bind_label(oob);
+        asm.emit_movs_imm8(0, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bl_sym("__omni_str_chr");
+        asm.emit_pop((1 << 4) | (1 << 5) | (1 << 6), true);
+    }
+    asm.end_function(base_vma)?;
+
+    // `__omni_str_byte_at(i8* s=r0, i64 idx=r2:r3) -> i64 r0:r1`
+    asm.begin_function("__omni_str_byte_at");
+    {
+        asm.emit_push((1 << 4) | (1 << 5) | (1 << 6), true);
+        asm.emit_movs_reg(4, 0);
+        asm.emit_movs_reg(5, 2);
+        asm.emit_movs_reg(6, 3);
+        asm.emit_bl_sym("strlen");
+        asm.emit_cmp_imm8(6, 0);
+        let non_neg = asm.new_label();
+        asm.emit_bcond_label_short(Cond::Pl, non_neg);
+        asm.emit_adds_reg(5, 5, 0);
+        asm.bind_label(non_neg);
+        asm.emit_cmp_reg(5, 0);
+        let oob = asm.new_label();
+        asm.emit_bcond_label_short(Cond::Cs, oob);
+        asm.emit_adds_reg(4, 4, 5);
+        asm.emit_ldrb_imm(0, 4, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop((1 << 4) | (1 << 5) | (1 << 6), true);
+        asm.bind_label(oob);
+        asm.emit_movs_imm8(0, 0);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop((1 << 4) | (1 << 5) | (1 << 6), true);
+    }
+    asm.end_function(base_vma)?;
+
     // `__omni_c_return_ptr` / `__omni_c_return_str` / `__omni_c_get_returned_ptr` / `__omni_c_get_returned_str`
     for setter in ["__omni_c_return_ptr", "__omni_c_return_str"] {
         asm.begin_function(setter);
@@ -1833,6 +1931,19 @@ fn emit_collections_and_arenas(
         "__omni_float_to_str",
         "__omni_c_str_to_f64",
         "__omni_input",
+        "__omni_str_slice_step",
+        "__omni_str_contains",
+        "__omni_str_starts_with",
+        "__omni_str_ends_with",
+        "__omni_str_find",
+        "__omni_str_upper",
+        "__omni_str_lower",
+        "__omni_str_trim",
+        "__omni_str_replace",
+        "__omni_str_split",
+        "__omni_str_to_chars",
+        "__omni_slice_subslice",
+        "__omni_slice_contains",
         "fast_hash_block",
     ] {
         asm.begin_function(stub_sym);

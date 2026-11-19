@@ -37,6 +37,7 @@ OmniMap* __omni_map_create(size_t initial_cap) {
         return NULL;
     }
 
+    map->magic = OMNI_MAP_MAGIC;
     map->capacity = cap;
     map->count = 0;
     map->tombstones = 0;
@@ -200,12 +201,13 @@ void __omni_map_delete(OmniMap* map, const char* key) {
 }
 
 size_t __omni_map_len(OmniMap* map) {
-    if (!map) return 0;
+    if (!__omni_is_map_ptr(map)) return 0;
     return map->count;
 }
 
 void __omni_map_destroy(OmniMap* map) {
-    if (!map) return;
+    if (!__omni_is_map_ptr(map)) return;
+    map->magic = 0;
     if (map->buckets) {
         for (size_t i = 0; i < map->capacity; i++) {
             if (map->buckets[i].occupied && !map->buckets[i].deleted && map->buckets[i].key) {

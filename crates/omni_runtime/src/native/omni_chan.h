@@ -18,7 +18,10 @@ typedef pthread_mutex_t omni_mutex_t;
 typedef pthread_cond_t omni_cond_t;
 #endif
 
+#define OMNI_CHAN_MAGIC 0x4348414E4F4D4EFFULL
+
 typedef struct {
+    uint64_t magic;
     uint8_t* buffer;
     size_t capacity;
     size_t elem_size;
@@ -30,6 +33,13 @@ typedef struct {
     omni_cond_t not_empty;
     omni_cond_t not_full;
 } OmniChan;
+
+static inline bool __omni_is_chan_ptr(const void* ptr) {
+    const unsigned char* p = (const unsigned char*)ptr;
+    if (!p || (uintptr_t)p < 4096) return false;
+    if (p[0] != 0xFF || (((uintptr_t)p & 7u) != 0u)) return false;
+    return ((const OmniChan*)ptr)->magic == OMNI_CHAN_MAGIC;
+}
 
 OmniChan* __omni_chan_make(size_t capacity, size_t elem_size);
 bool __omni_chan_send(OmniChan* chan, const void* elem_ptr);

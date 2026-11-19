@@ -231,14 +231,309 @@ char* __omni_input(const char* prompt) {
 }
 
 char* __omni_str_concat(const char* a, const char* b) {
-    size_t la = a ? strlen(a) : 0;
-    size_t lb = b ? strlen(b) : 0;
+    size_t la = (a && (uintptr_t)a >= 4096) ? strlen(a) : 0;
+    size_t lb = (b && (uintptr_t)b >= 4096) ? strlen(b) : 0;
     char* res = (char*)malloc(la + lb + 1);
     if (!res) return "";
     if (la > 0) memcpy(res, a, la);
     if (lb > 0) memcpy(res + la, b, lb);
     res[la + lb] = '\0';
     return res;
+}
+
+#define OMNI_C2(b)  { (char)(b), '\0' }
+#define OMNI_C16(base) \
+    OMNI_C2((base)+0),  OMNI_C2((base)+1),  OMNI_C2((base)+2),  OMNI_C2((base)+3),  \
+    OMNI_C2((base)+4),  OMNI_C2((base)+5),  OMNI_C2((base)+6),  OMNI_C2((base)+7),  \
+    OMNI_C2((base)+8),  OMNI_C2((base)+9),  OMNI_C2((base)+10), OMNI_C2((base)+11), \
+    OMNI_C2((base)+12), OMNI_C2((base)+13), OMNI_C2((base)+14), OMNI_C2((base)+15)
+
+static const char g_omni_byte_strs[256][2] = {
+    OMNI_C16(0x00), OMNI_C16(0x10), OMNI_C16(0x20), OMNI_C16(0x30),
+    OMNI_C16(0x40), OMNI_C16(0x50), OMNI_C16(0x60), OMNI_C16(0x70),
+    OMNI_C16(0x80), OMNI_C16(0x90), OMNI_C16(0xA0), OMNI_C16(0xB0),
+    OMNI_C16(0xC0), OMNI_C16(0xD0), OMNI_C16(0xE0), OMNI_C16(0xF0)
+};
+
+int64_t __omni_str_len(const char* s) {
+    if (!s || (uintptr_t)s < 4096) return 0;
+    if (__omni_is_slice_ptr(s)) {
+        return (int64_t)__omni_slice_len((OmniSlice*)s);
+    }
+    return (int64_t)strlen(s);
+}
+
+char* __omni_str_char_at(const char* s, int64_t index) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    int64_t len = (int64_t)strlen(s);
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) return (char*)g_omni_byte_strs[0];
+    unsigned char ch = (unsigned char)s[index];
+    return (char*)g_omni_byte_strs[ch];
+}
+
+int64_t __omni_str_byte_at(const char* s, int64_t index) {
+    if (!s || (uintptr_t)s < 4096) return 0;
+    int64_t len = (int64_t)strlen(s);
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) return 0;
+    return (int64_t)(unsigned char)s[index];
+}
+
+int64_t __omni_str_ord(const char* s) {
+    if (!s || (uintptr_t)s < 4096 || s[0] == '\0') return 0;
+    return (int64_t)(unsigned char)s[0];
+}
+
+char* __omni_str_chr(int64_t code) {
+    if (code <= 0 || code > 255) return (char*)g_omni_byte_strs[0];
+    return (char*)g_omni_byte_strs[(unsigned char)code];
+}
+
+char* __omni_str_slice_step(
+    const char* s,
+    int64_t start,
+    int64_t end,
+    int64_t step,
+    int64_t has_start,
+    int64_t has_end
+) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    if (step == 0) step = 1;
+    int64_t n = (int64_t)strlen(s);
+    if (step > 0) {
+        int64_t st = has_start ? start : 0;
+        int64_t en = has_end ? end : n;
+        if (st < 0) st += n;
+        if (st < 0) st = 0;
+        if (st > n) st = n;
+        if (en < 0) en += n;
+        if (en < 0) en = 0;
+        if (en > n) en = n;
+        if (en <= st) return (char*)g_omni_byte_strs[0];
+        if (step == 1) {
+            size_t out_len = (size_t)(en - st);
+            char* out = (char*)malloc(out_len + 1);
+            if (!out) return (char*)g_omni_byte_strs[0];
+            memcpy(out, s + st, out_len);
+            out[out_len] = '\0';
+            __omni_c_return_ptr(out);
+            return out;
+        }
+        size_t cap = (size_t)((en - st + step - 1) / step);
+        char* out = (char*)malloc(cap + 1);
+        if (!out) return (char*)g_omni_byte_strs[0];
+        size_t w = 0;
+        for (int64_t i = st; i < en; i += step) {
+            out[w++] = s[i];
+        }
+        out[w] = '\0';
+        __omni_c_return_ptr(out);
+        return out;
+    } else {
+        int64_t st = has_start ? start : (n - 1);
+        int64_t en = has_end ? end : -1;
+        if (has_start) {
+            if (st < 0) st += n;
+            if (st < -1) st = -1;
+            if (st >= n) st = n - 1;
+        }
+        if (has_end) {
+            if (en < 0) en += n;
+            if (en < -1) en = -1;
+            if (en >= n) en = n - 1;
+        }
+        if (st <= en || n == 0) return (char*)g_omni_byte_strs[0];
+        char* out = (char*)malloc((size_t)n + 1);
+        if (!out) return (char*)g_omni_byte_strs[0];
+        size_t w = 0;
+        for (int64_t i = st; i > en; i += step) {
+            if (i >= 0 && i < n) {
+                out[w++] = s[i];
+            }
+        }
+        out[w] = '\0';
+        __omni_c_return_ptr(out);
+        return out;
+    }
+}
+
+int64_t __omni_str_contains(const char* haystack, const char* needle) {
+    if (!haystack || (uintptr_t)haystack < 4096) return 0;
+    if (!needle || (uintptr_t)needle < 4096) return 0;
+    return strstr(haystack, needle) != NULL ? 1 : 0;
+}
+
+int64_t __omni_str_starts_with(const char* s, const char* prefix) {
+    if (!s || (uintptr_t)s < 4096 || !prefix || (uintptr_t)prefix < 4096) return 0;
+    size_t lp = strlen(prefix);
+    return strncmp(s, prefix, lp) == 0 ? 1 : 0;
+}
+
+int64_t __omni_str_ends_with(const char* s, const char* suffix) {
+    if (!s || (uintptr_t)s < 4096 || !suffix || (uintptr_t)suffix < 4096) return 0;
+    size_t ls = strlen(s);
+    size_t lsf = strlen(suffix);
+    if (lsf > ls) return 0;
+    return memcmp(s + (ls - lsf), suffix, lsf) == 0 ? 1 : 0;
+}
+
+int64_t __omni_str_find(const char* haystack, const char* needle) {
+    if (!haystack || (uintptr_t)haystack < 4096 || !needle || (uintptr_t)needle < 4096) return -1;
+    const char* p = strstr(haystack, needle);
+    return p ? (int64_t)(p - haystack) : -1;
+}
+
+char* __omni_str_upper(const char* s) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    size_t n = strlen(s);
+    char* out = (char*)malloc(n + 1);
+    if (!out) return (char*)g_omni_byte_strs[0];
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        out[i] = (char)((c >= 'a' && c <= 'z') ? (c - 32) : c);
+    }
+    out[n] = '\0';
+    __omni_c_return_ptr(out);
+    return out;
+}
+
+char* __omni_str_lower(const char* s) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    size_t n = strlen(s);
+    char* out = (char*)malloc(n + 1);
+    if (!out) return (char*)g_omni_byte_strs[0];
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        out[i] = (char)((c >= 'A' && c <= 'Z') ? (c + 32) : c);
+    }
+    out[n] = '\0';
+    __omni_c_return_ptr(out);
+    return out;
+}
+
+char* __omni_str_trim(const char* s) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    const char* start = s;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
+    const char* end = s + strlen(s);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
+    size_t n = (size_t)(end - start);
+    char* out = (char*)malloc(n + 1);
+    if (!out) return (char*)g_omni_byte_strs[0];
+    if (n > 0) memcpy(out, start, n);
+    out[n] = '\0';
+    __omni_c_return_ptr(out);
+    return out;
+}
+
+char* __omni_str_replace(const char* s, const char* old_sub, const char* new_sub) {
+    if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
+    if (!old_sub || (uintptr_t)old_sub < 4096 || old_sub[0] == '\0') {
+        char* dup = strdup(s);
+        __omni_c_return_ptr(dup);
+        return dup;
+    }
+    if (!new_sub || (uintptr_t)new_sub < 4096) new_sub = "";
+    size_t old_len = strlen(old_sub);
+    size_t new_len = strlen(new_sub);
+    size_t count = 0;
+    for (const char* p = s; (p = strstr(p, old_sub)) != NULL; p += old_len) {
+        count++;
+    }
+    if (count == 0) {
+        char* dup = strdup(s);
+        __omni_c_return_ptr(dup);
+        return dup;
+    }
+    size_t s_len = strlen(s);
+    size_t out_len = s_len + count * new_len - count * old_len;
+    char* out = (char*)malloc(out_len + 1);
+    if (!out) return (char*)g_omni_byte_strs[0];
+    char* dst = out;
+    const char* cur = s;
+    const char* hit;
+    while ((hit = strstr(cur, old_sub)) != NULL) {
+        size_t seg = (size_t)(hit - cur);
+        if (seg > 0) {
+            memcpy(dst, cur, seg);
+            dst += seg;
+        }
+        if (new_len > 0) {
+            memcpy(dst, new_sub, new_len);
+            dst += new_len;
+        }
+        cur = hit + old_len;
+    }
+    size_t tail = strlen(cur);
+    if (tail > 0) {
+        memcpy(dst, cur, tail);
+        dst += tail;
+    }
+    *dst = '\0';
+    __omni_c_return_ptr(out);
+    return out;
+}
+
+void* __omni_str_to_chars(const char* s) {
+    if (!s || (uintptr_t)s < 4096) {
+        OmniSlice* empty = __omni_slice_create(4);
+        __omni_c_return_ptr(empty);
+        return empty;
+    }
+    size_t n = strlen(s);
+    OmniSlice* out = __omni_slice_create(n > 4 ? n : 4);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        __omni_slice_append(out, (int64_t)(uintptr_t)g_omni_byte_strs[ch]);
+    }
+    __omni_c_return_ptr(out);
+    return out;
+}
+
+void* __omni_str_split(const char* s, const char* sep) {
+    if (!s || (uintptr_t)s < 4096) {
+        OmniSlice* empty = __omni_slice_create(4);
+        __omni_c_return_ptr(empty);
+        return empty;
+    }
+    if (!sep || (uintptr_t)sep < 4096 || sep[0] == '\0') {
+        OmniSlice* out = __omni_slice_create(4);
+        const char* p = s;
+        while (*p) {
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (!*p) break;
+            const char* start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+            size_t len = (size_t)(p - start);
+            char* part = (char*)malloc(len + 1);
+            if (part) {
+                memcpy(part, start, len);
+                part[len] = '\0';
+                __omni_slice_append(out, (int64_t)(uintptr_t)part);
+            }
+        }
+        __omni_c_return_ptr(out);
+        return out;
+    }
+    size_t sep_len = strlen(sep);
+    OmniSlice* out = __omni_slice_create(4);
+    const char* cur = s;
+    const char* hit;
+    while ((hit = strstr(cur, sep)) != NULL) {
+        size_t len = (size_t)(hit - cur);
+        char* part = (char*)malloc(len + 1);
+        if (part) {
+            if (len > 0) memcpy(part, cur, len);
+            part[len] = '\0';
+            __omni_slice_append(out, (int64_t)(uintptr_t)part);
+        }
+        cur = hit + sep_len;
+    }
+    char* tail = strdup(cur);
+    __omni_slice_append(out, (int64_t)(uintptr_t)tail);
+    __omni_c_return_ptr(out);
+    return out;
 }
 
 char* __omni_int_to_str(int64_t v) {
@@ -865,10 +1160,12 @@ int32_t __omni_os_socket_bind(int32_t fd, void* addr_or_ip, int32_t default_port
     const char* ip = NULL;
     int32_t port = default_port > 0 ? default_port : 9999;
     if (addr_or_ip) {
-        OmniSlice* slice = (OmniSlice*)addr_or_ip;
-        if (slice->len >= 2) {
-            ip = (const char*)slice->data[0];
-            port = (int32_t)slice->data[1];
+        if (__omni_is_slice_ptr(addr_or_ip)) {
+            OmniSlice* slice = (OmniSlice*)addr_or_ip;
+            if (slice->len >= 2) {
+                ip = (const char*)slice->data[0];
+                port = (int32_t)slice->data[1];
+            }
         } else {
             ip = (const char*)addr_or_ip;
         }
@@ -960,12 +1257,14 @@ void* __omni_os_socket_accept_tuple(int32_t server_fd) {
 int32_t __omni_os_socket_connect(int32_t fd, void* addr_or_ip, int32_t default_port) {
     if (fd < 0) return -1;
     const char* ip = NULL;
-    int32_t port = default_port > 0 ? default_port : 9999;
+    int32_t port = default_port > 0 ? default_port : 0;
     if (addr_or_ip) {
-        OmniSlice* slice = (OmniSlice*)addr_or_ip;
-        if (slice->len >= 2) {
-            ip = (const char*)slice->data[0];
-            port = (int32_t)slice->data[1];
+        if (__omni_is_slice_ptr(addr_or_ip)) {
+            OmniSlice* slice = (OmniSlice*)addr_or_ip;
+            if (slice->len >= 2) {
+                ip = (const char*)slice->data[0];
+                port = (int32_t)slice->data[1];
+            }
         } else {
             ip = (const char*)addr_or_ip;
         }
@@ -996,7 +1295,7 @@ int32_t __omni_os_socket_connect(int32_t fd, void* addr_or_ip, int32_t default_p
 }
 
 char* __omni_os_socket_getpeername(int32_t fd) {
-    if (fd < 0) return strdup("127.0.0.1:9999");
+    if (fd < 0) return strdup("");
 #ifdef _WIN32
     struct sockaddr_in addr;
     int len = sizeof(addr);
@@ -1014,14 +1313,11 @@ char* __omni_os_socket_getpeername(int32_t fd) {
         return strdup(buf);
     }
 #endif
-    return strdup("127.0.0.1:9999");
+    return strdup("");
 }
 
 int32_t __omni_os_socket_send(int32_t fd, const char* data) {
-    if (fd < 0) return 0;
-    if (!data || (uintptr_t)data < 4096) {
-        data = "-----BEGIN RSA PUBLIC KEY-----";
-    }
+    if (fd < 0 || !data || (uintptr_t)data < 4096) return -1;
     size_t len = strlen(data);
 #ifdef _WIN32
     return (int32_t)send((SOCKET)fd, data, (int)len, 0);
@@ -1042,9 +1338,7 @@ char* __omni_os_socket_recv(int32_t fd, int32_t max_bytes) {
 #endif
     if (n <= 0) {
         free(buf);
-        printf("Partner has disconnected. Exiting...\n");
-        fflush(stdout);
-        exit(0);
+        return strdup("");
     }
     buf[n] = '\0';
     return buf;

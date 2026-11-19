@@ -1895,6 +1895,7 @@ impl OmniParser {
                 && !line_str.starts_with("if(")
                 && !line_str.contains('"')
                 && !line_str.contains('\'')
+                && !line_str.contains(" else ")
                 && !(line_str.contains('[') && line_str.contains(" for "))
             {
                 if let Some((stmt_part, unless_cond)) = line_str.rsplit_once(" unless ") {
@@ -3855,6 +3856,12 @@ pub enum ExprAst {
         target: Box<SpannedExpr>,
         index: Box<SpannedExpr>,
     },
+    Slice {
+        target: Box<SpannedExpr>,
+        start: Option<Box<SpannedExpr>>,
+        end: Option<Box<SpannedExpr>>,
+        step: Option<Box<SpannedExpr>>,
+    },
     Call {
         callee: Box<SpannedExpr>,
         args: Vec<CallArg>,
@@ -3884,6 +3891,7 @@ enum LexTokenKind {
     RBrace,
     Comma,
     Colon,
+    DotDot,
     Question,
     Dot,
 }
@@ -3914,7 +3922,7 @@ impl PolyglotLexicon {
             "|>" => Some((6, 7)),
             "||" | "or" => Some((10, 11)),
             "&&" | "and" => Some((14, 15)),
-            "==" | "!=" | "===" | "!==" | "~=" | "<" | "<=" | ">" | ">=" | "is" => Some((20, 21)),
+            "==" | "!=" | "===" | "!==" | "~=" | "<" | "<=" | ">" | ">=" | "is" | "in" => Some((20, 21)),
             "|" => Some((26, 27)),
             "^" => Some((28, 29)),
             "&" => Some((30, 31)),
@@ -3942,6 +3950,7 @@ fn tokenize_expr(src: &str) -> Result<Vec<LexToken<'_>>, String> {
     let bytes = src.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
+    let mut bracket_depth = 0usize;
     let mut tokens = Vec::new();
 
     while i < len {
@@ -4230,6 +4239,15 @@ fn tokenize_expr(src: &str) -> Result<Vec<LexToken<'_>>, String> {
         // 2-character operators
         if i + 1 < len {
             let duo = &src[i..i + 2];
+            if duo == ".." && bracket_depth > 0 {
+                tokens.push(LexToken {
+                    kind: LexTokenKind::DotDot,
+                    text: duo,
+                    span: (i, i + 2),
+                });
+                i += 2;
+                continue;
+            }
             if matches!(duo, "=>" | ".." | "<-" | ":=") {
                 return Err(format!("non-scalar expression operator '{}'", duo));
             }
@@ -4258,8 +4276,14 @@ fn tokenize_expr(src: &str) -> Result<Vec<LexToken<'_>>, String> {
         let kind = match b {
             b'(' => LexTokenKind::LParen,
             b')' => LexTokenKind::RParen,
-            b'[' => LexTokenKind::LBracket,
-            b']' => LexTokenKind::RBracket,
+            b'[' => {
+                bracket_depth += 1;
+                LexTokenKind::LBracket
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                LexTokenKind::RBracket
+            }
             b'{' => LexTokenKind::LBrace,
             b'}' => LexTokenKind::RBrace,
             b',' => LexTokenKind::Comma,
@@ -4727,19 +4751,58 @@ impl<'a> PrattParser<'a> {
                     }
                     LexTokenKind::LBracket => {
                         self.pos += 1;
-                        if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Colon)) {
-                            return Err("slice range indexing requires non-scalar lowering".to_string());
+                        let is_sep = |k: &LexTokenKind| matches!(k, LexTokenKind::Colon | LexTokenKind::DotDot);
+                        let start_expr = if matches!(self.peek().map(|t| &t.kind), Some(k) if is_sep(k)) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_bp(0)?))
+                        };
+
+                        if matches!(self.peek().map(|t| &t.kind), Some(k) if is_sep(k)) {
+                            let sep_kind = self.next()?.kind.clone();
+                            let end_expr = if matches!(
+                                self.peek().map(|t| &t.kind),
+                                Some(LexTokenKind::Colon | LexTokenKind::RBracket)
+                            ) {
+                                None
+                            } else {
+                                Some(Box::new(self.parse_bp(0)?))
+                            };
+
+                            let step_expr = if sep_kind == LexTokenKind::Colon
+                                && matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Colon))
+                            {
+                                self.pos += 1;
+                                if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::RBracket)) {
+                                    None
+                                } else {
+                                    Some(Box::new(self.parse_bp(0)?))
+                                }
+                            } else {
+                                None
+                            };
+
+                            let rb = self.expect_kind(&LexTokenKind::RBracket)?;
+                            let span = (lhs.span.0, rb.span.1);
+                            lhs = SpannedExpr {
+                                node: ExprAst::Slice {
+                                    target: Box::new(lhs),
+                                    start: start_expr,
+                                    end: end_expr,
+                                    step: step_expr,
+                                },
+                                span,
+                            };
+                            continue;
                         }
-                        let idx_expr = self.parse_bp(0)?;
-                        if matches!(self.peek().map(|t| &t.kind), Some(LexTokenKind::Colon)) {
-                            return Err("slice range indexing requires non-scalar lowering".to_string());
-                        }
+
+                        let idx_expr = start_expr.ok_or_else(|| "expected index expression inside '[...]'".to_string())?;
                         let rb = self.expect_kind(&LexTokenKind::RBracket)?;
                         let span = (lhs.span.0, rb.span.1);
                         lhs = SpannedExpr {
                             node: ExprAst::Index {
                                 target: Box::new(lhs),
-                                index: Box::new(idx_expr),
+                                index: idx_expr,
                             },
                             span,
                         };
@@ -4848,7 +4911,28 @@ impl<'a> PrattParser<'a> {
                 continue;
             }
 
-            // 5. Infix binary operators (`+`, `*`, `**`, `&&`, `and`, `is`, `is not`, etc.)
+            // 5. Infix binary operators (`+`, `*`, `**`, `&&`, `and`, `is`, `is not`, `in`, `not in`, etc.)
+            if tok.kind == LexTokenKind::Ident
+                && tok.text == "not"
+                && matches!(self.tokens.get(self.pos + 1).map(|t| t.text), Some("in"))
+            {
+                let (lbp, rbp) = (20u8, 21u8);
+                if lbp < min_bp {
+                    break;
+                }
+                self.pos += 2;
+                let rhs = self.parse_bp(rbp)?;
+                let span = (lhs.span.0, rhs.span.1);
+                lhs = SpannedExpr {
+                    node: ExprAst::Binary {
+                        op: "not in".to_string(),
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    span,
+                };
+                continue;
+            }
             if matches!(tok.kind, LexTokenKind::Op | LexTokenKind::Ident) {
                 if let Some((lbp, rbp)) = PolyglotLexicon::infix_bp(tok.text) {
                     if lbp < min_bp {

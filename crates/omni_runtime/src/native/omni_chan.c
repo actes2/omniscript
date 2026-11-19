@@ -40,6 +40,7 @@ OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
         return NULL;
     }
 
+    chan->magic = OMNI_CHAN_MAGIC;
     chan->capacity = capacity;
     chan->elem_size = elem_size;
     chan->head = 0;
@@ -133,7 +134,7 @@ int64_t __omni_chan_recv_int(OmniChan* chan) {
 }
 
 size_t __omni_chan_len(OmniChan* chan) {
-    if (!chan) return 0;
+    if (!__omni_is_chan_ptr(chan)) return 0;
     omni_mutex_lock(&chan->lock);
     size_t count = chan->count;
     omni_mutex_unlock(&chan->lock);
@@ -141,7 +142,7 @@ size_t __omni_chan_len(OmniChan* chan) {
 }
 
 void __omni_chan_close(OmniChan* chan) {
-    if (!chan) return;
+    if (!__omni_is_chan_ptr(chan)) return;
     omni_mutex_lock(&chan->lock);
     chan->closed = true;
     omni_cond_broadcast(&chan->not_empty);
@@ -150,7 +151,8 @@ void __omni_chan_close(OmniChan* chan) {
 }
 
 void __omni_chan_destroy(OmniChan* chan) {
-    if (!chan) return;
+    if (!__omni_is_chan_ptr(chan)) return;
+    chan->magic = 0;
     omni_mutex_lock(&chan->lock);
     chan->closed = true;
     omni_cond_broadcast(&chan->not_empty);

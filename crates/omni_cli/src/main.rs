@@ -598,6 +598,8 @@ fn compile_source(
     let t_parse_start = std::time::Instant::now();
     let parser = OmniParser::new();
     let mut module = parser.parse_module_with_dir(module_name, &source_content, Some(base_dir));
+    let user_defined_fns: std::collections::HashSet<String> =
+        module.functions.iter().map(|f| f.name.clone()).collect();
     let parse_time = t_parse_start.elapsed();
 
     if !module.diagnostics.is_empty() {
@@ -1162,6 +1164,8 @@ fn compile_source(
     // 4. Code Generation & Intent Synthesis (with .omnicache check)
     let t_codegen_start = std::time::Instant::now();
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"OMNI_IR_ABI_V3_STR_ARRAY_ABDUCTIVE:");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(source_content.as_bytes());
     hasher.update(target_platform.slug.as_bytes());
     hasher.update(target_platform.llvm_triple.as_bytes());
@@ -1213,7 +1217,8 @@ fn compile_source(
             let primary_verified = VerifiedSynthesisEngine::new(candle_engine, &verifier);
             let codegen = CodeGenerator::new(&primary_verified)
                 .with_target_triple(target_platform.llvm_triple.clone())
-                .with_drilled_spines(collected_drilled_spines.clone());
+                .with_drilled_spines(collected_drilled_spines.clone())
+                .with_user_functions(user_defined_fns.clone());
             codegen.generate_module_ir(&module, temp)?
         } else {
             if verbose {
@@ -1221,11 +1226,20 @@ fn compile_source(
             }
             let primary = OllamaInferenceEngine::new("omni-coder");
             let primary_verified = VerifiedSynthesisEngine::new(&primary, &verifier);
-            let composite = FallbackEngine::new(primary_verified, fallback);
-            let codegen = CodeGenerator::new(&composite)
-                .with_target_triple(target_platform.llvm_triple.clone())
-                .with_drilled_spines(collected_drilled_spines.clone());
-            codegen.generate_module_ir(&module, temp)?
+            if std::env::var("OMNI_ALLOW_MOCK_FALLBACK").ok().as_deref() == Some("1") {
+                let composite = FallbackEngine::new(primary_verified, fallback);
+                let codegen = CodeGenerator::new(&composite)
+                    .with_target_triple(target_platform.llvm_triple.clone())
+                    .with_drilled_spines(collected_drilled_spines.clone())
+                    .with_user_functions(user_defined_fns.clone());
+                codegen.generate_module_ir(&module, temp)?
+            } else {
+                let codegen = CodeGenerator::new(&primary_verified)
+                    .with_target_triple(target_platform.llvm_triple.clone())
+                    .with_drilled_spines(collected_drilled_spines.clone())
+                    .with_user_functions(user_defined_fns.clone());
+                codegen.generate_module_ir(&module, temp)?
+            }
         };
 
         let c_ingest = omni_preamble::ingest_and_splice_c_dependencies(
