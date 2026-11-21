@@ -1276,7 +1276,7 @@ static void omni_obj_reg_upsert(uintptr_t ptr, int64_t type_id, uint8_t is_manag
         uintptr_t cur = g_obj_reg_slots[idx].payload_ptr;
         if (cur == ptr) {
             if (type_id > 0) g_obj_reg_slots[idx].type_id = type_id;
-            if (is_managed) g_obj_reg_slots[idx].is_managed = 1;
+            if (is_managed) g_obj_reg_slots[idx].is_managed = is_managed;
             omni_obj_unlock();
             return;
         }
