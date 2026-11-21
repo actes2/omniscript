@@ -922,6 +922,27 @@ fn compile_source(
                     }
                 }
 
+                // Propagate concrete resolved ecosystem (e.g. `import zlib` -> `"c"`, `import varint` -> `"python"`)
+                // back into `module.imports` so CodeGenerator binds C FFI aliases & dialect contexts accurately.
+                if (ecosystem == "polyglot" || ecosystem == "unknown")
+                    && !walk.ecosystem.is_empty()
+                    && walk.ecosystem != "polyglot"
+                    && walk.resolution_source != "unresolved"
+                {
+                    for imp in &mut module.imports {
+                        if let ImportDirective::Ecosystem {
+                            ecosystem: ref mut imp_eco,
+                            module: ref imp_mod,
+                            ..
+                        } = imp
+                        {
+                            if imp_mod == &mod_name && (*imp_eco == "polyglot" || *imp_eco == "unknown") {
+                                *imp_eco = walk.ecosystem.clone();
+                            }
+                        }
+                    }
+                }
+
                 // Ingest pure-source crawled module items directly into AST
                 let mut all_sources_to_merge = walk.visited_files.clone();
                 if let Some(ref orig) = walk.resolved_origin {
@@ -932,6 +953,7 @@ fn compile_source(
                 for trace in &walk.call_traces {
                     for slice_line in &trace.drilled_code_slice {
                         if !slice_line.starts_with("jvm_dispatch(")
+                            && !slice_line.starts_with("builtin::")
                             && !collected_drilled_spines.contains(slice_line)
                         {
                             collected_drilled_spines.push(slice_line.clone());
@@ -1164,7 +1186,7 @@ fn compile_source(
     // 4. Code Generation & Intent Synthesis (with .omnicache check)
     let t_codegen_start = std::time::Instant::now();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"OMNI_IR_ABI_V3_STR_ARRAY_ABDUCTIVE:");
+    hasher.update(b"OMNI_IR_ABI_V4_POLYGLOT_RC_CLOSURES:");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(source_content.as_bytes());
     hasher.update(target_platform.slug.as_bytes());
@@ -1200,6 +1222,55 @@ fn compile_source(
         let verifier = LlvmVerifier::new()?;
         let fallback = MockSynthesisEngine::new();
 
+        let mut foreign_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for imp in &module.imports {
+            if let omni_preamble::ImportDirective::FromDirectory { symbols, .. } = imp {
+                for s in symbols {
+                    for part in s.split(" as ") {
+                        let pt = part.trim();
+                        if !pt.is_empty() {
+                            foreign_syms.insert(pt.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        for c_path in foreign_c_files.iter().chain(all_dependency_files.iter()) {
+            let ext = c_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "h" | "hpp" | "c" | "cc" | "cpp") {
+                if let Ok(src) = fs::read_to_string(c_path) {
+                    let bytes = src.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                            let start = i;
+                            i += 1;
+                            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                                i += 1;
+                            }
+                            let tok = &src[start..i];
+                            let mut j = i;
+                            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if j < bytes.len()
+                                && bytes[j] == b'('
+                                && !matches!(tok, "if" | "for" | "while" | "switch" | "return" | "sizeof" | "typeof" | "alignof")
+                            {
+                                foreign_syms.insert(tok.to_string());
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut generated = if let Some(ref candle_engine) = candle_engine_opt {
             let dev_tag = if candle_engine.is_cuda() {
                 "CUDA GPU"
@@ -1218,7 +1289,8 @@ fn compile_source(
             let codegen = CodeGenerator::new(&primary_verified)
                 .with_target_triple(target_platform.llvm_triple.clone())
                 .with_drilled_spines(collected_drilled_spines.clone())
-                .with_user_functions(user_defined_fns.clone());
+                .with_user_functions(user_defined_fns.clone())
+                .with_foreign_symbols(foreign_syms);
             codegen.generate_module_ir(&module, temp)?
         } else {
             if verbose {
@@ -1231,13 +1303,15 @@ fn compile_source(
                 let codegen = CodeGenerator::new(&composite)
                     .with_target_triple(target_platform.llvm_triple.clone())
                     .with_drilled_spines(collected_drilled_spines.clone())
-                    .with_user_functions(user_defined_fns.clone());
+                    .with_user_functions(user_defined_fns.clone())
+                    .with_foreign_symbols(foreign_syms);
                 codegen.generate_module_ir(&module, temp)?
             } else {
                 let codegen = CodeGenerator::new(&primary_verified)
                     .with_target_triple(target_platform.llvm_triple.clone())
                     .with_drilled_spines(collected_drilled_spines.clone())
-                    .with_user_functions(user_defined_fns.clone());
+                    .with_user_functions(user_defined_fns.clone())
+                    .with_foreign_symbols(foreign_syms);
                 codegen.generate_module_ir(&module, temp)?
             }
         };

@@ -9,6 +9,8 @@
 
 typedef struct {
     uint64_t magic;
+    uint32_t rc;
+    uint32_t flags;
     int64_t* data;
     size_t len;
     size_t cap;
@@ -17,7 +19,10 @@ typedef struct {
 static inline bool __omni_is_slice_ptr(const void* ptr) {
     const unsigned char* p = (const unsigned char*)ptr;
     if (!p || (uintptr_t)p < 4096) return false;
-    if (p[0] != 0xFF || (((uintptr_t)p & 7u) != 0u)) return false;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (((uintptr_t)p >> 48) != 0u) return false;
+#endif
+    if ((((uintptr_t)p & 7u) != 0u) || p[0] != 0xFF) return false;
     return ((const OmniSlice*)ptr)->magic == OMNI_SLICE_MAGIC;
 }
 

@@ -18,6 +18,7 @@
 #endif
 
 #include "omni_fiber.h"
+#include "omni_value.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,8 +30,34 @@
 
 static OMNI_FIBER_TLS OmniFiber* g_current_fiber = NULL;
 static OMNI_FIBER_TLS OmniFiber g_main_fiber = {0};
+static OMNI_FIBER_TLS OmniFiber* g_ready_head = NULL;
+static OMNI_FIBER_TLS OmniFiber* g_ready_tail = NULL;
 static OMNI_FIBER_TLS OmniFiber* g_dead_fibers = NULL;
 static OMNI_FIBER_TLS int g_initialized = 0;
+
+static inline void enqueue_ready_fiber(OmniFiber* f) {
+    if (!f || f->status == OMNI_FIBER_DEAD) return;
+    f->status = OMNI_FIBER_RUNNABLE;
+    f->next = NULL;
+    if (!g_ready_tail) {
+        g_ready_head = f;
+        g_ready_tail = f;
+    } else {
+        g_ready_tail->next = f;
+        g_ready_tail = f;
+    }
+}
+
+static inline OmniFiber* dequeue_ready_fiber(void) {
+    OmniFiber* f = g_ready_head;
+    if (!f) return NULL;
+    g_ready_head = f->next;
+    if (!g_ready_head) {
+        g_ready_tail = NULL;
+    }
+    f->next = NULL;
+    return f;
+}
 
 #if defined(__x86_64__) && !defined(_WIN32)
 __attribute__((naked)) static void swap_g_context(void** from_rsp __attribute__((unused)), void* to_rsp __attribute__((unused))) {
@@ -115,6 +142,11 @@ int __omni_fiber_is_in_fiber(void) {
     return (g_current_fiber != NULL && g_current_fiber != &g_main_fiber);
 }
 
+int __omni_fiber_has_runnable(void) {
+    __omni_fiber_init();
+    return (g_ready_head != NULL) ? 1 : 0;
+}
+
 #if defined(OMNI_HAS_WIN32_FIBERS)
 static VOID WINAPI win32_fiber_entry_stub(LPVOID param) {
     OmniFiber* f = (OmniFiber*)param;
@@ -130,8 +162,14 @@ static VOID WINAPI win32_fiber_entry_stub(LPVOID param) {
         f->next = g_dead_fibers;
         g_dead_fibers = f;
     }
-    g_current_fiber = &g_main_fiber;
-    SwitchToFiber(g_main_fiber.win_fiber_handle);
+    OmniFiber* target = dequeue_ready_fiber();
+    if (!target) target = &g_main_fiber;
+    target->status = OMNI_FIBER_RUNNING;
+    g_current_fiber = target;
+    if (f) {
+        __omni_fiber_swap_unwind_ctx(&f->unwind_ctx, &target->unwind_ctx, &f->saved_ret_ptr, &target->saved_ret_ptr);
+    }
+    SwitchToFiber(target->win_fiber_handle);
 }
 #else
 static void fiber_entry_stub(void) {
@@ -149,8 +187,13 @@ static void fiber_entry_stub(void) {
         g_dead_fibers = f;
     }
 
-    OmniFiber* target = &g_main_fiber;
+    OmniFiber* target = dequeue_ready_fiber();
+    if (!target) target = &g_main_fiber;
+    target->status = OMNI_FIBER_RUNNING;
     g_current_fiber = target;
+    if (f) {
+        __omni_fiber_swap_unwind_ctx(&f->unwind_ctx, &target->unwind_ctx, &f->saved_ret_ptr, &target->saved_ret_ptr);
+    }
     swap_g_context(&f->rsp, target->rsp);
 }
 #endif
@@ -254,22 +297,43 @@ OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_siz
 
 void __omni_fiber_yield(void) {
     __omni_fiber_init();
-    if (g_current_fiber && g_current_fiber != &g_main_fiber) {
-        OmniFiber* from = g_current_fiber;
-        OmniFiber* to = &g_main_fiber;
-        g_current_fiber = to;
-#if defined(OMNI_HAS_WIN32_FIBERS)
-        (void)from;
-        SwitchToFiber(to->win_fiber_handle);
-#else
-        swap_g_context(&from->rsp, to->rsp);
-#endif
-        cleanup_dead_fibers();
+    OmniFiber* from = g_current_fiber;
+    if (!from) return;
+    OmniFiber* to = dequeue_ready_fiber();
+    if (!to) {
+        if (from != &g_main_fiber) {
+            to = &g_main_fiber;
+        } else {
+            cleanup_dead_fibers();
+            return;
+        }
     }
+    enqueue_ready_fiber(from);
+    to->status = OMNI_FIBER_RUNNING;
+    g_current_fiber = to;
+    __omni_fiber_swap_unwind_ctx(&from->unwind_ctx, &to->unwind_ctx, &from->saved_ret_ptr, &to->saved_ret_ptr);
+#if defined(OMNI_HAS_WIN32_FIBERS)
+    SwitchToFiber(to->win_fiber_handle);
+#else
+    swap_g_context(&from->rsp, to->rsp);
+#endif
+    cleanup_dead_fibers();
+}
+
+void __omni_fiber_join_all(void) {
+    __omni_fiber_init();
+    while (g_ready_head != NULL) {
+        __omni_fiber_yield();
+    }
+    cleanup_dead_fibers();
 }
 
 void __omni_fiber_destroy(OmniFiber* fiber) {
     if (fiber) {
+        if (fiber->unwind_ctx) {
+            __omni_fiber_free_unwind_ctx(fiber->unwind_ctx);
+            fiber->unwind_ctx = NULL;
+        }
         if (fiber->arena) {
             __omni_arena_destroy(fiber->arena);
             fiber->arena = NULL;
@@ -308,9 +372,11 @@ void __omni_go_spawn(void (*entry)(void*), void* arg) {
     if (!fiber) return;
 
     OmniFiber* from = g_current_fiber;
+    enqueue_ready_fiber(from);
+    fiber->status = OMNI_FIBER_RUNNING;
     g_current_fiber = fiber;
+    __omni_fiber_swap_unwind_ctx(&from->unwind_ctx, &fiber->unwind_ctx, &from->saved_ret_ptr, &fiber->saved_ret_ptr);
 #if defined(OMNI_HAS_WIN32_FIBERS)
-    (void)from;
     SwitchToFiber(fiber->win_fiber_handle);
 #else
     swap_g_context(&from->rsp, fiber->rsp);

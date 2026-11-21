@@ -22,6 +22,8 @@ typedef pthread_cond_t omni_cond_t;
 
 typedef struct {
     uint64_t magic;
+    uint32_t rc;
+    uint32_t flags;
     uint8_t* buffer;
     size_t capacity;
     size_t elem_size;
@@ -37,7 +39,10 @@ typedef struct {
 static inline bool __omni_is_chan_ptr(const void* ptr) {
     const unsigned char* p = (const unsigned char*)ptr;
     if (!p || (uintptr_t)p < 4096) return false;
-    if (p[0] != 0xFF || (((uintptr_t)p & 7u) != 0u)) return false;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (((uintptr_t)p >> 48) != 0u) return false;
+#endif
+    if ((((uintptr_t)p & 7u) != 0u) || p[0] != 0xFF) return false;
     return ((const OmniChan*)ptr)->magic == OMNI_CHAN_MAGIC;
 }
 

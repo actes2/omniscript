@@ -1,4 +1,5 @@
 #include "omni_map.h"
+#include "omni_value.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,9 +39,12 @@ OmniMap* __omni_map_create(size_t initial_cap) {
     }
 
     map->magic = OMNI_MAP_MAGIC;
+    map->rc = 1;
+    map->flags = 0;
     map->capacity = cap;
     map->count = 0;
     map->tombstones = 0;
+    __omni_reg_track(map, 3);
     return map;
 }
 
@@ -207,7 +211,13 @@ size_t __omni_map_len(OmniMap* map) {
 
 void __omni_map_destroy(OmniMap* map) {
     if (!__omni_is_map_ptr(map)) return;
+    uint32_t cur = __atomic_load_n(&map->rc, __ATOMIC_ACQUIRE);
+    if (cur == 0xFFFFFFFFu) return;
+    if (__atomic_sub_fetch(&map->rc, 1u, __ATOMIC_ACQ_REL) > 0u) {
+        return;
+    }
     map->magic = 0;
+    __omni_reg_untrack(map);
     if (map->buckets) {
         for (size_t i = 0; i < map->capacity; i++) {
             if (map->buckets[i].occupied && !map->buckets[i].deleted && map->buckets[i].key) {
@@ -221,19 +231,25 @@ void __omni_map_destroy(OmniMap* map) {
 }
 
 void __omni_map_set_int(OmniMap* map, int64_t key, int64_t val) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%" PRId64, key);
+    char buf[36];
+    snprintf(buf, sizeof(buf), "\x01i:%" PRId64, key);
     __omni_map_set(map, buf, val);
 }
 
 int64_t __omni_map_get_int(OmniMap* map, int64_t key) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%" PRId64, key);
+    char buf[36];
+    snprintf(buf, sizeof(buf), "\x01i:%" PRId64, key);
     return __omni_map_get(map, buf);
 }
 
 bool __omni_map_contains_int(OmniMap* map, int64_t key) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%" PRId64, key);
+    char buf[36];
+    snprintf(buf, sizeof(buf), "\x01i:%" PRId64, key);
     return __omni_map_contains(map, buf);
+}
+
+void __omni_map_delete_int(OmniMap* map, int64_t key) {
+    char buf[36];
+    snprintf(buf, sizeof(buf), "\x01i:%" PRId64, key);
+    __omni_map_delete(map, buf);
 }

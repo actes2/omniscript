@@ -822,6 +822,14 @@ impl ThumbAssembler {
         });
     }
 
+    /// Medium-range (`+/- 2048` bytes) conditional branch without clobbering any register (`B<!cond> +2; B label`).
+    pub fn emit_bcond_near(&mut self, cond: Cond, label: usize) {
+        let skip = self.new_label();
+        self.emit_bcond_label_short(cond.invert(), skip);
+        self.emit_b_label_short(label);
+        self.bind_label(skip);
+    }
+
     /// Range-unlimited intra-function unconditional jump (safe at basic-block boundaries where `r7` is scratch).
     pub fn emit_jump_bb(&mut self, label: usize) {
         if self.has_thumb2 {

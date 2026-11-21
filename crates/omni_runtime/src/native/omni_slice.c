@@ -21,8 +21,11 @@ OmniSlice* __omni_slice_create(size_t initial_cap) {
     }
 
     slice->magic = OMNI_SLICE_MAGIC;
+    slice->rc = 1;
+    slice->flags = 0;
     slice->len = 0;
     slice->cap = initial_cap;
+    __omni_reg_track(slice, 2);
     return slice;
 }
 
@@ -91,7 +94,7 @@ size_t __omni_slice_len(OmniSlice* slice) {
         return __omni_chan_len((OmniChan*)slice);
     }
     // Polymorphic string-as-array fallback when untyped `i8*` C string reaches `len(x)`
-    return strlen((const char*)slice);
+    return (size_t)__omni_str_len((const char*)slice);
 }
 
 int64_t __omni_slice_pop(OmniSlice* slice) {
@@ -198,7 +201,13 @@ void __omni_slice_print(OmniSlice* slice) {
 
 void __omni_slice_destroy(OmniSlice* slice) {
     if (!__omni_is_slice_ptr(slice)) return;
+    uint32_t cur = __atomic_load_n(&slice->rc, __ATOMIC_ACQUIRE);
+    if (cur == 0xFFFFFFFFu) return;
+    if (__atomic_sub_fetch(&slice->rc, 1u, __ATOMIC_ACQ_REL) > 0u) {
+        return;
+    }
     slice->magic = 0;
+    __omni_reg_untrack(slice);
     if (slice->data) {
         free(slice->data);
         slice->data = NULL;

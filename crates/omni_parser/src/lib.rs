@@ -102,7 +102,7 @@ pub struct AnnotationDef {
     pub arguments: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionDef {
     pub name: String,
     pub is_method: bool,
@@ -113,7 +113,7 @@ pub struct FunctionDef {
     pub memory_ops: Vec<UnifiedMemOp>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamDef {
     pub name: String,
     pub type_hint: Option<String>,
@@ -258,6 +258,10 @@ pub enum Statement {
         physical_source: String,
         idiom: IdiomFamily,
     },
+    /// Nested function or local closure definition (`def inner(x): ...`, `f = lambda x: ...`, `const f = (x) => ...`)
+    LocalFnDef {
+        func: FunctionDef,
+    },
     /// First-class polyglot annotation / decorator binding applied to a function or class symbol
     AnnotationBinding {
         target_symbol: String,
@@ -315,6 +319,9 @@ pub fn harvest_called_symbols(stmts: &[Statement], set: &mut std::collections::H
                 if let Some(ref fb) = finally_block {
                     harvest_called_symbols(fb, set);
                 }
+            }
+            Statement::LocalFnDef { func } => {
+                harvest_called_symbols(&func.body, set);
             }
             Statement::Print { expr } => {
                 for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
@@ -523,6 +530,429 @@ impl OmniParser {
             type_hint: None,
             default_val,
         }
+    }
+
+    /// Parses inline polyglot lambda / closure expressions across ecosystems:
+    /// - Python: `lambda x, y=1: x + y` or `lambda: 42`
+    /// - JS / TS / C# / Dart / Scala: `(x, y) => x + y`, `x => x + 1`, `async (x) => x`
+    /// - PHP: `fn($x, $y = 1) => $x + $y`
+    /// - Rust / Ruby: `[move] |x, y| x + y`, `[move] || 42`, `|x: i64| -> i64 { x * 2 }`
+    /// - Go / JS / Lua: `func(x int) int { return x }`, `function(x) { return x }`, `function(x) return x end`
+    /// - C++: `[=](int x) -> int { return x + 1 }`, `[&](int x) { return x * 2 }`, `[](int x) { return x }`
+    /// - Kotlin / Groovy / Swift: `{ x, y -> x + y }`, `{ x in x + 1 }`
+    pub fn try_parse_lambda_expr(expr: &str) -> Option<(Vec<ParamDef>, String)> {
+        fn matching_close_at_end(s: &str, open_ch: u8, close_ch: u8) -> bool {
+            let bytes = s.as_bytes();
+            if bytes.len() < 2 || bytes[0] != open_ch || bytes[bytes.len() - 1] != close_ch {
+                return false;
+            }
+            let mut depth = 0i32;
+            let mut in_q: Option<u8> = None;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if let Some(q) = in_q {
+                    if b == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b == q {
+                        in_q = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' || b == b'\'' {
+                    in_q = Some(b);
+                } else if b == open_ch {
+                    depth += 1;
+                } else if b == close_ch {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i == bytes.len() - 1;
+                    }
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                i += 1;
+            }
+            false
+        }
+
+        fn normalize_lambda_body(raw_body: &str) -> Option<String> {
+            let b = raw_body.trim();
+            if b.is_empty() {
+                return None;
+            }
+            if matching_close_at_end(b, b'{', b'}') {
+                let inner = b[1..b.len() - 1].trim();
+                if inner.is_empty() {
+                    return Some("0".to_string());
+                }
+                let is_multi_stmt = inner.contains(';')
+                    || inner.contains('\n')
+                    || inner.starts_with("let ")
+                    || inner.starts_with("var ")
+                    || inner.starts_with("const ")
+                    || inner.starts_with("if ")
+                    || inner.starts_with("for ")
+                    || inner.starts_with("while ")
+                    || inner.starts_with("match ")
+                    || inner.starts_with("try");
+                if is_multi_stmt {
+                    return Some(b.to_string());
+                }
+                let expr_only = inner
+                    .strip_prefix("return ")
+                    .unwrap_or(inner)
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
+                if !expr_only.is_empty() {
+                    return Some(expr_only.to_string());
+                }
+                return Some("0".to_string());
+            }
+            Some(b.to_string())
+        }
+
+        let mut t = expr.trim().trim_end_matches(';').trim();
+        while matching_close_at_end(t, b'(', b')') {
+            t = t[1..t.len() - 1].trim();
+        }
+
+        // 1. Python `lambda [params]: body`
+        if t == "lambda" || t.starts_with("lambda ") || t.starts_with("lambda:") {
+            let rest = t.trim_start_matches("lambda").trim();
+            let colon = rest.find(':')?;
+            let raw_params = rest[..colon].trim();
+            let body = normalize_lambda_body(&rest[colon + 1..])?;
+            let params = Self::split_respecting_quotes(raw_params, ',')
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(|p| Self::parse_param(&p))
+                .collect();
+            return Some((params, body));
+        }
+
+        // 2. Rust / Ruby `[move] |x, y| body` or `[move] || body`
+        let rust_t = if let Some(rest) = t.strip_prefix("move") {
+            let r = rest.trim_start();
+            if r.starts_with('|') { r } else { t }
+        } else {
+            t
+        };
+        if let Some(after_bar) = rust_t.strip_prefix("||") {
+            let mut body_raw = after_bar.trim();
+            if let Some(arrow_rest) = body_raw.strip_prefix("->") {
+                if let Some(brace) = arrow_rest.find('{') {
+                    body_raw = arrow_rest[brace..].trim();
+                }
+            }
+            if let Some(body) = normalize_lambda_body(body_raw) {
+                return Some((Vec::new(), body));
+            }
+        } else if rust_t.starts_with('|') {
+            if let Some(close_bar) = rust_t[1..].find('|') {
+                let raw_params = rust_t[1..1 + close_bar].trim();
+                let valid_params = raw_params.is_empty()
+                    || Self::split_respecting_quotes(raw_params, ',').iter().all(|p| {
+                        let pn = p
+                            .split([':', '='])
+                            .next()
+                            .unwrap_or(p)
+                            .trim()
+                            .trim_start_matches("mut ")
+                            .trim();
+                        !pn.is_empty() && pn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if valid_params {
+                    let mut body_raw = rust_t[1 + close_bar + 1..].trim();
+                    if let Some(arrow_rest) = body_raw.strip_prefix("->") {
+                        if let Some(brace) = arrow_rest.find('{') {
+                            body_raw = arrow_rest[brace..].trim();
+                        }
+                    }
+                    if let Some(body) = normalize_lambda_body(body_raw) {
+                        let params = Self::split_respecting_quotes(raw_params, ',')
+                            .into_iter()
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .map(|p| Self::parse_param(&p))
+                            .collect();
+                        return Some((params, body));
+                    }
+                }
+            }
+        }
+
+        // 3. Go `func(...) ... { ... }`, JS `function(...) { ... }`, Lua `function(...) ... end`, C++ `[...](...) { ... }`
+        let anon_fn_rest = if let Some(r) = t.strip_prefix("function") {
+            let rt = r.trim_start();
+            if rt.starts_with('(') { Some((rt, true)) } else { None }
+        } else if let Some(r) = t.strip_prefix("func") {
+            let rt = r.trim_start();
+            if rt.starts_with('(') { Some((rt, false)) } else { None }
+        } else if t.starts_with('[') {
+            if let Some(rb) = t.find(']') {
+                let cap_spec = t[1..rb].trim();
+                let after_cap = t[rb + 1..].trim_start();
+                let valid_cap = cap_spec.is_empty()
+                    || cap_spec == "="
+                    || cap_spec == "&"
+                    || cap_spec.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ',' | ' ' | '&' | '='));
+                if valid_cap && after_cap.starts_with('(') && after_cap.contains('{') && after_cap.ends_with('}') {
+                    Some((after_cap, false))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((sig_and_body, allow_lua_end)) = anon_fn_rest {
+            let mut pd = 0i32;
+            let mut close_p = None;
+            for (idx, b) in sig_and_body.bytes().enumerate() {
+                if b == b'(' {
+                    pd += 1;
+                } else if b == b')' {
+                    pd -= 1;
+                    if pd == 0 {
+                        close_p = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(rp) = close_p {
+                let raw_params = sig_and_body[1..rp].trim();
+                let after_params = sig_and_body[rp + 1..].trim();
+                let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                    .into_iter()
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Self::parse_param(&p))
+                    .collect();
+                if let Some(brace_pos) = after_params.find('{') {
+                    let candidate_blk = after_params[brace_pos..].trim();
+                    if matching_close_at_end(candidate_blk, b'{', b'}') {
+                        if let Some(body) = normalize_lambda_body(candidate_blk) {
+                            return Some((params, body));
+                        }
+                    }
+                } else if allow_lua_end && after_params.ends_with("end") {
+                    let lua_inner = after_params[..after_params.len() - 3].trim();
+                    if !lua_inner.is_empty() {
+                        let wrapped = format!("{{ {} }}", lua_inner);
+                        if let Some(body) = normalize_lambda_body(&wrapped) {
+                            return Some((params, body));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Kotlin / Groovy `{ x, y -> x + y }` and Swift `{ x in x + 1 }` brace closures
+        if matching_close_at_end(t, b'{', b'}') && !t.contains('"') && !t.contains('\'') {
+            let inner_b = t[1..t.len() - 1].trim();
+            let split_opt = if let Some((lhs, rhs)) = inner_b.split_once("->") {
+                Some((lhs.trim(), rhs.trim()))
+            } else if let Some((lhs, rhs)) = inner_b.split_once(" in ") {
+                if !lhs.starts_with("for ") && !lhs.contains('=') {
+                    Some((lhs.trim(), rhs.trim()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((raw_p, raw_rhs)) = split_opt {
+                let clean_p = if matching_close_at_end(raw_p, b'(', b')') {
+                    raw_p[1..raw_p.len() - 1].trim()
+                } else {
+                    raw_p
+                };
+                let valid_p = !clean_p.is_empty()
+                    && Self::split_respecting_quotes(clean_p, ',').iter().all(|p| {
+                        let pn = p.split(':').next().unwrap_or(p).trim();
+                        !pn.is_empty() && pn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if valid_p && !raw_rhs.is_empty() {
+                    let params = Self::split_respecting_quotes(clean_p, ',')
+                        .into_iter()
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .map(|p| Self::parse_param(&p))
+                        .collect();
+                    let wrapped = format!("{{ {} }}", raw_rhs);
+                    if let Some(body) = normalize_lambda_body(&wrapped) {
+                        return Some((params, body));
+                    }
+                }
+            }
+        }
+
+        // 5. Arrow function `(x, y) => body`, `x => body`, `async (x) => body`, PHP `fn($x) => $x + 1`
+        let arrow_t_cow: std::borrow::Cow<'_, str> = if t.starts_with("fn")
+            && t[2..].trim_start().starts_with('(')
+            && t.contains("=>")
+        {
+            std::borrow::Cow::Owned(t[2..].trim_start().replace('$', ""))
+        } else if let Some(r) = t.strip_prefix("async") {
+            let rt = r.trim_start();
+            if (rt.starts_with('(') || rt.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false))
+                && rt.contains("=>")
+            {
+                std::borrow::Cow::Borrowed(rt)
+            } else {
+                std::borrow::Cow::Borrowed(t)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(t)
+        };
+        let at = arrow_t_cow.as_ref();
+        {
+            let bytes = at.as_bytes();
+            let mut pd = 0i32;
+            let mut bd = 0i32;
+            let mut cd = 0i32;
+            let mut in_q: Option<u8> = None;
+            let mut arrow_idx = None;
+            let mut k = 0usize;
+            while k + 1 < bytes.len() {
+                let b = bytes[k];
+                if let Some(q) = in_q {
+                    if b == b'\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if b == q {
+                        in_q = None;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if b == b'"' || b == b'\'' {
+                    in_q = Some(b);
+                } else if b == b'(' {
+                    pd += 1;
+                } else if b == b')' {
+                    pd -= 1;
+                } else if b == b'[' {
+                    bd += 1;
+                } else if b == b']' {
+                    bd -= 1;
+                } else if b == b'{' {
+                    cd += 1;
+                } else if b == b'}' {
+                    cd -= 1;
+                } else if pd == 0 && bd == 0 && cd == 0 && b == b'=' && bytes[k + 1] == b'>' {
+                    arrow_idx = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            if let Some(aidx) = arrow_idx {
+                let head = at[..aidx].trim();
+                if let Some(body) = normalize_lambda_body(&at[aidx + 2..]) {
+                    if head.starts_with('(') {
+                        if let Some(rp) = head.rfind(')') {
+                            let inner_p = &head[1..rp];
+                            let after_p = head[rp + 1..].trim();
+                            if after_p.is_empty() || after_p.starts_with(':') || after_p.starts_with("->") {
+                                let params = Self::split_respecting_quotes(inner_p, ',')
+                                    .into_iter()
+                                    .map(|p| p.trim().to_string())
+                                    .filter(|p| !p.is_empty())
+                                    .map(|p| Self::parse_param(&p))
+                                    .collect();
+                                return Some((params, body));
+                            }
+                        }
+                    } else if !head.is_empty()
+                        && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return Some((vec![Self::parse_param(head)], body));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Rewrites top-level `break` statements inside a loop body to set `flag_var = 1` before breaking,
+    /// enabling Python-faithful `for/while ... else:` execution without altering inner nested loops.
+    fn inject_loop_break_flag(stmts: Vec<Statement>, flag_var: &str) -> Vec<Statement> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            match s {
+                Statement::Concrete { ref code, idiom }
+                    if {
+                        let bt = code.trim().trim_end_matches(';').trim();
+                        bt == "break" || bt.starts_with("break ")
+                    } =>
+                {
+                    out.push(Statement::Assign {
+                        target: flag_var.to_string(),
+                        expr: "1".to_string(),
+                        idiom: IdiomFamily::Standard,
+                        is_scoped_decl: false,
+                    });
+                    out.push(Statement::Concrete {
+                        code: code.clone(),
+                        idiom,
+                    });
+                }
+                Statement::If { condition, then_branch, else_branch } => {
+                    out.push(Statement::If {
+                        condition,
+                        then_branch: Self::inject_loop_break_flag(then_branch, flag_var),
+                        else_branch: else_branch.map(|eb| Self::inject_loop_break_flag(eb, flag_var)),
+                    });
+                }
+                Statement::WithContext { context_expr, var_alias, body } => {
+                    out.push(Statement::WithContext {
+                        context_expr,
+                        var_alias,
+                        body: Self::inject_loop_break_flag(body, flag_var),
+                    });
+                }
+                Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    out.push(Statement::TryCatch {
+                        try_block: Self::inject_loop_break_flag(try_block, flag_var),
+                        catch_clauses: catch_clauses
+                            .into_iter()
+                            .map(|c| CatchClause {
+                                exception_type: c.exception_type,
+                                var_name: c.var_name,
+                                body: Self::inject_loop_break_flag(c.body, flag_var),
+                            })
+                            .collect(),
+                        finally_block: finally_block.map(|fb| Self::inject_loop_break_flag(fb, flag_var)),
+                    });
+                }
+                Statement::Match { target, arms } => {
+                    out.push(Statement::Match {
+                        target,
+                        arms: arms
+                            .into_iter()
+                            .map(|a| MatchArm {
+                                pattern: a.pattern,
+                                body: Self::inject_loop_break_flag(a.body, flag_var),
+                            })
+                            .collect(),
+                    });
+                }
+                // Do NOT recurse into inner `WhileLoop` / `ForLoop` — their `break`s belong to the inner loop!
+                other => out.push(other),
+            }
+        }
+        out
     }
 
     pub fn extract_fn_return_type(header_line: &str, fn_name: &str) -> Option<String> {
@@ -1715,16 +2145,113 @@ impl OmniParser {
                 false
             };
 
-            let is_dict_assign = {
-                let t_no_brace = trimmed.strip_suffix('{').map(|s| s.trim_end());
-                matches!(t_no_brace, Some(b) if b.ends_with('=') || b.ends_with(":=") || b == "return")
+            let peek_next_is_chain = |from_idx: usize| -> bool {
+                let mut k = from_idx;
+                while k < raw_lines.len() {
+                    let s = Self::strip_trailing_comment(raw_lines[k]).trim();
+                    if s.is_empty() {
+                        k += 1;
+                        continue;
+                    }
+                    return (s.starts_with('.') && !s.starts_with("..")) || s.starts_with("|>");
+                }
+                false
+            };
+
+            let can_chain_next = |s: &str| -> bool {
+                !s.ends_with(';')
+                    && !s.ends_with(':')
+                    && !s.ends_with('{')
+                    && !s.ends_with('}')
+                    && !s.ends_with(" then")
+                    && !s.ends_with(" do")
+                    && !matches!(s, "else" | "begin" | "try" | "repeat")
+            };
+
+            let (is_dict_assign, is_lambda_brace_assign) = {
+                if let Some(b) = trimmed.strip_suffix('{').map(|s| s.trim_end()) {
+                    let dict_ok = b.ends_with('=') || b.ends_with(":=") || b == "return";
+                    let is_ctrl_or_decl = b.starts_with("if ")
+                        || b.starts_with("if(")
+                        || b.starts_with("elif ")
+                        || b.starts_with("else ")
+                        || b == "else"
+                        || b.starts_with("while ")
+                        || b.starts_with("while(")
+                        || b.starts_with("for ")
+                        || b.starts_with("for(")
+                        || b.starts_with("switch ")
+                        || b.starts_with("switch(")
+                        || b.starts_with("match ")
+                        || b.starts_with("try")
+                        || b.starts_with("catch")
+                        || b.starts_with("using ")
+                        || b.starts_with("using(")
+                        || b.starts_with("with ")
+                        || b.starts_with("def ")
+                        || b.starts_with("fn ")
+                        || b.starts_with("pub fn ")
+                        || b.starts_with("func ")
+                        || b.starts_with("fun ")
+                        || b.starts_with("class ")
+                        || b.starts_with("struct ")
+                        || b.starts_with("enum ");
+                    let lam_rhs = if let Some(r) = b.strip_prefix("return ") {
+                        Some(r.trim())
+                    } else if !is_ctrl_or_decl {
+                        let mut p0 = 0i32;
+                        let mut b0 = 0i32;
+                        let mut c0 = 0i32;
+                        let mut rhs_opt = None;
+                        let bb = b.as_bytes();
+                        for k in 0..bb.len() {
+                            match bb[k] {
+                                b'(' => p0 += 1,
+                                b')' => p0 -= 1,
+                                b'[' => b0 += 1,
+                                b']' => b0 -= 1,
+                                b'{' => c0 += 1,
+                                b'}' => c0 -= 1,
+                                b'=' if p0 == 0 && b0 == 0 && c0 == 0 => {
+                                    let prv = if k > 0 { bb[k - 1] } else { 0 };
+                                    let nxt = bb.get(k + 1).copied().unwrap_or(0);
+                                    if !matches!(prv, b'=' | b'!' | b'<' | b'>') && nxt != b'=' && nxt != b'>' {
+                                        rhs_opt = Some(b[k + 1..].trim());
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        rhs_opt
+                    } else {
+                        None
+                    };
+                    let lam_ok = matches!(
+                        lam_rhs,
+                        Some(r)
+                            if r.ends_with("=>")
+                                || (r.starts_with('[') && (r.ends_with(')') || r.contains("->")))
+                                || ((r.starts_with('|') || r.starts_with("move |")) && r.ends_with('|'))
+                                || r.starts_with("func(")
+                                || r.starts_with("function(")
+                                || r.starts_with("function ")
+                    );
+                    (dict_ok, lam_ok)
+                } else {
+                    let kt_ok = (trimmed.contains('=') || trimmed.starts_with("return "))
+                        && trimmed.contains('{')
+                        && trimmed.ends_with("->");
+                    (false, kt_ok)
+                }
             };
             let (mut p_depth, mut b_depth, mut c_depth) = scan_delim_deltas(trimmed);
-            let track_c_depth = is_dict_assign;
+            let track_c_depth = is_dict_assign || is_lambda_brace_assign;
             let mut cont = p_depth > 0
                 || b_depth > 0
                 || (track_c_depth && c_depth > 0)
-                || has_trailing_cont_op(trimmed);
+                || has_trailing_cont_op(trimmed)
+                || (can_chain_next(trimmed) && peek_next_is_chain(idx));
 
             let joined_buf: String;
             if cont {
@@ -1744,8 +2271,19 @@ impl OmniParser {
                     p_depth += dp;
                     b_depth += db;
                     c_depth += dc;
-                    if !accum_str.is_empty() {
-                        accum_str.push(' ');
+                    if !accum_str.is_empty() && !n_stripped.starts_with('.') {
+                        if is_lambda_brace_assign
+                            && !accum_str.ends_with('{')
+                            && !accum_str.ends_with(';')
+                            && !accum_str.ends_with(',')
+                            && !accum_str.ends_with("->")
+                            && !accum_str.ends_with("=>")
+                            && !n_stripped.starts_with('}')
+                        {
+                            accum_str.push_str("; ");
+                        } else {
+                            accum_str.push(' ');
+                        }
                     }
                     accum_str.push_str(n_stripped);
                     let had_backslash = accum_str.ends_with('\\');
@@ -1757,9 +2295,13 @@ impl OmniParser {
                         || b_depth > 0
                         || (track_c_depth && c_depth > 0)
                         || had_backslash
-                        || (p_depth == 0 && b_depth == 0 && (!track_c_depth || c_depth <= 0) && has_trailing_cont_op(&accum_str));
+                        || (p_depth == 0
+                            && b_depth == 0
+                            && (!track_c_depth || c_depth <= 0)
+                            && (has_trailing_cont_op(&accum_str)
+                                || (can_chain_next(&accum_str) && peek_next_is_chain(idx))));
                 }
-                if is_dict_assign {
+                if is_dict_assign || is_lambda_brace_assign {
                     if accum_str.ends_with(';') {
                         accum_str.truncate(accum_str.len() - 1);
                         accum_str = accum_str.trim_end().to_string();
@@ -3019,9 +3561,35 @@ impl OmniParser {
                 continue;
             }
 
-            // Nested function or local class/struct definition inside a block: consume its indented body
-            if self.fn_re.is_match(trimmed_text)
-                || Self::parse_class_header(trimmed_text).is_some()
+            // Nested function definition inside a block: parse & preserve as `Statement::LocalFnDef` for closure lambda-lifting!
+            if let Some(caps) = self.fn_re.captures(trimmed_text) {
+                let inner_fn_name = caps[1].to_string();
+                let inner_ret_type = Self::extract_fn_return_type(trimmed_text, &inner_fn_name);
+                let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|p| Self::parse_param(p))
+                    .collect();
+                let (nested_body, next_i) = self.consume_indented_block(lines, i + 1, indent, &inner_fn_name, mem_norm);
+                stmts.push(Statement::LocalFnDef {
+                    func: FunctionDef {
+                        name: inner_fn_name,
+                        is_method: false,
+                        annotations: Vec::new(),
+                        params,
+                        return_type: inner_ret_type,
+                        body: nested_body,
+                        memory_ops: Vec::new(),
+                    },
+                });
+                i = next_i;
+                continue;
+            }
+
+            // Local class/struct definition inside a block: consume its indented body
+            if Self::parse_class_header(trimmed_text).is_some()
                 || trimmed_text.starts_with("struct ")
             {
                 let (_nested_body, next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
@@ -3265,20 +3833,44 @@ impl OmniParser {
                 continue;
             }
 
-            // 2. While loop (with optional Python `while ... else:`)
+            // 2. While loop (with full Python `while ... else:` support)
             if let Some(caps) = self.while_re.captures(text) {
                 let condition = Self::unwrap_outer_balanced_parens(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
                 let (body, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                let mut loop_else: Option<Vec<Statement>> = None;
                 if next_i < lines.len() && lines[next_i].0 == indent && self.else_re.is_match(lines[next_i].1.trim()) {
-                    let (_else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                    let (else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
                     next_i = after_else;
+                    if !else_body.is_empty() {
+                        loop_else = Some(else_body);
+                    }
                 }
-                stmts.push(Statement::WhileLoop { condition, body });
+                if let Some(else_body) = loop_else {
+                    let flag_var = format!("__omni_loop_broke_{}_{}", fn_name, i);
+                    stmts.push(Statement::Assign {
+                        target: flag_var.clone(),
+                        expr: "0".to_string(),
+                        idiom: IdiomFamily::Standard,
+                        is_scoped_decl: true,
+                    });
+                    let tagged_body = Self::inject_loop_break_flag(body, &flag_var);
+                    stmts.push(Statement::WhileLoop {
+                        condition,
+                        body: tagged_body,
+                    });
+                    stmts.push(Statement::If {
+                        condition: format!("{} == 0", flag_var),
+                        then_branch: else_body,
+                        else_branch: None,
+                    });
+                } else {
+                    stmts.push(Statement::WhileLoop { condition, body });
+                }
                 i = next_i;
                 continue;
             }
 
-            // 3. For loop (with optional Python `for ... else:`)
+            // 3. For loop (with full Python `for ... else:` support)
             let for_match = if let Some(caps) = self.c_for_re.captures(text) {
                 Some((caps[1].to_string(), caps[2].trim().to_string()))
             } else if let Some(caps) = self.paren_for_re.captures(text) {
@@ -3293,11 +3885,36 @@ impl OmniParser {
 
             if let Some((var, count)) = for_match {
                 let (body, mut next_i) = self.consume_indented_block(lines, i + 1, indent, fn_name, mem_norm);
+                let mut loop_else: Option<Vec<Statement>> = None;
                 if next_i < lines.len() && lines[next_i].0 == indent && self.else_re.is_match(lines[next_i].1.trim()) {
-                    let (_else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
+                    let (else_body, after_else) = self.consume_indented_block(lines, next_i + 1, indent, fn_name, mem_norm);
                     next_i = after_else;
+                    if !else_body.is_empty() {
+                        loop_else = Some(else_body);
+                    }
                 }
-                stmts.push(Statement::ForLoop { var, count, body });
+                if let Some(else_body) = loop_else {
+                    let flag_var = format!("__omni_loop_broke_{}_{}", fn_name, i);
+                    stmts.push(Statement::Assign {
+                        target: flag_var.clone(),
+                        expr: "0".to_string(),
+                        idiom: IdiomFamily::Standard,
+                        is_scoped_decl: true,
+                    });
+                    let tagged_body = Self::inject_loop_break_flag(body, &flag_var);
+                    stmts.push(Statement::ForLoop {
+                        var,
+                        count,
+                        body: tagged_body,
+                    });
+                    stmts.push(Statement::If {
+                        condition: format!("{} == 0", flag_var),
+                        then_branch: else_body,
+                        else_branch: None,
+                    });
+                } else {
+                    stmts.push(Statement::ForLoop { var, count, body });
+                }
                 i = next_i;
                 continue;
             }
@@ -3467,44 +4084,65 @@ impl OmniParser {
                 continue;
             }
 
-            // 11. Polyglot Map / Dict Init: `m = {"k": 10, "v": 20}`, `m := {}`
+            // 11. Polyglot Map / Dict Init: `m = {"k": 10, "v": 20}`, `m := {}` (guarded against Kotlin `{ x -> ... }` lambdas)
             if let Some(caps) = self.map_init_re.captures(text) {
-                let is_scoped = caps.get(1).is_some() || text.contains(":=");
-                let target = caps[2].trim().to_string();
-                let inner = caps[3].trim();
-                let entries = if inner.is_empty() {
-                    Vec::new()
-                } else {
-                    Self::split_respecting_quotes(inner, ',')
-                        .into_iter()
-                        .filter_map(|pair| {
-                            let pair = pair.trim();
-                            if pair.is_empty() {
-                                return None;
-                            }
-                            if let Some((k, v)) = pair.split_once(':') {
-                                Some((
-                                    k.trim().trim_matches('"').trim_matches('\'').to_string(),
-                                    v.trim().to_string(),
-                                ))
-                            } else if let Some((k, v)) = pair.split_once("=>") {
-                                Some((
-                                    k.trim().trim_matches('"').trim_matches('\'').to_string(),
-                                    v.trim().to_string(),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                };
-                stmts.push(Statement::MapInit {
-                    target,
-                    entries,
-                    is_scoped_decl: is_scoped,
-                });
-                i += 1;
-                continue;
+                let inner_cand = caps[3].trim();
+                let brace_cand = format!("{{{}}}", inner_cand);
+                if Self::try_parse_lambda_expr(&brace_cand).is_none() {
+                    let is_scoped = caps.get(1).is_some() || text.contains(":=");
+                    let target = caps[2].trim().to_string();
+                    let inner = inner_cand;
+                    let entries = if inner.is_empty() {
+                        Vec::new()
+                    } else {
+                        Self::split_respecting_quotes(inner, ',')
+                            .into_iter()
+                            .filter_map(|pair| {
+                                let pair = pair.trim();
+                                if pair.is_empty() {
+                                    return None;
+                                }
+                                let parse_map_key = |k_raw: &str| -> String {
+                                    let kt = k_raw.trim();
+                                    if (kt.starts_with('"') && kt.ends_with('"'))
+                                        || (kt.starts_with('\'') && kt.ends_with('\''))
+                                    {
+                                        return kt[1..kt.len() - 1].to_string();
+                                    }
+                                    let clean_num = kt.replace('_', "");
+                                    let int_opt = if let Some(h) = clean_num.strip_prefix("0x").or_else(|| clean_num.strip_prefix("0X")) {
+                                        i64::from_str_radix(h, 16).ok()
+                                    } else if let Some(b) = clean_num.strip_prefix("0b").or_else(|| clean_num.strip_prefix("0B")) {
+                                        i64::from_str_radix(b, 2).ok()
+                                    } else if let Some(o) = clean_num.strip_prefix("0o").or_else(|| clean_num.strip_prefix("0O")) {
+                                        i64::from_str_radix(o, 8).ok()
+                                    } else {
+                                        clean_num.parse::<i64>().ok()
+                                    };
+                                    if let Some(iv) = int_opt {
+                                        format!("\x01int:{}", iv)
+                                    } else {
+                                        kt.to_string()
+                                    }
+                                };
+                                if let Some((k, v)) = pair.split_once(':') {
+                                    Some((parse_map_key(k), v.trim().to_string()))
+                                } else if let Some((k, v)) = pair.split_once("=>") {
+                                    Some((parse_map_key(k), v.trim().to_string()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+                    stmts.push(Statement::MapInit {
+                        target,
+                        entries,
+                        is_scoped_decl: is_scoped,
+                    });
+                    i += 1;
+                    continue;
+                }
             }
 
             // 12. Polyglot List Append: `items.append(40)`, `items.push(50)`
@@ -3591,24 +4229,82 @@ impl OmniParser {
                 continue;
             }
 
-            // 14. Go-style Scoped Walrus Declaration (e.g. `count := 0`)
+            // 14. Go-style Scoped Walrus Declaration (e.g. `count := 0` or `add := func/lambda/(x) => ...`)
             if let Some(caps) = self.walrus_assign_re.captures(text) {
-                stmts.push(Statement::Assign {
-                    target: caps[1].trim().to_string(),
-                    expr: caps[2].trim().to_string(),
-                    idiom: IdiomFamily::GoScopedDeclaration,
-                    is_scoped_decl: true,
-                });
+                let target = caps[1].trim().to_string();
+                let rhs = caps[2].trim();
+                if let Some((params, body_expr)) = Self::try_parse_lambda_expr(rhs) {
+                    let mut fn_body = if body_expr.starts_with('{') && body_expr.ends_with('}') {
+                        let inner_blk = &body_expr[1..body_expr.len() - 1];
+                        self.parse_module("lambda_blk", inner_blk).top_level_statements
+                    } else {
+                        vec![Statement::Return { expr: Some(body_expr) }]
+                    };
+                    if let Some(Statement::Concrete { code, .. }) = fn_body.last().cloned() {
+                        let ct = code.trim();
+                        if !ct.starts_with("print") && !ct.starts_with("throw ") && !ct.starts_with("raise ") {
+                            *fn_body.last_mut().unwrap() = Statement::Return { expr: Some(ct.to_string()) };
+                        }
+                    }
+                    stmts.push(Statement::LocalFnDef {
+                        func: FunctionDef {
+                            name: target,
+                            is_method: false,
+                            annotations: Vec::new(),
+                            params,
+                            return_type: None,
+                            body: fn_body,
+                            memory_ops: Vec::new(),
+                        },
+                    });
+                } else {
+                    stmts.push(Statement::Assign {
+                        target,
+                        expr: rhs.to_string(),
+                        idiom: IdiomFamily::GoScopedDeclaration,
+                        is_scoped_decl: true,
+                    });
+                }
                 i += 1;
                 continue;
             }
 
-            // Polyglot Tuple Literal Assignment: `DEFAULT_IP_PORT = ("127.0.0.1", 9999)`
-            // Desugar into Statement::ListInit
+            // Polyglot Local Lambda / Closure Assignment (`f = lambda x: ...`, `const f = (x) => ...`, `let f = |x| ...`)
+            // and Tuple Literal Assignment (`DEFAULT_IP_PORT = ("127.0.0.1", 8080)`)
             if let Some(caps) = self.assign_re.captures(text) {
                 let target = caps[2].trim().to_string();
                 let clean_expr = caps[3].trim().trim_end_matches(';').trim();
                 let is_scoped = caps.get(1).is_some();
+
+                if !target.contains('.') && !target.contains('[') {
+                    if let Some((params, body_expr)) = Self::try_parse_lambda_expr(clean_expr) {
+                        let mut fn_body = if body_expr.starts_with('{') && body_expr.ends_with('}') {
+                            let inner_blk = &body_expr[1..body_expr.len() - 1];
+                            self.parse_module("lambda_blk", inner_blk).top_level_statements
+                        } else {
+                            vec![Statement::Return { expr: Some(body_expr) }]
+                        };
+                        if let Some(Statement::Concrete { code, .. }) = fn_body.last().cloned() {
+                            let ct = code.trim();
+                            if !ct.starts_with("print") && !ct.starts_with("throw ") && !ct.starts_with("raise ") {
+                                *fn_body.last_mut().unwrap() = Statement::Return { expr: Some(ct.to_string()) };
+                            }
+                        }
+                        stmts.push(Statement::LocalFnDef {
+                            func: FunctionDef {
+                                name: target,
+                                is_method: false,
+                                annotations: Vec::new(),
+                                params,
+                                return_type: None,
+                                body: fn_body,
+                                memory_ops: Vec::new(),
+                            },
+                        });
+                        i += 1;
+                        continue;
+                    }
+                }
 
                 if clean_expr.starts_with('(') && clean_expr.ends_with(')') && clean_expr.contains(',') && !clean_expr.starts_with("(i32)") && !clean_expr.starts_with("(i64)") {
                     let wrapped = Self::unwrap_outer_balanced_parens(clean_expr);

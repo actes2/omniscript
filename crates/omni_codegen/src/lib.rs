@@ -383,6 +383,8 @@ pub enum CleanupOp {
     DestroySlice(String),
     DestroyMap(String),
     DestroyChan(String),
+    ReleaseRc(String),
+    FreeHeapPtr { slot_ptr: String, elem_ty: String },
     PopTryFrame,
 }
 
@@ -401,17 +403,26 @@ pub struct ScopeTree {
     pub class_field_types: HashMap<String, HashMap<String, String>>,
     pub class_field_order: HashMap<String, Vec<(String, Option<String>, Option<String>)>>,
     pub class_decorators: HashMap<String, Vec<String>>,
+    pub class_type_ids: HashMap<String, u64>,
     pub c_module_aliases: HashSet<String>,
+    pub valid_extmod_prefixes: HashSet<String>,
+    pub has_open_ns_import: bool,
     pub collection_elem_types: HashMap<String, String>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
+    pub fn_param_defs: HashMap<String, Vec<omni_parser::ParamDef>>,
+    pub method_param_defs: HashMap<(String, String), Vec<omni_parser::ParamDef>>,
     pub method_defining_class: HashMap<(String, String), String>,
     pub fn_return_types: HashMap<String, IrType>,
+    pub fn_return_ptr_kinds: HashMap<String, String>,
+    pub fn_curried_return_types: HashMap<String, IrType>,
     pub fn_tuple_return_types: HashMap<String, Vec<IrType>>,
     pub method_return_types: HashMap<(String, String), IrType>,
     pub loop_exit_labels: Vec<String>,
     pub loop_cond_labels: Vec<String>,
     pub loop_entry_try_depths: Vec<usize>,
+    pub loop_cleanup_marks: Vec<usize>,
+    pub closure_env_writebacks: Vec<(usize, String, String)>,
     pub active_try_depth: usize,
 }
 
@@ -423,19 +434,42 @@ impl ScopeTree {
             class_field_types: HashMap::new(),
             class_field_order: HashMap::new(),
             class_decorators: HashMap::new(),
+            class_type_ids: HashMap::new(),
             c_module_aliases: HashSet::new(),
+            valid_extmod_prefixes: HashSet::new(),
+            has_open_ns_import: false,
             collection_elem_types: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
+            fn_param_defs: HashMap::new(),
+            method_param_defs: HashMap::new(),
             method_defining_class: HashMap::new(),
             fn_return_types: HashMap::new(),
+            fn_return_ptr_kinds: HashMap::new(),
+            fn_curried_return_types: HashMap::new(),
             fn_tuple_return_types: HashMap::new(),
             method_return_types: HashMap::new(),
             loop_exit_labels: Vec::new(),
             loop_cond_labels: Vec::new(),
             loop_entry_try_depths: Vec::new(),
+            loop_cleanup_marks: Vec::new(),
+            closure_env_writebacks: Vec::new(),
             active_try_depth: 0,
         }
+    }
+
+    pub fn fn_abi_arity(&self, fn_name: &str) -> usize {
+        self.fn_param_defs
+            .get(fn_name)
+            .map(|p| p.len().max(6))
+            .unwrap_or(6)
+    }
+
+    pub fn method_abi_arity(&self, cls: &str, method: &str) -> usize {
+        self.method_param_defs
+            .get(&(cls.to_string(), method.to_string()))
+            .map(|p| p.len().max(5))
+            .unwrap_or(5)
     }
 
     /// Structurally resolves a declared field `(field_name, field_idx, optional_type_hint)` on `cls`
@@ -793,8 +827,12 @@ pub struct CodeGenerator<'a> {
     active_ai_ctx: RefCell<Option<ActiveFnAiContext>>,
     drilled_spines: Vec<String>,
     user_functions: Option<HashSet<String>>,
+    foreign_symbols: HashSet<String>,
     verified_annotated_classes: RefCell<HashSet<String>>,
     pending_semantic_errors: RefCell<Vec<String>>,
+    lifted_closures_ir: RefCell<String>,
+    vdispatch_emitted: RefCell<HashMap<String, String>>,
+    closure_counter: std::cell::Cell<usize>,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -809,13 +847,29 @@ impl<'a> CodeGenerator<'a> {
             active_ai_ctx: RefCell::new(None),
             drilled_spines: Vec::new(),
             user_functions: None,
+            foreign_symbols: HashSet::new(),
             verified_annotated_classes: RefCell::new(HashSet::new()),
             pending_semantic_errors: RefCell::new(Vec::new()),
+            lifted_closures_ir: RefCell::new(String::new()),
+            vdispatch_emitted: RefCell::new(HashMap::new()),
+            closure_counter: std::cell::Cell::new(0),
         }
+    }
+
+    fn is_user_fn(&self, fn_name: &str) -> bool {
+        self.user_functions
+            .as_ref()
+            .map(|set| set.contains(fn_name))
+            .unwrap_or(true)
     }
 
     pub fn with_user_functions(mut self, user_fns: HashSet<String>) -> Self {
         self.user_functions = Some(user_fns);
+        self
+    }
+
+    pub fn with_foreign_symbols(mut self, syms: HashSet<String>) -> Self {
+        self.foreign_symbols = syms;
         self
     }
 
@@ -994,6 +1048,852 @@ impl<'a> CodeGenerator<'a> {
         TypedValue { reg: raw_reg, ty: IrType::I64 }
     }
 
+    /// Evaluates positional & keyword call-site arguments into raw `i64` ABI registers, expanding
+    /// declared parameter default expressions at the call site and supporting arbitrary arities.
+    fn eval_call_args_with_defaults(
+        &self,
+        raw_args: &[String],
+        param_defs_opt: Option<&Vec<omni_parser::ParamDef>>,
+        min_abi_slots: usize,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> Vec<String> {
+        if let Some(pdefs) = param_defs_opt {
+            let target_slots = pdefs.len().max(min_abi_slots);
+            let alloc_slots = target_slots.max(raw_args.len());
+            let mut slot_exprs: Vec<Option<String>> = vec![None; alloc_slots];
+            let mut next_pos = 0usize;
+
+            for a in raw_args {
+                let trimmed_a = a.trim();
+                let mut matched_kw_idx = None;
+                let mut kw_rhs = "";
+                if !trimmed_a.starts_with('"') && !trimmed_a.starts_with('\'') {
+                    if let Some((lhs, rhs)) = trimmed_a.split_once('=') {
+                        let lhs_t = lhs.trim();
+                        if !rhs.starts_with('=')
+                            && !lhs_t.is_empty()
+                            && !lhs_t.ends_with('!')
+                            && !lhs_t.ends_with('<')
+                            && !lhs_t.ends_with('>')
+                            && lhs_t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            if let Some(p_idx) = pdefs.iter().position(|p| p.name == lhs_t) {
+                                matched_kw_idx = Some(p_idx);
+                                kw_rhs = rhs.trim();
+                            }
+                        }
+                    }
+                }
+
+                if let Some(p_idx) = matched_kw_idx {
+                    if p_idx < slot_exprs.len() {
+                        slot_exprs[p_idx] = Some(kw_rhs.to_string());
+                    }
+                } else {
+                    while next_pos < slot_exprs.len() && slot_exprs[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    let clean = Self::strip_kwarg_prefix(trimmed_a);
+                    if next_pos < slot_exprs.len() {
+                        slot_exprs[next_pos] = Some(clean.to_string());
+                        next_pos += 1;
+                    }
+                }
+            }
+
+            let param_expects_f64 = |idx: usize| -> bool {
+                pdefs.get(idx).map(|p| {
+                    if let Some(ref th) = p.type_hint {
+                        let c = th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim();
+                        is_float_type_hint(c)
+                    } else if let Some(ref dv) = p.default_val {
+                        Self::parse_default_i64(&p.default_val).is_none() && parse_polyglot_f64(dv.trim()).is_some()
+                    } else {
+                        false
+                    }
+                }).unwrap_or(false)
+            };
+            let mut out = Vec::with_capacity(target_slots);
+            for idx in 0..target_slots {
+                if let Some(ref expr_s) = slot_exprs[idx] {
+                    let mut tv = self.eval_typed(expr_s, ir, scope_tree, string_constants, temp_counter);
+                    if param_expects_f64(idx) && tv.ty != IrType::F64 {
+                        let fv = self.coerce_to_f64(tv, ir, temp_counter);
+                        tv = TypedValue { reg: fv, ty: IrType::F64 };
+                    }
+                    out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
+                } else if let Some(def_s) = pdefs.get(idx).and_then(|p| p.default_val.as_ref()) {
+                    let mut tv = self.eval_typed(def_s.trim(), ir, scope_tree, string_constants, temp_counter);
+                    if param_expects_f64(idx) && tv.ty != IrType::F64 {
+                        let fv = self.coerce_to_f64(tv, ir, temp_counter);
+                        tv = TypedValue { reg: fv, ty: IrType::F64 };
+                    }
+                    out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
+                } else {
+                    out.push("-581005069656919554".to_string());
+                }
+            }
+            out
+        } else {
+            let mut out = Vec::with_capacity(raw_args.len().max(min_abi_slots));
+            for a in raw_args {
+                let clean = Self::strip_kwarg_prefix(a.trim());
+                let tv = self.eval_typed(clean, ir, scope_tree, string_constants, temp_counter);
+                out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
+            }
+            while out.len() < min_abi_slots {
+                out.push("0".to_string());
+            }
+            out
+        }
+    }
+
+    fn emit_checked_int_div_rem(
+        &self,
+        op: &str,
+        left_val: &str,
+        right_val: &str,
+        ir: &mut String,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> TypedValue {
+        let op_name = if op == "%" { "srem" } else { "sdiv" };
+        if self.target_triple.starts_with("thumb") {
+            let is_zero = format!("%div_zero_{}", *temp_counter);
+            let safe_div = format!("%safe_div_{}", *temp_counter);
+            let res_var = format!("%t_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
+            ir.push_str(&format!("  {} = select i1 {}, i64 1, i64 {}\n", safe_div, is_zero, right_val));
+            ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, safe_div));
+            return TypedValue { reg: res_var, ty: IrType::I64 };
+        }
+
+        let id = *temp_counter;
+        *temp_counter += 1;
+        let is_zero = format!("%div_zero_{}", id);
+        let throw_lbl = format!("div_throw_{}", id);
+        let ok_lbl = format!("div_ok_{}", id);
+        let res_var = format!("%div_res_{}", id);
+
+        ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
+        ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", is_zero, throw_lbl, ok_lbl));
+
+        ir.push_str(&format!("{}:\n", throw_lbl));
+        let ty_ptr = if let Some((cn, clen)) = Self::find_string_constant(string_constants, "ZeroDivisionError") {
+            let p = format!("%zde_ty_{}", id);
+            ir.push_str(&format!(
+                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                p, clen, clen, cn
+            ));
+            p
+        } else {
+            "null".to_string()
+        };
+        let msg_ptr = if let Some((cn, clen)) = Self::find_string_constant(string_constants, "division by zero") {
+            let p = format!("%zde_msg_{}", id);
+            ir.push_str(&format!(
+                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                p, clen, clen, cn
+            ));
+            p
+        } else {
+            "null".to_string()
+        };
+        ir.push_str(&format!("  call void @__omni_throw(i64 1, i8* {}, i8* {})\n", ty_ptr, msg_ptr));
+        ir.push_str("  unreachable\n\n");
+
+        ir.push_str(&format!("{}:\n", ok_lbl));
+        ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, right_val));
+        TypedValue { reg: res_var, ty: IrType::I64 }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_method_dispatch(
+        &self,
+        static_receiver_cls: Option<&str>,
+        def_cls: &str,
+        method: &str,
+        raw_inst: &str,
+        raw_args: &[String],
+        allow_virtual: bool,
+        ir: &mut String,
+        scope_tree: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> TypedValue {
+        let m_arity = scope_tree.method_abi_arity(def_cls, method);
+        let pdefs_opt = scope_tree
+            .method_param_defs
+            .get(&(def_cls.to_string(), method.to_string()));
+        let mut arg_regs = self.eval_call_args_with_defaults(
+            raw_args,
+            pdefs_opt,
+            m_arity,
+            ir,
+            scope_tree,
+            string_constants,
+            temp_counter,
+        );
+        arg_regs.truncate(m_arity);
+        let fmt_args = arg_regs
+            .iter()
+            .map(|r| format!("i64 {}", r))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let is_ctor_or_ctx = matches!(method, "__init__" | "new" | "default" | "__enter__" | "__exit__");
+        let base_ret = scope_tree
+            .method_return_types
+            .get(&(def_cls.to_string(), method.to_string()))
+            .cloned();
+
+        let mut poly_cases: Vec<(u64, String, Option<IrType>)> = Vec::new();
+        let mut distinct_defs: HashSet<String> = HashSet::new();
+        let is_numeric_ir = |r: &Option<IrType>| matches!(r, None | Some(IrType::I64 | IrType::I32 | IrType::F64));
+        let mut any_f64_arm = matches!(base_ret, Some(IrType::F64));
+        if allow_virtual && !is_ctor_or_ctx && scope_tree.class_type_ids.len() >= 2 {
+            let mut sorted_cls: Vec<(&String, &u64)> = scope_tree.class_type_ids.iter().collect();
+            sorted_cls.sort_by_key(|(_, tid)| **tid);
+            for (cname, &tid) in sorted_cls {
+                if let Some(impl_def) = scope_tree
+                    .method_defining_class
+                    .get(&(cname.clone(), method.to_string()))
+                {
+                    if scope_tree.method_abi_arity(impl_def, method) == m_arity {
+                        let impl_ret = scope_tree
+                            .method_return_types
+                            .get(&(impl_def.clone(), method.to_string()))
+                            .cloned();
+                        if static_receiver_cls.is_none()
+                            || impl_ret == base_ret
+                            || (is_numeric_ir(&impl_ret) && is_numeric_ir(&base_ret))
+                        {
+                            if matches!(impl_ret, Some(IrType::F64)) {
+                                any_f64_arm = true;
+                            }
+                            distinct_defs.insert(impl_def.clone());
+                            poly_cases.push((tid, impl_def.clone(), impl_ret));
+                        }
+                    }
+                }
+            }
+        }
+
+        let eff_ret = if distinct_defs.len() >= 2 && any_f64_arm {
+            Some(IrType::F64)
+        } else {
+            base_ret.clone()
+        };
+
+        let target_sym = if distinct_defs.len() >= 2 {
+            let f64_tag = if matches!(eff_ret, Some(IrType::F64)) { "_f64" } else { "" };
+            let vd_sym = format!("__omni_vdispatch_{}_{}_{}{}", def_cls, method, m_arity, f64_tag);
+            if !self.vdispatch_emitted.borrow().contains_key(&vd_sym) {
+                let param_sig = (0..m_arity)
+                    .map(|i| format!("i64 %a{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let fwd_args = (0..m_arity)
+                    .map(|i| format!("i64 %a{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut vd_ir = format!(
+                    "define i64 @{}(i8* %self_raw, {}) {{\nentry:\n  %tid = call i64 @__omni_obj_get_type(i8* %self_raw)\n  switch i64 %tid, label %vd_default [\n",
+                    vd_sym, param_sig
+                );
+                for (tid, _, _) in &poly_cases {
+                    vd_ir.push_str(&format!("    i64 {}, label %vd_case_{}\n", tid, tid));
+                }
+                vd_ir.push_str("  ]\n");
+                for (tid, impl_def, impl_ret) in &poly_cases {
+                    if matches!(eff_ret, Some(IrType::F64)) && !matches!(impl_ret, Some(IrType::F64)) {
+                        vd_ir.push_str(&format!(
+                            "vd_case_{0}:\n  %r_{0} = call i64 @__omni_method_{1}_{2}(i8* %self_raw, {3})\n  %rf_{0} = sitofp i64 %r_{0} to double\n  %rb_{0} = bitcast double %rf_{0} to i64\n  ret i64 %rb_{0}\n",
+                            tid, impl_def, method, fwd_args
+                        ));
+                    } else {
+                        vd_ir.push_str(&format!(
+                            "vd_case_{0}:\n  %r_{0} = call i64 @__omni_method_{1}_{2}(i8* %self_raw, {3})\n  ret i64 %r_{0}\n",
+                            tid, impl_def, method, fwd_args
+                        ));
+                    }
+                }
+                if matches!(eff_ret, Some(IrType::F64)) && !matches!(base_ret, Some(IrType::F64)) {
+                    vd_ir.push_str(&format!(
+                        "vd_default:\n  %r_def = call i64 @__omni_method_{0}_{1}(i8* %self_raw, {2})\n  %rf_def = sitofp i64 %r_def to double\n  %rb_def = bitcast double %rf_def to i64\n  ret i64 %rb_def\n}}\n\n",
+                        def_cls, method, fwd_args
+                    ));
+                } else {
+                    vd_ir.push_str(&format!(
+                        "vd_default:\n  %r_def = call i64 @__omni_method_{}_{}(i8* %self_raw, {})\n  ret i64 %r_def\n}}\n\n",
+                        def_cls, method, fwd_args
+                    ));
+                }
+                self.vdispatch_emitted.borrow_mut().insert(vd_sym.clone(), vd_ir);
+            }
+            vd_sym
+        } else {
+            format!("__omni_method_{}_{}", def_cls, method)
+        };
+
+        let ret_reg = format!("%method_ret_{}", *temp_counter);
+        *temp_counter += 1;
+        ir.push_str(&format!(
+            "  {} = call i64 @{}(i8* {}, {})\n",
+            ret_reg, target_sym, raw_inst, fmt_args
+        ));
+        let mret = eff_ret
+            .or_else(|| scope_tree.infer_structural_method_return_type(def_cls, method, raw_args.len()));
+        Self::apply_return_ir_type(ret_reg, mret.as_ref(), ir, temp_counter)
+    }
+
+    fn extract_ident_tokens(text: &str, out: &mut HashSet<String>) {
+        let mut cur = String::new();
+        let mut in_quote: Option<char> = None;
+        let mut escaped = false;
+        for ch in text.chars() {
+            if let Some(q) = in_quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                if !cur.is_empty() {
+                    if !cur.chars().next().unwrap().is_ascii_digit() {
+                        out.insert(cur.clone());
+                    }
+                    cur.clear();
+                }
+                in_quote = Some(ch);
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                cur.push(ch);
+            } else if !cur.is_empty() {
+                if !cur.chars().next().unwrap().is_ascii_digit() {
+                    out.insert(cur.clone());
+                }
+                cur.clear();
+            }
+        }
+        if !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
+            out.insert(cur);
+        }
+    }
+
+    fn collect_referenced_idents(stmts: &[Statement], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Statement::Assign { target, expr, .. } => {
+                    Self::extract_ident_tokens(target, out);
+                    Self::extract_ident_tokens(expr, out);
+                }
+                Statement::TupleUnpack { expr, .. }
+                | Statement::Print { expr }
+                | Statement::ListAppend { expr, .. }
+                | Statement::ChanSend { expr, .. } => {
+                    Self::extract_ident_tokens(expr, out);
+                }
+                Statement::Return { expr: Some(e) } => {
+                    Self::extract_ident_tokens(e, out);
+                }
+                Statement::ListInit { elements, .. } => {
+                    for el in elements {
+                        Self::extract_ident_tokens(el, out);
+                    }
+                }
+                Statement::MapInit { entries, .. } => {
+                    for (k, v) in entries {
+                        Self::extract_ident_tokens(k, out);
+                        Self::extract_ident_tokens(v, out);
+                    }
+                }
+                Statement::IndexSet { target, index_expr, val_expr } => {
+                    Self::extract_ident_tokens(target, out);
+                    Self::extract_ident_tokens(index_expr, out);
+                    Self::extract_ident_tokens(val_expr, out);
+                }
+                Statement::If { condition, then_branch, else_branch } => {
+                    Self::extract_ident_tokens(condition, out);
+                    Self::collect_referenced_idents(then_branch, out);
+                    if let Some(eb) = else_branch {
+                        Self::collect_referenced_idents(eb, out);
+                    }
+                }
+                Statement::WhileLoop { condition, body } => {
+                    Self::extract_ident_tokens(condition, out);
+                    Self::collect_referenced_idents(body, out);
+                }
+                Statement::ForLoop { count, body, .. } => {
+                    Self::extract_ident_tokens(count, out);
+                    Self::collect_referenced_idents(body, out);
+                }
+                Statement::WithContext { context_expr, body, .. } => {
+                    Self::extract_ident_tokens(context_expr, out);
+                    Self::collect_referenced_idents(body, out);
+                }
+                Statement::Match { target, arms } => {
+                    Self::extract_ident_tokens(target, out);
+                    for arm in arms {
+                        Self::collect_referenced_idents(&arm.body, out);
+                    }
+                }
+                Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                    Self::collect_referenced_idents(try_block, out);
+                    for c in catch_clauses {
+                        Self::collect_referenced_idents(&c.body, out);
+                    }
+                    if let Some(fb) = finally_block {
+                        Self::collect_referenced_idents(fb, out);
+                    }
+                }
+                Statement::LocalFnDef { func } => {
+                    Self::collect_referenced_idents(&func.body, out);
+                }
+                Statement::Concrete { code, .. } => {
+                    Self::extract_ident_tokens(code, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Lambda-lifts a local function or inline closure expression into `@__omni_closure_body_<id>`
+    /// and emits a heap-allocated `OmniClosure` (`{ magic, rc, flags, fn_ptr, env_ptr }`) at the
+    /// current program point so lexical captures survive outer-frame return without a tracing GC.
+    fn lower_closure_def(
+        &self,
+        func: &omni_parser::FunctionDef,
+        ir: &mut String,
+        outer_scope: &ScopeTree,
+        string_constants: &[(String, String, usize)],
+        temp_counter: &mut usize,
+    ) -> String {
+        let cid = self.closure_counter.get();
+        self.closure_counter.set(cid + 1);
+        let clos_sym = format!("__omni_closure_body_{}", cid);
+
+        let mut ref_idents = HashSet::new();
+        Self::collect_referenced_idents(&func.body, &mut ref_idents);
+        for p in &func.params {
+            if let Some(ref dv) = p.default_val {
+                Self::extract_ident_tokens(dv, &mut ref_idents);
+            }
+        }
+        let param_names: HashSet<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
+        let mut captures: Vec<SymbolBinding> = outer_scope
+            .active_bindings()
+            .into_iter()
+            .filter(|b| {
+                b.name != func.name
+                    && !param_names.contains(b.name.as_str())
+                    && ref_idents.contains(&b.name)
+            })
+            .collect();
+        captures.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let u_arity = func.params.len().max(6);
+        let param_sig = (0..u_arity)
+            .map(|i| format!("i64 %arg{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let param_types_sig = vec!["i64"; u_arity].join(", ");
+
+        let mut clos_ir = if captures.is_empty() {
+            format!("define i64 @{}({}) {{\nentry:\n", clos_sym, param_sig)
+        } else {
+            format!("define i64 @{}(i64 %env_raw, {}) {{\nentry:\n", clos_sym, param_sig)
+        };
+
+        let mut inner_scope = ScopeTree::new();
+        inner_scope.class_fields = outer_scope.class_fields.clone();
+        inner_scope.class_field_types = outer_scope.class_field_types.clone();
+        inner_scope.class_field_order = outer_scope.class_field_order.clone();
+        inner_scope.class_decorators = outer_scope.class_decorators.clone();
+        inner_scope.class_type_ids = outer_scope.class_type_ids.clone();
+        inner_scope.c_module_aliases = outer_scope.c_module_aliases.clone();
+        inner_scope.valid_extmod_prefixes = outer_scope.valid_extmod_prefixes.clone();
+        inner_scope.has_open_ns_import = outer_scope.has_open_ns_import;
+        inner_scope.enum_variants = outer_scope.enum_variants.clone();
+        inner_scope.known_functions = outer_scope.known_functions.clone();
+        inner_scope.fn_param_defs = outer_scope.fn_param_defs.clone();
+        inner_scope.method_param_defs = outer_scope.method_param_defs.clone();
+        inner_scope.method_defining_class = outer_scope.method_defining_class.clone();
+        inner_scope.fn_return_types = outer_scope.fn_return_types.clone();
+        inner_scope.fn_return_ptr_kinds = outer_scope.fn_return_ptr_kinds.clone();
+        inner_scope.fn_curried_return_types = outer_scope.fn_curried_return_types.clone();
+        inner_scope.fn_tuple_return_types = outer_scope.fn_tuple_return_types.clone();
+        inner_scope.method_return_types = outer_scope.method_return_types.clone();
+        inner_scope
+            .fn_param_defs
+            .insert(func.name.clone(), func.params.clone());
+
+        let mut inner_temp = 0usize;
+        let mut inner_lbl = 0usize;
+        let mut inner_str_idx = 0usize;
+        let mut inner_frees: Vec<CleanupOp> = Vec::new();
+        let mut inner_decls: HashSet<String> = HashSet::new();
+
+        if !captures.is_empty() {
+            clos_ir.push_str("  %env_ptr = inttoptr i64 %env_raw to i8*\n");
+            for (cap_idx, cap_b) in captures.iter().enumerate() {
+                let raw_r = format!("%cap_raw_{}_{}", cap_idx, inner_temp);
+                inner_temp += 1;
+                clos_ir.push_str(&format!(
+                    "  {} = call i64 @__omni_slice_get(i8* %env_ptr, i64 {})\n",
+                    raw_r, cap_idx
+                ));
+                if cap_b.type_hint == "double" {
+                    let fv = format!("%cap_f64_{}", inner_temp);
+                    let slot = format!("%cap_slot_{}_{}", cap_b.name, inner_temp);
+                    inner_temp += 1;
+                    clos_ir.push_str(&format!(
+                        "  {} = bitcast i64 {} to double\n  {} = alloca double\n  store double {}, double* {}\n",
+                        fv, raw_r, slot, fv, slot
+                    ));
+                    inner_scope
+                        .closure_env_writebacks
+                        .push((cap_idx, slot.clone(), "double".to_string()));
+                    inner_scope.insert(
+                        cap_b.name.clone(),
+                        SymbolBinding {
+                            name: cap_b.name.clone(),
+                            llvm_ptr: slot,
+                            type_hint: "double".to_string(),
+                            is_scoped: true,
+                        },
+                    );
+                } else if cap_b.type_hint.starts_with("%struct.") {
+                    let cls = cap_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                    let sp = format!("%cap_sp_{}", inner_temp);
+                    let slot = format!("%cap_slot_{}_{}", cap_b.name, inner_temp);
+                    inner_temp += 1;
+                    clos_ir.push_str(&format!(
+                        "  {} = inttoptr i64 {} to %struct.{}*\n  {} = alloca %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                        sp, raw_r, cls, slot, cls, cls, sp, cls, slot
+                    ));
+                    inner_scope.insert(
+                        cap_b.name.clone(),
+                        SymbolBinding {
+                            name: cap_b.name.clone(),
+                            llvm_ptr: slot,
+                            type_hint: cap_b.type_hint.clone(),
+                            is_scoped: true,
+                        },
+                    );
+                } else if cap_b.type_hint.starts_with("%enum.") {
+                    let en = cap_b.type_hint.trim_start_matches("%enum.").trim_end_matches('*');
+                    let ep = format!("%cap_ep_{}", inner_temp);
+                    let slot = format!("%cap_slot_{}_{}", cap_b.name, inner_temp);
+                    inner_temp += 1;
+                    clos_ir.push_str(&format!(
+                        "  {} = inttoptr i64 {} to %enum.{}*\n  {} = alloca %enum.{}*\n  store %enum.{}* {}, %enum.{}** {}\n",
+                        ep, raw_r, en, slot, en, en, ep, en, slot
+                    ));
+                    inner_scope.insert(
+                        cap_b.name.clone(),
+                        SymbolBinding {
+                            name: cap_b.name.clone(),
+                            llvm_ptr: slot,
+                            type_hint: cap_b.type_hint.clone(),
+                            is_scoped: true,
+                        },
+                    );
+                } else if cap_b.type_hint.starts_with("i8*") {
+                    let pp = format!("%cap_ptr_{}", inner_temp);
+                    let slot = format!("%cap_slot_{}_{}", cap_b.name, inner_temp);
+                    inner_temp += 1;
+                    clos_ir.push_str(&format!(
+                        "  {} = inttoptr i64 {} to i8*\n  {} = alloca i8*\n  store i8* {}, i8** {}\n",
+                        pp, raw_r, slot, pp, slot
+                    ));
+                    if let Some(et) = outer_scope.collection_elem_types.get(&cap_b.name) {
+                        inner_scope.collection_elem_types.insert(cap_b.name.clone(), et.clone());
+                    }
+                    inner_scope.insert(
+                        cap_b.name.clone(),
+                        SymbolBinding {
+                            name: cap_b.name.clone(),
+                            llvm_ptr: slot,
+                            type_hint: cap_b.type_hint.clone(),
+                            is_scoped: true,
+                        },
+                    );
+                } else {
+                    let slot = format!("%cap_slot_{}_{}", cap_b.name, inner_temp);
+                    inner_temp += 1;
+                    clos_ir.push_str(&format!(
+                        "  {} = alloca i64\n  store i64 {}, i64* {}\n",
+                        slot, raw_r, slot
+                    ));
+                    inner_scope
+                        .closure_env_writebacks
+                        .push((cap_idx, slot.clone(), "i64".to_string()));
+                    inner_scope.insert(
+                        cap_b.name.clone(),
+                        SymbolBinding {
+                            name: cap_b.name.clone(),
+                            llvm_ptr: slot,
+                            type_hint: "i64".to_string(),
+                            is_scoped: true,
+                        },
+                    );
+                }
+            }
+        }
+
+        if ref_idents.contains(&func.name) && !func.name.starts_with("__lambda_") {
+            let self_slot = format!("%clos_self_slot_{}", inner_temp);
+            let self_fn_i8 = format!("%clos_self_fn_{}", inner_temp);
+            inner_temp += 1;
+            clos_ir.push_str(&format!("  {} = alloca i8*\n", self_slot));
+            if captures.is_empty() {
+                clos_ir.push_str(&format!(
+                    "  {} = bitcast i64 ({})* @{} to i8*\n  store i8* {}, i8** {}\n",
+                    self_fn_i8, param_types_sig, clos_sym, self_fn_i8, self_slot
+                ));
+            } else {
+                let self_cl = format!("%clos_self_obj_{}", inner_temp);
+                inner_temp += 1;
+                clos_ir.push_str(&format!(
+                    "  {} = bitcast i64 (i64, {})* @{} to i8*\n  {} = call i8* @__omni_closure_create(i8* {}, i8* %env_ptr)\n  store i8* {}, i8** {}\n",
+                    self_fn_i8, param_types_sig, clos_sym, self_cl, self_fn_i8, self_cl, self_slot
+                ));
+                inner_frees.push(CleanupOp::ReleaseRc(self_slot.clone()));
+            }
+            inner_scope.insert(
+                func.name.clone(),
+                SymbolBinding {
+                    name: func.name.clone(),
+                    llvm_ptr: self_slot,
+                    type_hint: "i8* (omni_fn)".to_string(),
+                    is_scoped: true,
+                },
+            );
+        }
+
+        for (i, param) in func.params.iter().enumerate() {
+            let arg_src = format!("%arg{}", i);
+            Self::bind_abi_param_i64(
+                &mut clos_ir,
+                &mut inner_scope,
+                &mut inner_temp,
+                param,
+                &arg_src,
+                &outer_scope.class_fields,
+                string_constants,
+            );
+        }
+
+        let prev_ctx = self.active_ai_ctx.borrow().clone();
+        let (s_defs, ai_temp, eco_opt, imp_vec) = if let Some(ref c) = prev_ctx {
+            (c.struct_defs.clone(), c.temp, c.ecosystem_context.clone(), c.import_chain.clone())
+        } else {
+            (Vec::new(), 0.1f32, None, Vec::new())
+        };
+        *self.active_ai_ctx.borrow_mut() = Some(ActiveFnAiContext {
+            enclosing_fn: clos_sym.clone(),
+            return_type: "i64".to_string(),
+            struct_defs: s_defs.clone(),
+            temp: ai_temp,
+            ecosystem_context: eco_opt.clone(),
+            import_chain: imp_vec.clone(),
+            dynamic_declarations: HashSet::new(),
+            escalation_depth: 0,
+        });
+
+        let lower_res = self.lower_statements(
+            &func.body,
+            &mut clos_ir,
+            &mut inner_scope,
+            &mut inner_frees,
+            string_constants,
+            &mut inner_str_idx,
+            &mut inner_lbl,
+            &mut inner_temp,
+            &clos_sym,
+            &s_defs,
+            ai_temp,
+            eco_opt.as_deref(),
+            &imp_vec,
+            &mut inner_decls,
+            true,
+        );
+
+        let sub_ctx_decls = self
+            .active_ai_ctx
+            .borrow_mut()
+            .take()
+            .map(|c| c.dynamic_declarations)
+            .unwrap_or_default();
+        *self.active_ai_ctx.borrow_mut() = prev_ctx;
+        if let Some(parent_ctx) = self.active_ai_ctx.borrow_mut().as_mut() {
+            parent_ctx.dynamic_declarations.extend(inner_decls);
+            parent_ctx.dynamic_declarations.extend(sub_ctx_decls);
+        }
+
+        match lower_res {
+            Ok(custom_ret) => {
+                if !custom_ret {
+                    Self::emit_closure_writebacks(&mut clos_ir, &inner_scope.closure_env_writebacks, &mut inner_temp);
+                    Self::emit_cleanups(&mut clos_ir, &inner_frees, &mut inner_temp, "Closure Exit");
+                    clos_ir.push_str("  ret i64 0\n");
+                }
+                clos_ir.push_str("}\n\n");
+                let hoisted = Self::hoist_allocas(&clos_ir);
+                self.lifted_closures_ir.borrow_mut().push_str(&hoisted);
+                self.lifted_closures_ir.borrow_mut().push('\n');
+            }
+            Err(e) => {
+                self.pending_semantic_errors.borrow_mut().push(e.to_string());
+                let fallback_hdr = if captures.is_empty() {
+                    format!("define i64 @{}({}) {{\nentry:\n  ret i64 0\n}}\n\n", clos_sym, param_sig)
+                } else {
+                    format!("define i64 @{}(i64 %env_raw, {}) {{\nentry:\n  ret i64 0\n}}\n\n", clos_sym, param_sig)
+                };
+                self.lifted_closures_ir.borrow_mut().push_str(&fallback_hdr);
+            }
+        }
+
+        // Emit closure allocation at definition/expression site in `ir`
+        let fn_i8 = format!("%clos_fn_i8_{}", *temp_counter);
+        let clos_obj = format!("%clos_obj_{}", *temp_counter);
+        *temp_counter += 1;
+
+        if captures.is_empty() {
+            ir.push_str(&format!(
+                "  {} = bitcast i64 ({})* @{} to i8*\n  {} = call i8* @__omni_closure_create(i8* {}, i8* null)\n",
+                fn_i8, param_types_sig, clos_sym, clos_obj, fn_i8
+            ));
+        } else {
+            let env_sl = format!("%clos_env_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = call i8* @__omni_slice_create(i64 {})\n",
+                env_sl,
+                captures.len().max(2)
+            ));
+            let mut ptr_mask: u64 = 0;
+            for (cap_idx, cap_b) in captures.iter().enumerate() {
+                let cap_bits = if cap_b.type_hint == "double" {
+                    let ld = format!("%cap_pack_f_{}", *temp_counter);
+                    let bc = format!("%cap_pack_fb_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = load double, double* {}\n  {} = bitcast double {} to i64\n",
+                        ld, cap_b.llvm_ptr, bc, ld
+                    ));
+                    bc
+                } else if cap_b.type_hint.starts_with("%struct.") {
+                    let cls = cap_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                    let ld = format!("%cap_pack_s_{}", *temp_counter);
+                    let r8 = format!("%cap_pack_s8_{}", *temp_counter);
+                    let ret8 = format!("%cap_pack_sr_{}", *temp_counter);
+                    let p2i = format!("%cap_pack_si_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = load %struct.{}*, %struct.{}** {}\n  {} = bitcast %struct.{}* {} to i8*\n  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = ptrtoint i8* {} to i64\n",
+                        ld, cls, cls, cap_b.llvm_ptr, r8, cls, ld, ret8, r8, p2i, ret8
+                    ));
+                    if cap_idx < 32 {
+                        ptr_mask |= 1u64 << cap_idx;
+                    }
+                    p2i
+                } else if cap_b.type_hint.starts_with("%enum.") {
+                    let en = cap_b.type_hint.trim_start_matches("%enum.").trim_end_matches('*');
+                    let ld = format!("%cap_pack_e_{}", *temp_counter);
+                    let r8 = format!("%cap_pack_e8_{}", *temp_counter);
+                    let ret8 = format!("%cap_pack_er_{}", *temp_counter);
+                    let p2i = format!("%cap_pack_ei_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = load %enum.{}*, %enum.{}** {}\n  {} = bitcast %enum.{}* {} to i8*\n  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = ptrtoint i8* {} to i64\n",
+                        ld, en, en, cap_b.llvm_ptr, r8, en, ld, ret8, r8, p2i, ret8
+                    ));
+                    if cap_idx < 32 {
+                        ptr_mask |= 1u64 << cap_idx;
+                    }
+                    p2i
+                } else if cap_b.type_hint.starts_with("i8*") {
+                    let ld = format!("%cap_pack_p_{}", *temp_counter);
+                    let ret8 = format!("%cap_pack_pr_{}", *temp_counter);
+                    let p2i = format!("%cap_pack_pi_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = load i8*, i8** {}\n  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = ptrtoint i8* {} to i64\n",
+                        ld, cap_b.llvm_ptr, ret8, ld, p2i, ret8
+                    ));
+                    if cap_idx < 32 {
+                        ptr_mask |= 1u64 << cap_idx;
+                    }
+                    p2i
+                } else if cap_b.type_hint == "i64" {
+                    let ld = format!("%cap_pack_i_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load i64, i64* {}\n", ld, cap_b.llvm_ptr));
+                    ld
+                } else {
+                    let ld32 = format!("%cap_pack_i32_{}", *temp_counter);
+                    let sx = format!("%cap_pack_sx_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = load i32, i32* {}\n  {} = sext i32 {} to i64\n",
+                        ld32, cap_b.llvm_ptr, sx, ld32
+                    ));
+                    sx
+                };
+                ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", env_sl, cap_bits));
+            }
+            ir.push_str(&format!(
+                "  {} = bitcast i64 (i64, {})* @{} to i8*\n  {} = call i8* @__omni_closure_create(i8* {}, i8* {})\n",
+                fn_i8, param_types_sig, clos_sym, clos_obj, fn_i8, env_sl
+            ));
+            if ptr_mask != 0 {
+                ir.push_str(&format!(
+                    "  call void @__omni_closure_set_env_rc_mask(i8* {}, i64 {})\n",
+                    clos_obj, ptr_mask as i64
+                ));
+            }
+            ir.push_str(&format!("  call void @__omni_slice_destroy(i8* {})\n", env_sl));
+        }
+
+        clos_obj
+    }
+
+    fn emit_closure_writebacks(
+        ir: &mut String,
+        writebacks: &[(usize, String, String)],
+        temp_counter: &mut usize,
+    ) {
+        for (idx, slot_ptr, th) in writebacks {
+            if th == "double" {
+                let lf = format!("%wb_f_{}", *temp_counter);
+                let bc = format!("%wb_fb_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = load double, double* {}\n  {} = bitcast double {} to i64\n  call void @__omni_slice_set(i8* %env_ptr, i64 {}, i64 {})\n",
+                    lf, slot_ptr, bc, lf, idx, bc
+                ));
+            } else {
+                let li = format!("%wb_i_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = load i64, i64* {}\n  call void @__omni_slice_set(i8* %env_ptr, i64 {}, i64 {})\n",
+                    li, slot_ptr, idx, li
+                ));
+            }
+        }
+    }
+
     /// Universal structural aggregate initialization for heap/stack `%struct.<cls_name>*` allocations:
     /// zero-initializes all declared field slots, applies field default expressions, dispatches to an
     /// explicit constructor method if one exists in source, or directly populates declared GEP slots
@@ -1010,6 +1910,9 @@ impl<'a> CodeGenerator<'a> {
         string_constants: &[(String, String, usize)],
         temp_counter: &mut usize,
     ) {
+        if let Some(&tid) = scope_tree.class_type_ids.get(cls_name) {
+            ir.push_str(&format!("  call void @__omni_obj_set_type(i8* {}, i64 {})\n", raw_inst, tid));
+        }
         let field_count = scope_tree
             .class_fields
             .get(cls_name)
@@ -1044,6 +1947,40 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  store i64 {}, i64* {}\n", dbits, dgep));
                 }
             }
+        }
+
+        let has_explicit_ctor = scope_tree
+            .method_defining_class
+            .contains_key(&(cls_name.to_string(), assoc_ctor_method.to_string()));
+
+        if has_explicit_ctor {
+            let def_cls = scope_tree.resolve_defining_class(cls_name, assoc_ctor_method);
+            let m_arity = scope_tree.method_abi_arity(&def_cls, assoc_ctor_method);
+            let pdefs_opt = scope_tree
+                .method_param_defs
+                .get(&(def_cls.clone(), assoc_ctor_method.to_string()));
+            let mut arg_regs = self.eval_call_args_with_defaults(
+                raw_args,
+                pdefs_opt,
+                m_arity,
+                ir,
+                scope_tree,
+                string_constants,
+                temp_counter,
+            );
+            arg_regs.truncate(m_arity);
+            let fmt_args = arg_regs
+                .iter()
+                .map(|r| format!("i64 {}", r))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let init_ret = format!("%init_ret_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = call i64 @__omni_method_{}_{}(i8* {}, {})\n",
+                init_ret, def_cls, assoc_ctor_method, raw_inst, fmt_args
+            ));
+            return;
         }
 
         let mut pos_vals: Vec<String> = Vec::new();
@@ -1081,34 +2018,16 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        let has_explicit_ctor = scope_tree
-            .method_defining_class
-            .contains_key(&(cls_name.to_string(), assoc_ctor_method.to_string()));
-
-        if has_explicit_ctor && (!pos_vals.is_empty() || kw_vals.is_empty()) {
-            let mut arg_regs = pos_vals.clone();
-            while arg_regs.len() < 5 {
-                arg_regs.push("0".to_string());
-            }
-            let def_cls = scope_tree.resolve_defining_class(cls_name, assoc_ctor_method);
-            let init_ret = format!("%init_ret_{}", *temp_counter);
-            *temp_counter += 1;
-            ir.push_str(&format!(
-                "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                init_ret, def_cls, assoc_ctor_method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-            ));
-        } else {
-            for (idx, bits) in pos_vals.iter().enumerate() {
-                if let Some((fname, _, _)) = ordered_fields.get(idx) {
-                    if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fname)) {
-                        let pgep = format!("%pinit_gep_{}_{}", f_idx, *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!(
-                            "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
-                            pgep, cls_name, cls_name, inst_struct_ptr, f_idx
-                        ));
-                        ir.push_str(&format!("  store i64 {}, i64* {}\n", bits, pgep));
-                    }
+        for (idx, bits) in pos_vals.iter().enumerate() {
+            if let Some((fname, _, _)) = ordered_fields.get(idx) {
+                if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fname)) {
+                    let pgep = format!("%pinit_gep_{}_{}", f_idx, *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n",
+                        pgep, cls_name, cls_name, inst_struct_ptr, f_idx
+                    ));
+                    ir.push_str(&format!("  store i64 {}, i64* {}\n", bits, pgep));
                 }
             }
         }
@@ -1633,6 +2552,7 @@ impl<'a> CodeGenerator<'a> {
                     *temp_counter += 1;
                     ir.push_str(&format!("  ; [RAII Slice Cleanup at {}]\n", context));
                     ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  store i8* null, i8** {}\n", alloca_ptr));
                     ir.push_str(&format!("  call void @__omni_slice_destroy(i8* {})\n", loaded));
                 }
                 CleanupOp::DestroyMap(alloca_ptr) => {
@@ -1640,6 +2560,7 @@ impl<'a> CodeGenerator<'a> {
                     *temp_counter += 1;
                     ir.push_str(&format!("  ; [RAII Map Cleanup at {}]\n", context));
                     ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  store i8* null, i8** {}\n", alloca_ptr));
                     ir.push_str(&format!("  call void @__omni_map_destroy(i8* {})\n", loaded));
                 }
                 CleanupOp::DestroyChan(alloca_ptr) => {
@@ -1647,7 +2568,26 @@ impl<'a> CodeGenerator<'a> {
                     *temp_counter += 1;
                     ir.push_str(&format!("  ; [RAII Chan Cleanup at {}]\n", context));
                     ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  store i8* null, i8** {}\n", alloca_ptr));
                     ir.push_str(&format!("  call void @__omni_chan_destroy(i8* {})\n", loaded));
+                }
+                CleanupOp::ReleaseRc(alloca_ptr) => {
+                    let loaded = format!("%clean_rc_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  ; [Perceus RC Release at {}]\n", context));
+                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, alloca_ptr));
+                    ir.push_str(&format!("  store i8* null, i8** {}\n", alloca_ptr));
+                    ir.push_str(&format!("  call void @__omni_rc_release(i8* {})\n", loaded));
+                }
+                CleanupOp::FreeHeapPtr { slot_ptr, elem_ty } => {
+                    let loaded = format!("%clean_hp_{}", *temp_counter);
+                    let raw = format!("%clean_hp_i8_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  ; [Perceus Heap Aggregate RC Release at {}]\n", context));
+                    ir.push_str(&format!("  {} = load {}, {}* {}\n", loaded, elem_ty, elem_ty, slot_ptr));
+                    ir.push_str(&format!("  store {} null, {}* {}\n", elem_ty, elem_ty, slot_ptr));
+                    ir.push_str(&format!("  {} = bitcast {} {} to i8*\n", raw, elem_ty, loaded));
+                    ir.push_str(&format!("  call void @__omni_rc_release(i8* {})\n", raw));
                 }
                 CleanupOp::PopTryFrame => {
                     ir.push_str(&format!("  ; [Unwind Try Frame Pop at {}]\n", context));
@@ -1773,7 +2713,9 @@ impl<'a> CodeGenerator<'a> {
                 }
                 Statement::MapInit { entries, .. } => {
                     for (k, v) in entries {
-                        Self::intern_string(string_constants, counter, k);
+                        if !k.starts_with("\x01int:") {
+                            Self::intern_string(string_constants, counter, k);
+                        }
                         scan_text(v, string_constants, counter);
                     }
                 }
@@ -1840,6 +2782,14 @@ impl<'a> CodeGenerator<'a> {
                         self.scan_strings_recursive(fb, string_constants, counter);
                     }
                 }
+                Statement::LocalFnDef { func } => {
+                    for p in &func.params {
+                        if let Some(ref dv) = p.default_val {
+                            scan_text(dv, string_constants, counter);
+                        }
+                    }
+                    self.scan_strings_recursive(&func.body, string_constants, counter);
+                }
                 _ => {}
             }
         }
@@ -1849,11 +2799,71 @@ impl<'a> CodeGenerator<'a> {
         omni_parser::harvest_called_symbols(stmts, set);
     }
 
+    fn find_outer_call_open_paren(trimmed: &str) -> Option<usize> {
+        if !trimmed.ends_with(')') {
+            return None;
+        }
+        let bytes = trimmed.as_bytes();
+        let mut depth = 0i32;
+        let mut in_q: u8 = 0;
+        let mut idx = bytes.len();
+        while idx > 0 {
+            idx -= 1;
+            let b = bytes[idx];
+            if in_q != 0 {
+                if b == in_q && (idx == 0 || bytes[idx - 1] != b'\\') {
+                    in_q = 0;
+                }
+                continue;
+            }
+            if b == b'"' || b == b'\'' {
+                in_q = b;
+            } else if b == b')' {
+                depth += 1;
+            } else if b == b'(' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    fn strip_str_literal_quotes(s: &str) -> Option<&str> {
+        let t = s.trim();
+        let rest = if let Some(r) = t
+            .strip_prefix("br")
+            .or_else(|| t.strip_prefix("rb"))
+            .or_else(|| t.strip_prefix("BR"))
+            .or_else(|| t.strip_prefix("RB"))
+        {
+            r
+        } else if let Some(r) = t
+            .strip_prefix('b')
+            .or_else(|| t.strip_prefix('B'))
+            .or_else(|| t.strip_prefix('r'))
+            .or_else(|| t.strip_prefix('R'))
+            .or_else(|| t.strip_prefix('u'))
+            .or_else(|| t.strip_prefix('U'))
+        {
+            r
+        } else {
+            t
+        };
+        if rest.len() >= 2
+            && ((rest.starts_with('"') && rest.ends_with('"'))
+                || (rest.starts_with('\'') && rest.ends_with('\'')))
+        {
+            Some(&rest[1..rest.len() - 1])
+        } else {
+            None
+        }
+    }
+
     pub fn is_string_expr(expr: &str, scope_tree: &ScopeTree) -> bool {
         let trimmed = expr.trim();
-        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        {
+        if Self::strip_str_literal_quotes(trimmed).is_some() {
             return true;
         }
         if trimmed.starts_with("input(") || trimmed == "input()" {
@@ -1910,11 +2920,14 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
         }
-        if let Some(lp) = trimmed.find('(') {
+        if let Some(lp) = Self::find_outer_call_open_paren(trimmed) {
             if trimmed.ends_with(')') {
                 let callee = trimmed[..lp].trim();
                 if let Some(IrType::Ptr) = scope_tree.fn_return_types.get(callee) {
-                    return true;
+                    let pk = scope_tree.fn_return_ptr_kinds.get(callee).map(|s| s.as_str());
+                    if pk.is_none() || pk == Some("i8* (string)") {
+                        return true;
+                    }
                 }
                 if let Some((rec, mname)) = callee.rsplit_once('.') {
                     let rec = rec.trim();
@@ -2012,11 +3025,8 @@ impl<'a> CodeGenerator<'a> {
     ) -> String {
         let trimmed = expr.trim();
 
-        // 1. String literal
-        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        {
-            let text = &trimmed[1..trimmed.len() - 1];
+        // 1. String / byte literal (`"..."`, `'...'`, `b'...'`, `r"..."`, etc.)
+        if let Some(text) = Self::strip_str_literal_quotes(trimmed) {
             if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
                 let str_ptr = format!("%str_lit_eval_{}", *temp_counter);
                 *temp_counter += 1;
@@ -2084,6 +3094,74 @@ impl<'a> CodeGenerator<'a> {
         }
         if let Some(inner) = trimmed.strip_prefix("[]byte(").and_then(|s| s.strip_suffix(')')) {
             return self.eval_str_ptr(inner.trim(), ir, scope_tree, string_constants, temp_counter);
+        }
+        if trimmed.starts_with("bytes(")
+            && Self::find_outer_call_open_paren(trimmed) == Some(5)
+            && !scope_tree.known_functions.contains("bytes")
+        {
+            let inner_t = trimmed[6..trimmed.len() - 1].trim();
+            if inner_t.is_empty() {
+                if let Some((cn, clen)) = Self::find_string_constant(string_constants, "") {
+                    let empty_b = format!("%bytes_empty_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                        empty_b, clen, clen, cn
+                    ));
+                    return empty_b;
+                }
+                return "null".to_string();
+            }
+            if Self::is_string_expr(inner_t, scope_tree) {
+                return self.eval_str_ptr(inner_t, ir, scope_tree, string_constants, temp_counter);
+            }
+            // Python 1-element tuple idiom `bytes((b,))`: allocate exact 2-byte `[b, 0]` buffer (safe even for `b == 0`)
+            if inner_t.starts_with('(')
+                && inner_t.ends_with(')')
+                && inner_t[1..inner_t.len() - 1].trim().ends_with(',')
+            {
+                let elem_expr = inner_t[1..inner_t.len() - 1].trim().trim_end_matches(',').trim();
+                let tv = self.eval_typed(elem_expr, ir, scope_tree, string_constants, temp_counter);
+                let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+                let b_buf = format!("%bytes_1b_{}", *temp_counter);
+                let b_tr = format!("%bytes_tr_{}", *temp_counter);
+                let b_p1 = format!("%bytes_p1_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = call i8* @malloc(i64 2)\n  {} = trunc i64 {} to i8\n  store i8 {}, i8* {}\n  {} = getelementptr inbounds i8, i8* {}, i64 1\n  store i8 0, i8* {}\n",
+                    b_buf, b_tr, v64, b_tr, b_buf, b_p1, b_buf, b_p1
+                ));
+                return b_buf;
+            }
+            let tv = self.eval_typed(inner_t, ir, scope_tree, string_constants, temp_counter);
+            if tv.ty == IrType::Ptr {
+                // Convert `OmniSlice` of byte integers `[65, 66]` into a C byte buffer if slice, or pass C string through
+                let bid = *temp_counter;
+                *temp_counter += 1;
+                let sl_len = format!("%bytes_sllen_{}", bid);
+                let sl_alloc = format!("%bytes_slsz_{}", bid);
+                let out_buf = format!("%bytes_slbuf_{}", bid);
+                let idx_slot = format!("%bytes_slidx_{}", bid);
+                ir.push_str(&format!(
+                    "  {} = call i64 @__omni_slice_len(i8* {})\n  {} = add i64 {}, 1\n  {} = call i8* @malloc(i64 {})\n  {} = alloca i64\n  store i64 0, i64* {}\n  br label %bytes_sl_cond_{}\n\nbytes_sl_cond_{}:\n  %bsl_i_{} = load i64, i64* {}\n  %bsl_c_{} = icmp slt i64 %bsl_i_{}, {}\n  br i1 %bsl_c_{}, label %bytes_sl_body_{}, label %bytes_sl_done_{}\n\nbytes_sl_body_{}:\n  %bsl_v_{} = call i64 @__omni_slice_get(i8* {}, i64 %bsl_i_{})\n  %bsl_t_{} = trunc i64 %bsl_v_{} to i8\n  %bsl_p_{} = getelementptr inbounds i8, i8* {}, i64 %bsl_i_{}\n  store i8 %bsl_t_{}, i8* %bsl_p_{}\n  %bsl_n_{} = add i64 %bsl_i_{}, 1\n  store i64 %bsl_n_{}, i64* {}\n  br label %bytes_sl_cond_{}\n\nbytes_sl_done_{}:\n  %bsl_end_{} = getelementptr inbounds i8, i8* {}, i64 {}\n  store i8 0, i8* %bsl_end_{}\n",
+                    sl_len, tv.reg, sl_alloc, sl_len, out_buf, sl_alloc, idx_slot, idx_slot, bid,
+                    bid, bid, idx_slot, bid, bid, sl_len, bid, bid, bid,
+                    bid, bid, tv.reg, bid, bid, bid, bid, out_buf, bid, bid, bid, bid, bid, bid, idx_slot, bid,
+                    bid, bid, out_buf, sl_len, bid
+                ));
+                return out_buf;
+            }
+            let v64 = self.coerce_to_i64(tv, ir, temp_counter);
+            let clamped = format!("%bytes_clmp_{}", *temp_counter);
+            let is_neg = format!("%bytes_neg_{}", *temp_counter);
+            let sz1 = format!("%bytes_sz1_{}", *temp_counter);
+            let z_buf = format!("%bytes_zbuf_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = icmp slt i64 {}, 0\n  {} = select i1 {}, i64 0, i64 {}\n  {} = add i64 {}, 1\n  {} = call i8* @__omni_obj_alloc(i64 {}, i64 0)\n",
+                is_neg, v64, clamped, is_neg, v64, sz1, clamped, z_buf, sz1
+            ));
+            return z_buf;
         }
         if trimmed.starts_with("*(*[]byte)(unsafe.Pointer(") && trimmed.ends_with(')') {
             if let Some(brace_open) = trimmed.find('{') {
@@ -2285,6 +3363,7 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // 5. Typed fallback: format `double` via `@__omni_float_to_str`, pass `i8*`, or format `i64` via `@__omni_int_to_str`
+        ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
         let tv = self.eval_typed(trimmed, ir, scope_tree, string_constants, temp_counter);
         match tv.ty {
             IrType::F64 => {
@@ -2293,7 +3372,12 @@ impl<'a> CodeGenerator<'a> {
                 ir.push_str(&format!("  {} = call i8* @__omni_float_to_str(double {})\n", flt_str, tv.reg));
                 flt_str
             }
-            IrType::Ptr => tv.reg,
+            IrType::Ptr => {
+                // Consume TLS slot so nested `f() + g()` never leaks `f()`'s pointer into `g()`
+                let _ = format!("%consume_str_{}", *temp_counter);
+                ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
+                tv.reg
+            }
             IrType::StructPtr(cls) => {
                 let raw = format!("%struct_str_cast_{}", *temp_counter);
                 *temp_counter += 1;
@@ -2305,7 +3389,7 @@ impl<'a> CodeGenerator<'a> {
                 if trimmed.ends_with(')') {
                     let ret_ptr = format!("%call_str_ptr_{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", ret_ptr));
+                    ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", ret_ptr));
                     let is_non_null = format!("%call_str_non_null_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", is_non_null, ret_ptr));
@@ -2911,8 +3995,14 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
                                 let ks = args[0].value.slice(full_expr).trim();
-                                let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
-                                ir.push_str(&format!("  call void @__omni_map_delete(i8* {}, i8* {})\n", ld, kp));
+                                if Self::is_string_expr(ks, scope_tree) {
+                                    let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
+                                    ir.push_str(&format!("  call void @__omni_map_delete(i8* {}, i8* {})\n", ld, kp));
+                                } else {
+                                    let ktv = self.eval_typed(ks, ir, scope_tree, string_constants, temp_counter);
+                                    let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
+                                    ir.push_str(&format!("  call void @__omni_map_delete_int(i8* {}, i64 {})\n", ld, k64));
+                                }
                                 return Some(TypedValue { reg: "0".to_string(), ty: IrType::I64 });
                             }
                             "len" | "size" | "count" if args.is_empty() => {
@@ -3056,6 +4146,31 @@ impl<'a> CodeGenerator<'a> {
         }
         if trimmed == "false" || trimmed == "False" {
             return TypedValue { reg: "0".to_string(), ty: IrType::I64 };
+        }
+
+        // First-class inline lambda / closure expression (`lambda x: ...`, `(x, y) => ...`, `|x| ...`)
+        if let Some((lam_params, lam_body_expr)) = OmniParser::try_parse_lambda_expr(trimmed) {
+            let cid = self.closure_counter.get();
+            let lam_stmts = if lam_body_expr.starts_with('{') && lam_body_expr.ends_with('}') {
+                let inner_blk = &lam_body_expr[1..lam_body_expr.len() - 1];
+                OmniParser::new().parse_module("lambda_blk", inner_blk).top_level_statements
+            } else {
+                vec![Statement::Return {
+                    expr: Some(lam_body_expr),
+                }]
+            };
+            let syn_fn = omni_parser::FunctionDef {
+                name: format!("__lambda_{}", cid),
+                params: lam_params,
+                return_type: None,
+                body: lam_stmts,
+                is_method: false,
+                annotations: Vec::new(),
+                memory_ops: Vec::new(),
+            };
+            let clos_ptr = self.lower_closure_def(&syn_fn, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", clos_ptr));
+            return TypedValue { reg: clos_ptr, ty: IrType::Ptr };
         }
 
         // Pratt AST Top-Level Structural Dispatch:
@@ -3262,15 +4377,14 @@ impl<'a> CodeGenerator<'a> {
                         "-" => "sub",
                         "*" => "mul",
                         "/" | "%" | "//" => {
-                            let is_zero = format!("%div_zero_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
-                            let safe_div = format!("%safe_div_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = select i1 {}, i64 1, i64 {}\n", safe_div, is_zero, right_val));
-                            let op_name = if op == "%" { "srem" } else { "sdiv" };
-                            ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, safe_div));
-                            return TypedValue { reg: res_var, ty: IrType::I64 };
+                            return self.emit_checked_int_div_rem(
+                                &op,
+                                &left_val,
+                                &right_val,
+                                ir,
+                                string_constants,
+                                temp_counter,
+                            );
                         }
                         "^" => "xor",
                         "&" => "and",
@@ -3826,6 +4940,16 @@ impl<'a> CodeGenerator<'a> {
             return TypedValue { reg: input_ptr, ty: IrType::Ptr };
         }
 
+        // Builtin Python `bytes(...)` / Go `[]byte(...)` constructor
+        if trimmed.starts_with("bytes(")
+            && Self::find_outer_call_open_paren(trimmed) == Some(5)
+            && !scope_tree.known_functions.contains("bytes")
+        {
+            let bp = self.eval_str_ptr(trimmed, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", bp));
+            return TypedValue { reg: bp, ty: IrType::Ptr };
+        }
+
         // Builtin exit(code)
         if trimmed == "exit()" || (trimmed.starts_with("exit(") && trimmed.ends_with(')')) {
             let code_val = if trimmed == "exit()" {
@@ -3932,7 +5056,10 @@ impl<'a> CodeGenerator<'a> {
                     "null".to_string()
                 }
             } else {
-                "null".to_string()
+                let u_ptr = format!("%thr_unset_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = inttoptr i64 -581005069656919554 to i8*\n", u_ptr));
+                u_ptr
             };
             if !target_fn.is_empty() {
                 let spawn_fn = if unwrap_start.starts_with("threading.Thread(") || unwrap_start.starts_with("Thread(") {
@@ -4006,12 +5133,103 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // Method invocation: `obj.method(args...)` or direct function call `func(args...)`
-        if let Some(lp) = trimmed.find('(') {
+        // Inline Struct Literal (`Point { x: 10, y: 20 }`) & Tagged Enum Variant (`Result::Ok(100)`) in expressions
+        if let Some(open) = trimmed.find('{') {
+            if trimmed.ends_with('}') {
+                let raw_sc = trimmed[..open].trim().strip_prefix("new ").map(|s| s.trim()).unwrap_or_else(|| trimmed[..open].trim());
+                let struct_cand = raw_sc.split('<').next().unwrap_or(raw_sc).trim();
+                if !struct_cand.is_empty() && scope_tree.class_fields.contains_key(struct_cand) {
+                    let f_count = scope_tree.class_fields.get(struct_cand).map(|m| m.len()).unwrap_or(1);
+                    let alloc_bytes = (f_count * 8).max(8);
+                    let tid = scope_tree.class_type_ids.get(struct_cand).copied().unwrap_or(0);
+                    let raw_inst = format!("%expr_slit_raw_{}", *temp_counter);
+                    let inst_alloc = format!("%expr_slit_ptr_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i8* @__omni_obj_alloc(i64 {}, i64 {})\n  {} = bitcast i8* {} to %struct.{}*\n",
+                        raw_inst, alloc_bytes, tid, inst_alloc, raw_inst, struct_cand
+                    ));
+                    let inner = &trimmed[open + 1..trimmed.len() - 1];
+                    for field_part in omni_parser::OmniParser::split_respecting_quotes(inner, ',') {
+                        let fp_trim = field_part.trim();
+                        if let Some((f_name, f_val)) = fp_trim.split_once(':') {
+                            let fn_clean = f_name.trim().trim_start_matches('.');
+                            if let Some(&f_idx) = scope_tree.class_fields.get(struct_cand).and_then(|m| m.get(fn_clean)) {
+                                let ftv = self.eval_typed(f_val.trim(), ir, scope_tree, string_constants, temp_counter);
+                                let bits = self.coerce_to_raw_i64_bits(ftv, ir, temp_counter);
+                                let gep = format!("%expr_slit_gep_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n  store i64 {}, i64* {}\n",
+                                    gep, struct_cand, struct_cand, inst_alloc, f_idx, bits, gep
+                                ));
+                            }
+                        }
+                    }
+                    ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_inst));
+                    return TypedValue {
+                        reg: inst_alloc,
+                        ty: IrType::StructPtr(struct_cand.to_string()),
+                    };
+                }
+            }
+        }
+        if let Some((e_name, (tag, payload_val))) = scope_tree.resolve_enum_variant(trimmed) {
+            let raw_enum = format!("%expr_enum_raw_{}", *temp_counter);
+            let inst_alloc = format!("%expr_enum_ptr_{}", *temp_counter);
+            let tag_gep = format!("%expr_etag_{}", *temp_counter);
+            let pay_gep = format!("%expr_epay_{}", *temp_counter);
+            *temp_counter += 1;
+            ir.push_str(&format!(
+                "  {} = call i8* @__omni_obj_alloc(i64 16, i64 0)\n  {} = bitcast i8* {} to %enum.{}*\n  {} = getelementptr inbounds %enum.{}, %enum.{}* {}, i32 0, i32 0\n  store i32 {}, i32* {}\n  {} = getelementptr inbounds %enum.{}, %enum.{}* {}, i32 0, i32 1\n",
+                raw_enum, inst_alloc, raw_enum, e_name, tag_gep, e_name, e_name, inst_alloc, tag, tag_gep, pay_gep, e_name, e_name, inst_alloc
+            ));
+            if let Some(p_expr) = payload_val {
+                let ptv = self.eval_typed(&p_expr, ir, scope_tree, string_constants, temp_counter);
+                let pbits = self.coerce_to_raw_i64_bits(ptv, ir, temp_counter);
+                ir.push_str(&format!("  store i64 {}, i64* {}\n", pbits, pay_gep));
+            } else {
+                ir.push_str(&format!("  store i64 0, i64* {}\n", pay_gep));
+            }
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_enum));
+            return TypedValue { reg: raw_enum, ty: IrType::Ptr };
+        }
+
+        // Method invocation: `obj.method(args...)`, direct call `func(args...)`, or curried/IIFE `make_adder(20)(7)`
+        if let Some(lp) = Self::find_outer_call_open_paren(trimmed) {
             if trimmed.ends_with(')') {
-                let call_target = trimmed[..lp].trim();
-                let is_valid_call_target = !call_target.is_empty()
+                let raw_call_target = trimmed[..lp].trim();
+                let stripped_new = raw_call_target
+                    .strip_prefix("new ")
+                    .map(|s| s.trim())
+                    .unwrap_or(raw_call_target);
+                let call_target = if !stripped_new.contains('(') && stripped_new.contains('<') && stripped_new.ends_with('>') {
+                    stripped_new.split('<').next().unwrap_or(stripped_new).trim()
+                } else {
+                    stripped_new
+                };
+                let is_ident_or_dot = !call_target.is_empty()
                     && call_target.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+                let inner_paren_ct = if call_target.starts_with('(') && call_target.ends_with(')') {
+                    Some(OmniParser::unwrap_outer_balanced_parens(call_target))
+                } else {
+                    None
+                };
+                let is_curried_or_iife = !call_target.is_empty()
+                    && !call_target.contains('.')
+                    && ((!call_target.starts_with('(') && call_target.ends_with(')'))
+                        || inner_paren_ct.as_deref().map_or(false, |ict| {
+                            scope_tree.known_functions.contains(ict)
+                                || scope_tree.resolve(ict).is_some()
+                                || OmniParser::try_parse_lambda_expr(ict).is_some()
+                        })
+                        || (call_target.starts_with('(')
+                            && (call_target.contains("lambda")
+                                || call_target.contains("=>")
+                                || call_target.contains('|')
+                                || call_target.contains("func")
+                                || call_target.contains("->"))));
+                let is_valid_call_target = is_ident_or_dot || is_curried_or_iife;
 
                 if is_valid_call_target {
                     let args_str = &trimmed[lp + 1..trimmed.len() - 1];
@@ -4094,7 +5312,7 @@ impl<'a> CodeGenerator<'a> {
                                 };
                                 let ret_reg = format!("%bind_ret_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_bind(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_bind(i32 {}, i8* {}, i32 0)\n", ret_reg, r_fd, addr_ptr));
                                 return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
@@ -4138,7 +5356,7 @@ impl<'a> CodeGenerator<'a> {
                                 };
                                 let ret_reg = format!("%conn_ret_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_connect(i32 {}, i8* {}, i32 9999)\n", ret_reg, r_fd, addr_ptr));
+                                ir.push_str(&format!("  {} = call i32 @__omni_os_socket_connect(i32 {}, i8* {}, i32 0)\n", ret_reg, r_fd, addr_ptr));
                                 return TypedValue { reg: ret_reg, ty: IrType::I32 };
                             }
 
@@ -4173,31 +5391,27 @@ impl<'a> CodeGenerator<'a> {
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_ld));
 
-                                    let mut arg_regs = Vec::new();
-                                    for a in &raw_args {
-                                        let a_clean = Self::strip_kwarg_prefix(a);
-                                        let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
-                                        arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                                    }
-                                    while arg_regs.len() < 5 {
-                                        arg_regs.push("0".to_string());
-                                    }
-
-                                    let ret_reg = format!("%method_ret_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!(
-                                        "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                                    ));
-                                    let mret = scope_tree
-                                        .method_return_types
-                                        .get(&(def_cls.clone(), method.to_string()))
-                                        .cloned()
-                                        .or_else(|| scope_tree.infer_structural_method_return_type(&def_cls, method, raw_args.len()));
-                                    return Self::apply_return_ir_type(ret_reg, mret.as_ref(), ir, temp_counter);
+                                    return self.emit_method_dispatch(
+                                        Some(cls_name),
+                                        &def_cls,
+                                        method,
+                                        &raw_inst,
+                                        &raw_args,
+                                        true,
+                                        ir,
+                                        scope_tree,
+                                        string_constants,
+                                        temp_counter,
+                                    );
                                 } else if b.type_hint.starts_with("i8*") || b.type_hint == "i64" {
-                                    if let Some((_, def_cls)) = scope_tree.method_defining_class.iter().find(|((_, m), _)| m == method) {
-                                        let def_cls = def_cls.clone();
+                                    let mut matching_defs: Vec<&String> = scope_tree
+                                        .method_defining_class
+                                        .iter()
+                                        .filter_map(|((_, m), dc)| if m == method { Some(dc) } else { None })
+                                        .collect();
+                                    matching_defs.sort();
+                                    if let Some(first_def) = matching_defs.first() {
+                                        let def_cls = (*first_def).clone();
                                         let raw_inst = if b.type_hint.starts_with("i8*") {
                                             let ld = format!("%raw_i8_inst_{}", *temp_counter);
                                             *temp_counter += 1;
@@ -4212,23 +5426,18 @@ impl<'a> CodeGenerator<'a> {
                                             ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", i2p, ld64));
                                             i2p
                                         };
-                                        let mut arg_regs = Vec::new();
-                                        for a in &raw_args {
-                                            let a_clean = Self::strip_kwarg_prefix(a);
-                                            let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
-                                            arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                                        }
-                                        while arg_regs.len() < 5 {
-                                            arg_regs.push("0".to_string());
-                                        }
-                                        let ret_reg = format!("%method_ret_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!(
-                                            "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                            ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                                        ));
-                                        let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
-                                        return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
+                                        return self.emit_method_dispatch(
+                                            None,
+                                            &def_cls,
+                                            method,
+                                            &raw_inst,
+                                            &raw_args,
+                                            true,
+                                            ir,
+                                            scope_tree,
+                                            string_constants,
+                                            temp_counter,
+                                        );
                                     }
                                 }
                             } else if scope_tree.class_fields.contains_key(rec) {
@@ -4256,24 +5465,18 @@ impl<'a> CodeGenerator<'a> {
                                     ("null".to_string(), &raw_args[..])
                                 };
 
-                                let mut arg_regs = Vec::new();
-                                for a in remaining_args {
-                                    let a_clean = Self::strip_kwarg_prefix(a);
-                                    let atv = self.eval_typed(a_clean, ir, scope_tree, string_constants, temp_counter);
-                                    arg_regs.push(self.coerce_to_raw_i64_bits(atv, ir, temp_counter));
-                                }
-                                while arg_regs.len() < 5 {
-                                    arg_regs.push("0".to_string());
-                                }
-
-                                let ret_reg = format!("%method_ret_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!(
-                                    "  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                    ret_reg, def_cls, method, raw_inst, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4]
-                                ));
-                                let mret = scope_tree.method_return_types.get(&(def_cls, method.to_string()));
-                                return Self::apply_return_ir_type(ret_reg, mret, ir, temp_counter);
+                                return self.emit_method_dispatch(
+                                    Some(rec),
+                                    &def_cls,
+                                    method,
+                                    &raw_inst,
+                                    remaining_args,
+                                    false,
+                                    ir,
+                                    scope_tree,
+                                    string_constants,
+                                    temp_counter,
+                                );
                             } else {
                                 // Foreign module call: `fast_math.compute_luhn(card_num)` -> `@__omni_fn_compute_luhn`
                                 if method == "randint" && raw_args.len() >= 2 {
@@ -4290,6 +5493,52 @@ impl<'a> CodeGenerator<'a> {
                                     ));
                                     return TypedValue { reg: rnd_res, ty: IrType::I64 };
                                 }
+
+                                let prefixed_fn = format!("{}_{}", rec, method);
+                                if scope_tree.known_functions.contains(method) {
+                                    let abi_n = scope_tree.fn_abi_arity(method);
+                                    let mut arg_regs = self.eval_call_args_with_defaults(
+                                        &raw_args,
+                                        scope_tree.fn_param_defs.get(method),
+                                        abi_n,
+                                        ir,
+                                        scope_tree,
+                                        string_constants,
+                                        temp_counter,
+                                    );
+                                    arg_regs.truncate(abi_n);
+                                    let fmt_args = arg_regs.iter().map(|r| format!("i64 {}", r)).collect::<Vec<_>>().join(", ");
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_fn_{}({})\n",
+                                        ret_reg, method, fmt_args
+                                    ));
+                                    let fret = scope_tree.fn_return_types.get(method);
+                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                                } else if scope_tree.known_functions.contains(&prefixed_fn) {
+                                    let abi_n = scope_tree.fn_abi_arity(&prefixed_fn);
+                                    let mut arg_regs = self.eval_call_args_with_defaults(
+                                        &raw_args,
+                                        scope_tree.fn_param_defs.get(&prefixed_fn),
+                                        abi_n,
+                                        ir,
+                                        scope_tree,
+                                        string_constants,
+                                        temp_counter,
+                                    );
+                                    arg_regs.truncate(abi_n);
+                                    let fmt_args = arg_regs.iter().map(|r| format!("i64 {}", r)).collect::<Vec<_>>().join(", ");
+                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_fn_{}({})\n",
+                                        ret_reg, prefixed_fn, fmt_args
+                                    ));
+                                    let fret = scope_tree.fn_return_types.get(&prefixed_fn);
+                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                                }
+
                                 let mut arg_regs = Vec::new();
                                 for a in &raw_args {
                                     let a_clean = Self::strip_kwarg_prefix(a);
@@ -4305,26 +5554,7 @@ impl<'a> CodeGenerator<'a> {
                                     arg_regs.push("0".to_string());
                                 }
 
-                                let prefixed_fn = format!("{}_{}", rec, method);
-                                if scope_tree.known_functions.contains(method) {
-                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!(
-                                        "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
-                                    ));
-                                    let fret = scope_tree.fn_return_types.get(method);
-                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
-                                } else if scope_tree.known_functions.contains(&prefixed_fn) {
-                                    let ret_reg = format!("%foreign_ret_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!(
-                                        "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, prefixed_fn, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
-                                    ));
-                                    let fret = scope_tree.fn_return_types.get(&prefixed_fn);
-                                    return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
-                                } else if NATIVE_C_LIB_I64_FNS.contains(&method) {
+                                if NATIVE_C_LIB_I64_FNS.contains(&method) {
                                     let ret_reg = format!("%foreign_ret_{}", *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!(
@@ -4379,9 +5609,24 @@ impl<'a> CodeGenerator<'a> {
                                     }
                                     let ret_reg = format!("%foreign_ret_{}", *temp_counter);
                                     *temp_counter += 1;
+                                    let ext_sym = if scope_tree.resolve(rec).is_none()
+                                        && !scope_tree.class_fields.contains_key(rec)
+                                    {
+                                        let clean_rec: String = rec
+                                            .chars()
+                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                                            .collect();
+                                        let clean_mth: String = method
+                                            .chars()
+                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                                            .collect();
+                                        format!("__omni_extmod__{}__{}", clean_rec, clean_mth)
+                                    } else {
+                                        method.to_string()
+                                    };
                                     ir.push_str(&format!(
                                         "  {} = call i64 @{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                        ret_reg, method, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
+                                        ret_reg, ext_sym, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
                                     ));
                                     return TypedValue { reg: ret_reg, ty: IrType::I64 };
                                 }
@@ -4412,9 +5657,13 @@ impl<'a> CodeGenerator<'a> {
                             // Dynamic heap constructor instantiation: `Class(...)` or `new Class(...)`
                             let field_count = scope_tree.class_fields.get(&target_cls).map(|m| m.len()).unwrap_or(1);
                             let alloc_bytes = (field_count * 8).max(8);
+                            let tid = scope_tree.class_type_ids.get(&target_cls).copied().unwrap_or(0);
                             let raw_inst = format!("%ctor_raw_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", raw_inst, alloc_bytes));
+                            ir.push_str(&format!(
+                                "  {} = call i8* @__omni_obj_alloc(i64 {}, i64 {})\n",
+                                raw_inst, alloc_bytes, tid
+                            ));
 
                             let struct_ptr = format!("%ctor_struct_{}", *temp_counter);
                             *temp_counter += 1;
@@ -4442,7 +5691,179 @@ impl<'a> CodeGenerator<'a> {
                             };
                         }
 
-                        // Direct or indirect function invocation (`@__omni_fn_<name>` / function pointer)
+                        // Indirect fat-closure / bare function pointer call (`f(args)` or curried `make_adder(10)(5)` / `(lambda x: x+1)(5)`)
+                        let is_expr_callee = !scope_tree.known_functions.contains(call_target)
+                            && !NATIVE_C_LIB_I64_FNS.contains(&call_target)
+                            && !NATIVE_C_LIB_FNS.contains(&call_target)
+                            && (call_target.contains('(')
+                                || call_target.contains("=>")
+                                || call_target.contains("lambda")
+                                || call_target.starts_with('|'));
+
+                        if scope_tree.resolve(call_target).is_some() || is_expr_callee {
+                            let fptr_ld = if let Some(binding) = scope_tree.resolve(call_target) {
+                                let ld = format!("%fptr_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                if binding.type_hint.starts_with("i8*") {
+                                    ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, binding.llvm_ptr));
+                                } else if binding.type_hint == "i64" {
+                                    let ld64 = format!("%fptr_ld64_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, binding.llvm_ptr));
+                                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ld, ld64));
+                                } else {
+                                    let ld32 = format!("%fptr_ld32_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = load i32, i32* {}\n", ld32, binding.llvm_ptr));
+                                    let ext64 = format!("%fptr_ext64_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext64, ld32));
+                                    ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ld, ext64));
+                                }
+                                ld
+                            } else {
+                                let callee_tv = self.eval_typed(call_target, ir, scope_tree, string_constants, temp_counter);
+                                self.coerce_to_ptr(callee_tv, ir, temp_counter)
+                            };
+
+                            let unwrapped_callee = call_target
+                                .trim()
+                                .trim_start_matches('(')
+                                .trim_end_matches(')')
+                                .trim();
+                            let static_pdefs = scope_tree
+                                .fn_param_defs
+                                .get(call_target)
+                                .or_else(|| scope_tree.fn_param_defs.get(unwrapped_callee));
+                            let ind_arity = static_pdefs
+                                .map(|p| p.len())
+                                .unwrap_or(0)
+                                .max(raw_args.len())
+                                .max(6);
+                            let has_static_pdefs = static_pdefs.is_some();
+                            let mut arg_regs = self.eval_call_args_with_defaults(
+                                &raw_args,
+                                static_pdefs,
+                                ind_arity,
+                                ir,
+                                scope_tree,
+                                string_constants,
+                                temp_counter,
+                            );
+                            if !has_static_pdefs {
+                                for slot in arg_regs.iter_mut().skip(raw_args.len()) {
+                                    *slot = "-581005069656919554".to_string();
+                                }
+                            }
+                            arg_regs.truncate(ind_arity);
+                            let bare_ty_sig = vec!["i64"; ind_arity].join(", ");
+                            let bare_call_args = arg_regs
+                                .iter()
+                                .map(|r| format!("i64 {}", r))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+
+                            let cid_lbl = *temp_counter;
+                            *temp_counter += 1;
+                            let is_null = format!("%fptr_null_{}", cid_lbl);
+                            let valid_call_lbl = format!("call_valid_{}", cid_lbl);
+                            let env_call_lbl = format!("call_env_{}", cid_lbl);
+                            let bare_call_lbl = format!("call_bare_{}", cid_lbl);
+                            let null_call_lbl = format!("call_null_{}", cid_lbl);
+                            let cont_call_lbl = format!("call_cont_{}", cid_lbl);
+
+                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, fptr_ld));
+                            ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", is_null, null_call_lbl, valid_call_lbl));
+
+                            ir.push_str(&format!("{}:\n", valid_call_lbl));
+                            let raw_fn = format!("%clos_fn_{}", cid_lbl);
+                            let raw_env = format!("%clos_envp_{}", cid_lbl);
+                            let has_env = format!("%clos_has_env_{}", cid_lbl);
+                            ir.push_str(&format!(
+                                "  call void @__omni_c_return_ptr(i8* null)\n  {} = call i8* @__omni_closure_fn(i8* {})\n  {} = call i8* @__omni_closure_env(i8* {})\n  {} = icmp ne i8* {}, null\n  br i1 {}, label %{}, label %{}\n\n",
+                                raw_fn, fptr_ld, raw_env, fptr_ld, has_env, raw_env, has_env, env_call_lbl, bare_call_lbl
+                            ));
+
+                            ir.push_str(&format!("{}:\n", env_call_lbl));
+                            let env_i64 = format!("%clos_env_i64_{}", cid_lbl);
+                            let fptr_env = format!("%fptr_env_{}", cid_lbl);
+                            let ret_env = format!("%ret_call_env_{}", cid_lbl);
+                            ir.push_str(&format!(
+                                "  {} = ptrtoint i8* {} to i64\n  {} = bitcast i8* {} to i64 (i64, {})*\n  {} = call i64 {}(i64 {}, {})\n  br label %{}\n\n",
+                                env_i64, raw_env, fptr_env, raw_fn, bare_ty_sig, ret_env, fptr_env, env_i64, bare_call_args, cont_call_lbl
+                            ));
+
+                            ir.push_str(&format!("{}:\n", bare_call_lbl));
+                            let fptr_bare = format!("%fptr_bare_{}", cid_lbl);
+                            let ret_bare = format!("%ret_call_bare_{}", cid_lbl);
+                            ir.push_str(&format!(
+                                "  {} = bitcast i8* {} to i64 ({})*\n  {} = call i64 {}({})\n  br label %{}\n\n",
+                                fptr_bare, raw_fn, bare_ty_sig, ret_bare, fptr_bare, bare_call_args, cont_call_lbl
+                            ));
+
+                            ir.push_str(&format!("{}:\n", null_call_lbl));
+                            ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
+
+                            ir.push_str(&format!("{}:\n", cont_call_lbl));
+                            let phi_ret = format!("%indirect_ret_{}", cid_lbl);
+                            ir.push_str(&format!(
+                                "  {} = phi i64 [ {}, %{} ], [ {}, %{} ], [ 0, %{} ]\n",
+                                phi_ret, ret_env, env_call_lbl, ret_bare, bare_call_lbl, null_call_lbl
+                            ));
+                            let curried_head = call_target
+                                .split('(')
+                                .next()
+                                .map(|s| s.trim())
+                                .unwrap_or("");
+                            let inline_lam_ret = OmniParser::try_parse_lambda_expr(call_target.trim().trim_start_matches('(').trim_end_matches(')').trim())
+                                .and_then(|(ps, body)| {
+                                    let mut lmap = Self::build_param_ir_types(&ps, &scope_tree.class_fields);
+                                    if body.starts_with('{') && body.ends_with('}') {
+                                        let stmts = OmniParser::new().parse_module("lam_ret", &body[1..body.len() - 1]).top_level_statements;
+                                        let mut sc = None;
+                                        let mut tp = None;
+                                        Self::infer_return_signature_with_locals(&stmts, &scope_tree.class_fields, None, &mut lmap, &mut sc, &mut tp);
+                                        sc
+                                    } else {
+                                        Self::infer_expr_return_ir_type_with_locals(&body, &scope_tree.class_fields, None, Some(&lmap))
+                                    }
+                                });
+                            let fret = scope_tree
+                                .fn_return_types
+                                .get(call_target)
+                                .or_else(|| scope_tree.fn_return_types.get(unwrapped_callee))
+                                .or_else(|| scope_tree.fn_curried_return_types.get(curried_head))
+                                .or_else(|| inline_lam_ret.as_ref());
+                            return Self::apply_return_ir_type(phi_ret, fret, ir, temp_counter);
+                        }
+
+                        if scope_tree.known_functions.contains(call_target) {
+                            let abi_n = scope_tree.fn_abi_arity(call_target);
+                            let mut arg_regs = self.eval_call_args_with_defaults(
+                                &raw_args,
+                                scope_tree.fn_param_defs.get(call_target),
+                                abi_n,
+                                ir,
+                                scope_tree,
+                                string_constants,
+                                temp_counter,
+                            );
+                            arg_regs.truncate(abi_n);
+                            let fmt_args = arg_regs
+                                .iter()
+                                .map(|r| format!("i64 {}", r))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let ret_reg = format!("%fn_ret_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = call i64 @__omni_fn_{}({})\n",
+                                ret_reg, call_target, fmt_args
+                            ));
+                            let fret = scope_tree.fn_return_types.get(call_target);
+                            return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
+                        }
+
                         let mut arg_regs = Vec::new();
                         for a in &raw_args {
                             let a_clean = Self::strip_kwarg_prefix(a);
@@ -4457,76 +5878,9 @@ impl<'a> CodeGenerator<'a> {
                         while arg_regs.len() < 6 {
                             arg_regs.push("0".to_string());
                         }
-
-                        if let Some(binding) = scope_tree.resolve(call_target) {
-                            let fptr_ld = format!("%fptr_ld_{}", *temp_counter);
-                            *temp_counter += 1;
-                            if binding.type_hint.starts_with("i8*") {
-                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", fptr_ld, binding.llvm_ptr));
-                            } else if binding.type_hint == "i64" {
-                                let ld64 = format!("%fptr_ld64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, binding.llvm_ptr));
-                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", fptr_ld, ld64));
-                            } else {
-                                let ld32 = format!("%fptr_ld32_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = load i32, i32* {}\n", ld32, binding.llvm_ptr));
-                                let ext64 = format!("%fptr_ext64_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = zext i32 {} to i64\n", ext64, ld32));
-                                ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", fptr_ld, ext64));
-                            }
-                            let is_null = format!("%fptr_null_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, fptr_ld));
-
-                            let fptr = format!("%fptr_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!(
-                                "  {} = bitcast i8* {} to i64 (i64, i64, i64, i64, i64, i64)*\n",
-                                fptr, fptr_ld
-                            ));
-
-                            let valid_call_lbl = format!("call_valid_{}", *temp_counter);
-                            let null_call_lbl = format!("call_null_{}", *temp_counter);
-                            let cont_call_lbl = format!("call_cont_{}", *temp_counter);
-                            *temp_counter += 1;
-
-                            ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n\n", is_null, null_call_lbl, valid_call_lbl));
-
-                            ir.push_str(&format!("{}:\n", valid_call_lbl));
-                            let ret_call = format!("%ret_call_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!(
-                                "  {} = call i64 {}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                ret_call, fptr, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
-                            ));
-                            ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
-
-                            ir.push_str(&format!("{}:\n", null_call_lbl));
-                            ir.push_str(&format!("  br label %{}\n\n", cont_call_lbl));
-
-                            ir.push_str(&format!("{}:\n", cont_call_lbl));
-                            let phi_ret = format!("%indirect_ret_{}", *temp_counter);
-                            *temp_counter += 1;
-                            ir.push_str(&format!(
-                                "  {} = phi i64 [ {}, %{} ], [ 0, %{} ]\n",
-                                phi_ret, ret_call, valid_call_lbl, null_call_lbl
-                            ));
-                            return TypedValue { reg: phi_ret, ty: IrType::I64 };
-                        }
-
                         let ret_reg = format!("%fn_ret_{}", *temp_counter);
                         *temp_counter += 1;
-                        if scope_tree.known_functions.contains(call_target) {
-                            ir.push_str(&format!(
-                                "  {} = call i64 @__omni_fn_{}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n",
-                                ret_reg, call_target, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4], arg_regs[5]
-                            ));
-                            let fret = scope_tree.fn_return_types.get(call_target);
-                            return Self::apply_return_ir_type(ret_reg, fret, ir, temp_counter);
-                        } else if NATIVE_C_LIB_I64_FNS.contains(&call_target) {
+                        if NATIVE_C_LIB_I64_FNS.contains(&call_target) {
                             ir.push_str(&format!(
                                 "  {} = call i64 @{}({})\n",
                                 ret_reg, call_target, actual_c_args
@@ -4719,15 +6073,14 @@ impl<'a> CodeGenerator<'a> {
                 "-" => "sub",
                 "*" => "mul",
                 "/" | "%" | "//" => {
-                    let is_zero = format!("%div_zero_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_zero, right_val));
-                    let safe_div = format!("%safe_div_{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = select i1 {}, i64 1, i64 {}\n", safe_div, is_zero, right_val));
-                    let op_name = if op == "%" { "srem" } else { "sdiv" };
-                    ir.push_str(&format!("  {} = {} i64 {}, {}\n", res_var, op_name, left_val, safe_div));
-                    return TypedValue { reg: res_var, ty: IrType::I64 };
+                    return self.emit_checked_int_div_rem(
+                        &op,
+                        &left_val,
+                        &right_val,
+                        ir,
+                        string_constants,
+                        temp_counter,
+                    );
                 }
                 "^" => "xor",
                 "&" => "and",
@@ -4750,7 +6103,7 @@ impl<'a> CodeGenerator<'a> {
                             return TypedValue { reg: acc, ty: IrType::I64 };
                         }
                     }
-                    ir.push_str(&format!("  {} = mul i64 {}, {}\n", res_var, left_val, left_val));
+                    ir.push_str(&format!("  {} = call i64 @__omni_ipow64(i64 {}, i64 {})\n", res_var, left_val, right_val));
                     return TypedValue { reg: res_var, ty: IrType::I64 };
                 }
                 _ => "add",
@@ -4823,6 +6176,16 @@ impl<'a> CodeGenerator<'a> {
                     reg: loaded,
                     ty: IrType::StructPtr(cls_name.to_string()),
                 };
+            } else if binding.type_hint.starts_with("%enum.") {
+                let en_name = binding.type_hint.trim_start_matches("%enum.").trim_end_matches('*');
+                let loaded = format!("%enum_ptr_ld_{}", *temp_counter);
+                let raw_i8 = format!("%enum_i8_ld_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!(
+                    "  {} = load %enum.{}*, %enum.{}** {}\n  {} = bitcast %enum.{}* {} to i8*\n",
+                    loaded, en_name, en_name, binding.llvm_ptr, raw_i8, en_name, loaded
+                ));
+                return TypedValue { reg: raw_i8, ty: IrType::Ptr };
             } else if binding.type_hint.starts_with("i8*") {
                 let loaded = format!("%ptr_ld_{}", *temp_counter);
                 *temp_counter += 1;
@@ -4877,22 +6240,26 @@ impl<'a> CodeGenerator<'a> {
             if let Some(last_seg) = trimmed.rsplit('.').next() {
                 let fn_cand = last_seg.trim();
                 if scope_tree.known_functions.contains(fn_cand) {
+                    let abi_n = scope_tree.fn_abi_arity(fn_cand);
+                    let sig = vec!["i64"; abi_n].join(", ");
                     let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!(
-                        "  {} = bitcast i64 (i64, i64, i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
-                        raw_fptr, fn_cand
+                        "  {} = bitcast i64 ({})* @__omni_fn_{} to i8*\n",
+                        raw_fptr, sig, fn_cand
                     ));
                     ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
                     return TypedValue { reg: raw_fptr, ty: IrType::Ptr };
                 }
             }
         } else if scope_tree.known_functions.contains(trimmed) {
+            let abi_n = scope_tree.fn_abi_arity(trimmed);
+            let sig = vec!["i64"; abi_n].join(", ");
             let raw_fptr = format!("%fn_raw_ptr_{}", *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!(
-                "  {} = bitcast i64 (i64, i64, i64, i64, i64, i64)* @__omni_fn_{} to i8*\n",
-                raw_fptr, trimmed
+                "  {} = bitcast i64 ({})* @__omni_fn_{} to i8*\n",
+                raw_fptr, sig, trimmed
             ));
             ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", raw_fptr));
             return TypedValue { reg: raw_fptr, ty: IrType::Ptr };
@@ -5761,23 +7128,39 @@ impl<'a> CodeGenerator<'a> {
                         .map(|s| s.trim_end_matches('*').to_string());
 
                     if let Some(struct_cls) = existing_lhs_struct.or(inferred_rhs_struct) {
-                        if !trimmed_expr.starts_with("new ") && !trimmed_expr.ends_with(')') {
+                        if !trimmed_expr.starts_with("new ")
+                            && !trimmed_expr.ends_with(')')
+                            && !trimmed_expr.ends_with('}')
+                        {
+                            let elem_ty = format!("%struct.{}*", struct_cls);
                             let alloca_ptr = if *is_scoped_decl || scope_tree.resolve(target).is_none() {
                                 let ptr = format!("%var_{}_{}", target, *temp_counter);
                                 *temp_counter += 1;
                                 ir.push_str(&format!("  {} = alloca %struct.{}*\n", ptr, struct_cls));
+                                deferred_frees.push(CleanupOp::FreeHeapPtr {
+                                    slot_ptr: ptr.clone(),
+                                    elem_ty: elem_ty.clone(),
+                                });
                                 scope_tree.insert(
                                     target.clone(),
                                     SymbolBinding {
                                         name: target.clone(),
                                         llvm_ptr: ptr.clone(),
-                                        type_hint: format!("%struct.{}*", struct_cls),
+                                        type_hint: elem_ty.clone(),
                                         is_scoped: *is_scoped_decl,
                                     },
                                 );
                                 ptr
                             } else {
-                                scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                                let existing_p = scope_tree.resolve(target).unwrap().llvm_ptr.clone();
+                                let old_ld = format!("%old_s_ld_{}", *temp_counter);
+                                let old_i8 = format!("%old_s_i8_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = load {}, {}* {}\n  {} = bitcast {} {} to i8*\n  call void @__omni_rc_release(i8* {})\n",
+                                    old_ld, elem_ty, elem_ty, existing_p, old_i8, elem_ty, old_ld, old_i8
+                                ));
+                                existing_p
                             };
 
                             if is_null_literal(trimmed_expr) {
@@ -5786,8 +7169,13 @@ impl<'a> CodeGenerator<'a> {
                                 if src_b.type_hint.starts_with("%struct.") {
                                     let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                                     let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
+                                    let raw_i8 = format!("%inst_ret_i8_{}", *temp_counter);
+                                    let ret_i8 = format!("%inst_ret_ok_{}", *temp_counter);
                                     *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
+                                    ir.push_str(&format!(
+                                        "  {} = load %struct.{}*, %struct.{}** {}\n  {} = bitcast %struct.{}* {} to i8*\n  {} = call i8* @__omni_rc_retain(i8* {})\n",
+                                        ld_inst, s_cls, s_cls, src_b.llvm_ptr, raw_i8, s_cls, ld_inst, ret_i8, raw_i8
+                                    ));
                                     let store_inst = if s_cls == struct_cls {
                                         ld_inst
                                     } else {
@@ -5806,37 +7194,65 @@ impl<'a> CodeGenerator<'a> {
                                         let s_cls = src_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                                         let f_idx_src = scope_tree.class_fields.get(s_cls).and_then(|m| m.get(fld_src)).copied().unwrap_or(0);
                                         let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, src_b.llvm_ptr));
                                         let gep_src = format!("%fld_gep_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
                                         let ld64 = format!("%fld_ld64_{}", *temp_counter);
-                                        *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                        let raw_i8 = format!("%fld_i8_{}", *temp_counter);
+                                        let ret_i8 = format!("%fld_ret_i8_{}", *temp_counter);
                                         let ptr_cast = format!("%ptr_cast_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", ptr_cast, ld64, struct_cls));
-                                        ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ptr_cast, struct_cls, alloca_ptr));
+                                        ir.push_str(&format!(
+                                            "  {} = load %struct.{}*, %struct.{}** {}\n  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n  {} = load i64, i64* {}\n  {} = inttoptr i64 {} to i8*\n  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = bitcast i8* {} to %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                                            ld_inst, s_cls, s_cls, src_b.llvm_ptr,
+                                            gep_src, s_cls, s_cls, ld_inst, f_idx_src,
+                                            ld64, gep_src,
+                                            raw_i8, ld64,
+                                            ret_i8, raw_i8,
+                                            ptr_cast, ret_i8, struct_cls,
+                                            struct_cls, ptr_cast, struct_cls, alloca_ptr
+                                        ));
                                     }
                                 }
                             } else if let Some(self_b) = scope_tree.resolve("self") {
                                 let s_cls = self_b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
                                 if let Some(&f_idx_src) = scope_tree.class_fields.get(s_cls).and_then(|m| m.get(trimmed_expr)) {
                                     let ld_inst = format!("%inst_ptr_ld_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = load %struct.{}*, %struct.{}** {}\n", ld_inst, s_cls, s_cls, self_b.llvm_ptr));
                                     let gep_src = format!("%fld_gep_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n", gep_src, s_cls, s_cls, ld_inst, f_idx_src));
                                     let ld64 = format!("%fld_ld64_{}", *temp_counter);
-                                    *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = load i64, i64* {}\n", ld64, gep_src));
+                                    let raw_i8 = format!("%fld_i8_{}", *temp_counter);
+                                    let ret_i8 = format!("%fld_ret_i8_{}", *temp_counter);
                                     let ptr_cast = format!("%ptr_cast_{}", *temp_counter);
                                     *temp_counter += 1;
-                                    ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", ptr_cast, ld64, struct_cls));
-                                    ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", struct_cls, ptr_cast, struct_cls, alloca_ptr));
+                                    ir.push_str(&format!(
+                                        "  {} = load %struct.{}*, %struct.{}** {}\n  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n  {} = load i64, i64* {}\n  {} = inttoptr i64 {} to i8*\n  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = bitcast i8* {} to %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                                        ld_inst, s_cls, s_cls, self_b.llvm_ptr,
+                                        gep_src, s_cls, s_cls, ld_inst, f_idx_src,
+                                        ld64, gep_src,
+                                        raw_i8, ld64,
+                                        ret_i8, raw_i8,
+                                        ptr_cast, ret_i8, struct_cls,
+                                        struct_cls, ptr_cast, struct_cls, alloca_ptr
+                                    ));
+                                } else {
+                                    let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                    let raw_p = self.coerce_to_ptr(tv, ir, temp_counter);
+                                    let ret_p = format!("%s_expr_ret_{}", *temp_counter);
+                                    let sp = format!("%s_expr_sp_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = bitcast i8* {} to %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                                        ret_p, raw_p, sp, ret_p, struct_cls, struct_cls, sp, struct_cls, alloca_ptr
+                                    ));
                                 }
+                            } else {
+                                let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                let raw_p = self.coerce_to_ptr(tv, ir, temp_counter);
+                                let ret_p = format!("%s_expr_ret_{}", *temp_counter);
+                                let sp = format!("%s_expr_sp_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = call i8* @__omni_rc_retain(i8* {})\n  {} = bitcast i8* {} to %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                                    ret_p, raw_p, sp, ret_p, struct_cls, struct_cls, sp, struct_cls, alloca_ptr
+                                ));
                             }
                             continue;
                         }
@@ -5866,10 +7282,14 @@ impl<'a> CodeGenerator<'a> {
                             if let Some(cls_name) = cls_name_opt {
                                 let f_count = scope_tree.class_fields.get(cls_name).map(|m| m.len()).unwrap_or(1);
                                 let alloc_bytes = (f_count * 8).max(8);
+                                let tid = scope_tree.class_type_ids.get(cls_name).copied().unwrap_or(0);
 
                                 let raw_inst = format!("%raw_init_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", raw_inst, alloc_bytes));
+                                ir.push_str(&format!(
+                                    "  {} = call i8* @__omni_obj_alloc(i64 {}, i64 {})\n",
+                                    raw_inst, alloc_bytes, tid
+                                ));
 
                                 let inst_alloc = format!("%inst_alloc_{}_{}", target, *temp_counter);
                                 *temp_counter += 1;
@@ -5900,11 +7320,22 @@ impl<'a> CodeGenerator<'a> {
                                     .flatten()
                                     .filter(|b| b.type_hint == expected_th)
                                 {
+                                    let old_ld = format!("%old_ctor_{}", *temp_counter);
+                                    let old_i8 = format!("%old_ctor_i8_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = load {}, {}* {}\n  {} = bitcast {} {} to i8*\n  call void @__omni_rc_release(i8* {})\n",
+                                        old_ld, expected_th, expected_th, eb.llvm_ptr, old_i8, expected_th, old_ld, old_i8
+                                    ));
                                     eb.llvm_ptr.clone()
                                 } else {
                                     let tp = format!("%var_{}_{}", target, *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = alloca %struct.{}*\n", tp, cls_name));
+                                    deferred_frees.push(CleanupOp::FreeHeapPtr {
+                                        slot_ptr: tp.clone(),
+                                        elem_ty: expected_th.clone(),
+                                    });
                                     scope_tree.insert(target.clone(), SymbolBinding {
                                         name: target.clone(),
                                         llvm_ptr: tp.clone(),
@@ -5919,21 +7350,36 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
 
-                    // Rust Struct Literal: `p = Point { x: 10, y: 20 }`
+                    // Rust Struct Literal: `p = Point { x: 10, y: 20 }` (Perceus refcounted via `@__omni_obj_alloc`)
                     if let Some(open) = trimmed_expr.find('{') {
                         if trimmed_expr.ends_with('}') {
                             let struct_cand = trimmed_expr[..open].trim();
                             if scope_tree.class_fields.contains_key(struct_cand) {
                                 let cls_name = struct_cand;
+                                let f_count = scope_tree.class_fields.get(cls_name).map(|m| m.len()).unwrap_or(1);
+                                let alloc_bytes = (f_count * 8).max(8);
+                                let tid = scope_tree.class_type_ids.get(cls_name).copied().unwrap_or(0);
+                                let raw_inst = format!("%raw_slit_{}_{}", target, *temp_counter);
                                 let inst_alloc = format!("%inst_alloc_{}_{}", target, *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca %struct.{}\n", inst_alloc, cls_name));
+                                ir.push_str(&format!(
+                                    "  {} = call i8* @__omni_obj_alloc(i64 {}, i64 {})\n  {} = bitcast i8* {} to %struct.{}*\n",
+                                    raw_inst, alloc_bytes, tid, inst_alloc, raw_inst, cls_name
+                                ));
+                                for f_idx in 0..f_count {
+                                    let zgep = format!("%zlit_gep_{}_{}", f_idx, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}\n  store i64 0, i64* {}\n",
+                                        zgep, cls_name, cls_name, inst_alloc, f_idx, zgep
+                                    ));
+                                }
 
                                 let inner = &trimmed_expr[open + 1..trimmed_expr.len() - 1];
-                                for field_part in inner.split(',') {
+                                for field_part in omni_parser::OmniParser::split_respecting_quotes(inner, ',') {
                                     let fp_trim = field_part.trim();
                                     if let Some((f_name, f_val)) = fp_trim.split_once(':') {
-                                        let fn_clean = f_name.trim();
+                                        let fn_clean = f_name.trim().trim_start_matches('.');
                                         if let Some(&f_idx) = scope_tree.class_fields.get(cls_name).and_then(|m| m.get(fn_clean)) {
                                             let ftv = self.eval_typed(f_val.trim(), ir, scope_tree, string_constants, temp_counter);
                                             if ftv.ty == IrType::F64 {
@@ -5950,27 +7396,52 @@ impl<'a> CodeGenerator<'a> {
                                     }
                                 }
 
-                                let target_ptr = format!("%var_{}_{}", target, *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca %struct.{}*\n", target_ptr, cls_name));
+                                let elem_ty = format!("%struct.{}*", cls_name);
+                                let target_ptr = if let Some(eb) = (!*is_scoped_decl)
+                                    .then(|| scope_tree.resolve(target))
+                                    .flatten()
+                                    .filter(|b| b.type_hint == elem_ty)
+                                {
+                                    let old_ld = format!("%old_slit_{}", *temp_counter);
+                                    let old_i8 = format!("%old_slit_i8_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = load {}, {}* {}\n  {} = bitcast {} {} to i8*\n  call void @__omni_rc_release(i8* {})\n",
+                                        old_ld, elem_ty, elem_ty, eb.llvm_ptr, old_i8, elem_ty, old_ld, old_i8
+                                    ));
+                                    eb.llvm_ptr.clone()
+                                } else {
+                                    let tp = format!("%var_{}_{}", target, *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!("  {} = alloca %struct.{}*\n", tp, cls_name));
+                                    deferred_frees.push(CleanupOp::FreeHeapPtr {
+                                        slot_ptr: tp.clone(),
+                                        elem_ty: elem_ty.clone(),
+                                    });
+                                    scope_tree.insert(target.clone(), SymbolBinding {
+                                        name: target.clone(),
+                                        llvm_ptr: tp.clone(),
+                                        type_hint: elem_ty,
+                                        is_scoped: true,
+                                    });
+                                    tp
+                                };
                                 ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls_name, inst_alloc, cls_name, target_ptr));
-                                scope_tree.insert(target.clone(), SymbolBinding {
-                                    name: target.clone(),
-                                    llvm_ptr: target_ptr,
-                                    type_hint: format!("%struct.{}*", cls_name),
-                                    is_scoped: true,
-                                });
                                 continue;
                             }
                         }
                     }
 
-                    // Rust Tagged Enum Variant Assignment: `s = Status::Pending` or `res = Result::Ok(100)`
+                    // Rust Tagged Enum Variant Assignment: `s = Status::Pending` or `res = Result::Ok(100)` (Perceus refcounted via `@__omni_obj_alloc`)
                     if let Some((e_name, var_info)) = scope_tree.resolve_enum_variant(trimmed_expr) {
                         let (tag, payload_val) = var_info;
+                        let raw_enum = format!("%raw_enum_{}_{}", target, *temp_counter);
                         let inst_alloc = format!("%enum_alloc_{}_{}", target, *temp_counter);
                         *temp_counter += 1;
-                        ir.push_str(&format!("  {} = alloca %enum.{}\n", inst_alloc, e_name));
+                        ir.push_str(&format!(
+                            "  {} = call i8* @__omni_obj_alloc(i64 16, i64 0)\n  {} = bitcast i8* {} to %enum.{}*\n",
+                            raw_enum, inst_alloc, raw_enum, e_name
+                        ));
 
                         let tag_gep = format!("%tag_gep_{}", *temp_counter);
                         *temp_counter += 1;
@@ -5995,11 +7466,22 @@ impl<'a> CodeGenerator<'a> {
                             .flatten()
                             .filter(|b| b.type_hint == expected_enum_th)
                         {
+                            let old_ld = format!("%old_enum_{}", *temp_counter);
+                            let old_i8 = format!("%old_enum_i8_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = load {}, {}* {}\n  {} = bitcast {} {} to i8*\n  call void @__omni_rc_release(i8* {})\n",
+                                old_ld, expected_enum_th, expected_enum_th, eb.llvm_ptr, old_i8, expected_enum_th, old_ld, old_i8
+                            ));
                             eb.llvm_ptr.clone()
                         } else {
                             let tp = format!("%var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca %enum.{}*\n", tp, e_name));
+                            deferred_frees.push(CleanupOp::FreeHeapPtr {
+                                slot_ptr: tp.clone(),
+                                elem_ty: expected_enum_th.clone(),
+                            });
                             scope_tree.insert(target.clone(), SymbolBinding {
                                 name: target.clone(),
                                 llvm_ptr: tp.clone(),
@@ -6066,10 +7548,11 @@ impl<'a> CodeGenerator<'a> {
 
                     // Method returning slice instance: `linkedlist.asList()`
                     if trimmed_expr.ends_with(".asList()") || trimmed_expr.ends_with(".toList()") {
+                        ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
                         let _ = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
                         let slice_ptr = format!("%slice_ptr_{}", *temp_counter);
                         *temp_counter += 1;
-                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", slice_ptr));
                         let target_ptr = format!("%slice_var_{}_{}", target, *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = alloca i8*\n", target_ptr));
@@ -6105,7 +7588,10 @@ impl<'a> CodeGenerator<'a> {
                                     if scope_tree.is_natively_routed_call(rec, method, &parts, trimmed_expr) {
                                         false
                                     } else {
-                                        scope_tree.resolve(rec).is_none() && !scope_tree.class_fields.contains_key(rec)
+                                        scope_tree.resolve(rec).is_none()
+                                            && !scope_tree.class_fields.contains_key(rec)
+                                            && (scope_tree.has_open_ns_import
+                                                || scope_tree.valid_extmod_prefixes.contains(rec))
                                     }
                                 } else {
                                     false
@@ -6249,6 +7735,8 @@ impl<'a> CodeGenerator<'a> {
                                         ir.push_str(&format!("  store i64 {}, i64* {}\n", sext_reg, target_ptr));
                                     }
                                 }
+                            } else if exec_lines.is_empty() {
+                                ir.push_str(&format!("  store i64 0, i64* {}\n", target_ptr));
                             }
                         }
                         continue;
@@ -6257,14 +7745,28 @@ impl<'a> CodeGenerator<'a> {
                     let existing_src_binding = scope_tree.resolve(trimmed_expr).cloned();
 
                     if let Some(src) = existing_src_binding.filter(|b| b.type_hint.starts_with("i8*")) {
-                        // Preserving collection/channel/string reference semantics (zero truncation)
+                        // Perceus refcount-safe aliasing (`b = a` increments `rc` and releases on scope exit)
                         if let Some(elem_ty) = scope_tree.collection_elem_types.get(trimmed_expr).cloned() {
                             scope_tree.collection_elem_types.insert(target.clone(), elem_ty);
                         }
+                        if let Some(pdefs) = scope_tree.fn_param_defs.get(trimmed_expr).cloned() {
+                            scope_tree.fn_param_defs.insert(target.clone(), pdefs);
+                        }
+                        if let Some(rt) = scope_tree.fn_return_types.get(trimmed_expr).cloned() {
+                            scope_tree.fn_return_types.insert(target.clone(), rt);
+                        }
+                        let loaded = format!("%ref_load_{}", *temp_counter);
+                        let retained = format!("%ref_ret_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = load i8*, i8** {}\n  {} = call i8* @__omni_rc_retain(i8* {})\n",
+                            loaded, src.llvm_ptr, retained, loaded
+                        ));
                         let ptr = if *is_scoped_decl || scope_tree.resolve(target).filter(|b| b.type_hint.starts_with("i8*")).is_none() {
                             let p = format!("%col_ref_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca i8*\n", p));
+                            deferred_frees.push(CleanupOp::ReleaseRc(p.clone()));
                             scope_tree.insert(
                                 target.clone(),
                                 SymbolBinding {
@@ -6276,13 +7778,17 @@ impl<'a> CodeGenerator<'a> {
                             );
                             p
                         } else {
-                            scope_tree.resolve(target).unwrap().llvm_ptr.clone()
+                            let existing_p = scope_tree.resolve(target).unwrap().llvm_ptr.clone();
+                            let old_ld = format!("%ref_old_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = load i8*, i8** {}\n  call void @__omni_rc_release(i8* {})\n",
+                                old_ld, existing_p, old_ld
+                            ));
+                            existing_p
                         };
 
-                        let loaded = format!("%ref_load_{}", *temp_counter);
-                        *temp_counter += 1;
-                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, src.llvm_ptr));
-                        ir.push_str(&format!("  store i8* {}, i8** {}\n", loaded, ptr));
+                        ir.push_str(&format!("  store i8* {}, i8** {}\n", retained, ptr));
                     } else if Self::is_string_expr(trimmed_expr, scope_tree)
                         || trimmed_expr.starts_with("input(")
                         || trimmed_expr == "input()"
@@ -6293,6 +7799,7 @@ impl<'a> CodeGenerator<'a> {
                             let ptr = format!("%str_var_{}_{}", target, *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                            deferred_frees.push(CleanupOp::ReleaseRc(ptr.clone()));
                             scope_tree.insert(
                                 target.clone(),
                                 SymbolBinding {
@@ -6381,7 +7888,44 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, tv.reg, cls, alloca_ptr));
                             }
                             IrType::Ptr => {
-                                let (ptr_hint, nested_elem) = if trimmed_expr.starts_with('[') && trimmed_expr.ends_with(']') {
+                                if let Some((lam_ps, lam_body)) = OmniParser::try_parse_lambda_expr(trimmed_expr) {
+                                    scope_tree.fn_param_defs.insert(target.clone(), lam_ps.clone());
+                                    let mut lmap = Self::build_param_ir_types(&lam_ps, &scope_tree.class_fields);
+                                    let inferred_rt = if lam_body.starts_with('{') && lam_body.ends_with('}') {
+                                        let stmts = OmniParser::new().parse_module("lam_rt", &lam_body[1..lam_body.len() - 1]).top_level_statements;
+                                        let mut sc = None;
+                                        let mut tp = None;
+                                        Self::infer_return_signature_with_locals(&stmts, &scope_tree.class_fields, None, &mut lmap, &mut sc, &mut tp);
+                                        sc
+                                    } else {
+                                        Self::infer_expr_return_ir_type_with_locals(&lam_body, &scope_tree.class_fields, None, Some(&lmap))
+                                    };
+                                    if let Some(rt) = inferred_rt {
+                                        scope_tree.fn_return_types.insert(target.clone(), rt);
+                                    }
+                                } else if let Some(open_p) = trimmed_expr.find('(') {
+                                    let head = trimmed_expr[..open_p].trim();
+                                    if let Some(crt) = scope_tree.fn_curried_return_types.get(head).cloned() {
+                                        scope_tree.fn_return_types.insert(target.clone(), crt);
+                                    }
+                                }
+                                let call_head_ptr_kind = trimmed_expr.find('(').and_then(|op| {
+                                    if trimmed_expr.ends_with(')') {
+                                        let h = trimmed_expr[..op].trim();
+                                        if h == "divmod" {
+                                            Some("i8* (omni_slice)".to_string())
+                                        } else {
+                                            scope_tree.fn_return_ptr_kinds.get(h).cloned()
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let (ptr_hint, nested_elem) = if OmniParser::try_parse_lambda_expr(trimmed_expr).is_some() {
+                                    ("i8* (omni_fn)".to_string(), None)
+                                } else if let Some(chk) = call_head_ptr_kind {
+                                    (chk, None)
+                                } else if trimmed_expr.starts_with('[') && trimmed_expr.ends_with(']') {
                                     let tag = Self::infer_elem_tag_from_expr(trimmed_expr, &tv.ty, scope_tree);
                                     let sub = tag.strip_prefix("omni_slice:").map(|s| s.to_string());
                                     ("i8* (omni_slice)".to_string(), sub)
@@ -6428,11 +7972,18 @@ impl<'a> CodeGenerator<'a> {
                                     scope_tree.collection_elem_types.insert(target.clone(), sub_ty);
                                 }
                                 let alloca_ptr = if let Some(eb) = existing_target.filter(|b| b.type_hint.starts_with("i8*")) {
+                                    let old_ld = format!("%ptr_old_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = load i8*, i8** {}\n  call void @__omni_rc_release(i8* {})\n",
+                                        old_ld, eb.llvm_ptr, old_ld
+                                    ));
                                     eb.llvm_ptr
                                 } else {
                                     let ptr = format!("%ptr_var_{}_{}", target, *temp_counter);
                                     *temp_counter += 1;
                                     ir.push_str(&format!("  {} = alloca i8*\n", ptr));
+                                    deferred_frees.push(CleanupOp::ReleaseRc(ptr.clone()));
                                     scope_tree.insert(
                                         target.clone(),
                                         SymbolBinding {
@@ -6456,7 +8007,7 @@ impl<'a> CodeGenerator<'a> {
                                         let v64 = self.coerce_to_i64(tv, ir, temp_counter);
                                         let tramp = format!("%assign_tramp_{}", *temp_counter);
                                         *temp_counter += 1;
-                                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp));
+                                        ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", tramp));
                                         let is_null = format!("%assign_is_null_{}", *temp_counter);
                                         *temp_counter += 1;
                                         ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", is_null, tramp));
@@ -6699,6 +8250,7 @@ impl<'a> CodeGenerator<'a> {
                     scope_tree.loop_cond_labels.push(cond_lbl.clone());
                     scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
                     let while_snapshot = deferred_frees.len();
+                    scope_tree.loop_cleanup_marks.push(while_snapshot);
                     let body_ret = self.lower_statements(
                         body,
                         ir,
@@ -6716,6 +8268,7 @@ impl<'a> CodeGenerator<'a> {
                         dynamic_declarations,
                         false,
                     )?;
+                    scope_tree.loop_cleanup_marks.pop();
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
                     scope_tree.loop_entry_try_depths.pop();
@@ -6868,6 +8421,7 @@ impl<'a> CodeGenerator<'a> {
                         scope_tree.loop_cond_labels.push(inc_lbl.clone());
                         scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
                         let for_snapshot = deferred_frees.len();
+                        scope_tree.loop_cleanup_marks.push(for_snapshot);
                         let body_ret = self.lower_statements(
                             body,
                             ir,
@@ -6885,6 +8439,7 @@ impl<'a> CodeGenerator<'a> {
                             dynamic_declarations,
                             false,
                         )?;
+                        scope_tree.loop_cleanup_marks.pop();
                         scope_tree.loop_exit_labels.pop();
                         scope_tree.loop_cond_labels.pop();
                         scope_tree.loop_entry_try_depths.pop();
@@ -6958,6 +8513,7 @@ impl<'a> CodeGenerator<'a> {
                     scope_tree.loop_cond_labels.push(inc_lbl.clone());
                     scope_tree.loop_entry_try_depths.push(scope_tree.active_try_depth);
                     let for_snapshot = deferred_frees.len();
+                    scope_tree.loop_cleanup_marks.push(for_snapshot);
                     let body_ret = self.lower_statements(
                         body,
                         ir,
@@ -6975,6 +8531,7 @@ impl<'a> CodeGenerator<'a> {
                         dynamic_declarations,
                         false,
                     )?;
+                    scope_tree.loop_cleanup_marks.pop();
                     scope_tree.loop_exit_labels.pop();
                     scope_tree.loop_cond_labels.pop();
                     scope_tree.loop_entry_try_depths.pop();
@@ -7024,10 +8581,11 @@ impl<'a> CodeGenerator<'a> {
                         } else {
                             clean_var.to_string()
                         };
+                        ir.push_str("  call void @__omni_c_return_ptr(i8* null)\n");
                         let _ = self.eval_typed(&call_target, ir, scope_tree, string_constants, temp_counter);
                         let slice_ptr = format!("%slice_print_ptr_{}", *temp_counter);
                         *temp_counter += 1;
-                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", slice_ptr));
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", slice_ptr));
                         ir.push_str(&format!("  call void @__omni_slice_print(i8* {})\n", slice_ptr));
                         continue;
                     }
@@ -7255,11 +8813,13 @@ impl<'a> CodeGenerator<'a> {
                                 || b.type_hint.contains("omni_chan")
                                 || b.type_hint.starts_with("i8*")
                             {
-                                // Preserve returned heap handle across RAII cleanups
+                                // Preserve returned heap/closure/collection handle across RAII cleanups
                                 deferred_frees.retain(|op| match op {
                                     CleanupOp::DestroySlice(p)
                                     | CleanupOp::DestroyMap(p)
-                                    | CleanupOp::DestroyChan(p) => p != &b.llvm_ptr,
+                                    | CleanupOp::DestroyChan(p)
+                                    | CleanupOp::ReleaseRc(p) => p != &b.llvm_ptr,
+                                    CleanupOp::FreeHeapPtr { slot_ptr, .. } => slot_ptr != &b.llvm_ptr,
                                     _ => true,
                                 });
                                 let loaded = format!("%ret_ptr_ld_{}", *temp_counter);
@@ -7271,10 +8831,29 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_i64, loaded));
                                 cast_i64
                             } else if b.type_hint.starts_with("%struct.") {
+                                deferred_frees.retain(|op| match op {
+                                    CleanupOp::FreeHeapPtr { slot_ptr, .. } => slot_ptr != &b.llvm_ptr,
+                                    _ => true,
+                                });
                                 let tv = self.eval_typed(trimmed_e, ir, scope_tree, string_constants, temp_counter);
                                 let p8 = self.coerce_to_ptr(tv.clone(), ir, temp_counter);
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p8));
                                 self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
+                            } else if b.type_hint.starts_with("%enum.") {
+                                deferred_frees.retain(|op| match op {
+                                    CleanupOp::FreeHeapPtr { slot_ptr, .. } => slot_ptr != &b.llvm_ptr,
+                                    _ => true,
+                                });
+                                let en_name = b.type_hint.trim_start_matches("%enum.").trim_end_matches('*');
+                                let loaded = format!("%ret_enum_ld_{}", *temp_counter);
+                                let raw_i8 = format!("%ret_enum_i8_{}", *temp_counter);
+                                let cast_i64 = format!("%ret_enum_i64_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!(
+                                    "  {} = load %enum.{}*, %enum.{}** {}\n  {} = bitcast %enum.{}* {} to i8*\n  call void @__omni_c_return_ptr(i8* {})\n  {} = ptrtoint i8* {} to i64\n",
+                                    loaded, en_name, en_name, b.llvm_ptr, raw_i8, en_name, loaded, raw_i8, cast_i64, raw_i8
+                                ));
+                                cast_i64
                             } else {
                                 let tv = self.eval_typed(e, ir, scope_tree, string_constants, temp_counter);
                                 self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
@@ -7291,6 +8870,14 @@ impl<'a> CodeGenerator<'a> {
                         "0".to_string()
                     };
 
+                    // Drain active fibers/threads BEFORE main destroys local channels/collections (`[C6.5]`)
+                    if fn_name == "main" && !self.target_triple.starts_with("thumb") {
+                        ir.push_str("  call void @__omni_fiber_join_all()\n");
+                        ir.push_str("  call void @__omni_thread_join_all()\n");
+                    }
+                    if !scope_tree.closure_env_writebacks.is_empty() {
+                        Self::emit_closure_writebacks(ir, &scope_tree.closure_env_writebacks, temp_counter);
+                    }
                     // Execute active cleanups (including popping any active `jmp_buf` try frames)
                     Self::emit_cleanups(ir, deferred_frees, temp_counter, "Return");
 
@@ -7772,7 +9359,28 @@ impl<'a> CodeGenerator<'a> {
                         }
                         let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
-                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
+                        if let Some(int_str) = k.strip_prefix("\x01int:") {
+                            let k64 = int_str.parse::<i64>().unwrap_or(0);
+                            ir.push_str(&format!(
+                                "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
+                                map_res, k64, val_64
+                            ));
+                        } else if let Some(kb) = scope_tree.resolve(k) {
+                            if is_string_type_hint(&kb.type_hint) {
+                                let kp = self.eval_str_ptr(k, ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!(
+                                    "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
+                                    map_res, kp, val_64
+                                ));
+                            } else {
+                                let ktv = self.eval_typed(k, ir, scope_tree, string_constants, temp_counter);
+                                let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
+                                ir.push_str(&format!(
+                                    "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
+                                    map_res, k64, val_64
+                                ));
+                            }
+                        } else if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
                             let str_ptr = format!("%str_ptr_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
@@ -7829,7 +9437,7 @@ impl<'a> CodeGenerator<'a> {
                                 let tv = self.eval_typed(a_trim, ir, scope_tree, string_constants, temp_counter);
                                 self.coerce_to_raw_i64_bits(tv, ir, temp_counter)
                             } else {
-                                "0".to_string()
+                                "-581005069656919554".to_string()
                             };
                             let slot_ptr = format!("%spawn_slot_{}_{}", slot, *temp_counter);
                             *temp_counter += 1;
@@ -7849,7 +9457,10 @@ impl<'a> CodeGenerator<'a> {
                             let tv = self.eval_typed(raw_arg, ir, scope_tree, string_constants, temp_counter);
                             self.coerce_to_ptr(tv, ir, temp_counter)
                         } else {
-                            "null".to_string()
+                            let u_ptr = format!("%spawn_unset_ptr_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = inttoptr i64 -581005069656919554 to i8*\n", u_ptr));
+                            u_ptr
                         };
 
                         ir.push_str(&format!("  ; >>> [Go Concurrency Spawn: {}]\n", call_expr));
@@ -7988,9 +9599,15 @@ impl<'a> CodeGenerator<'a> {
                     let trimmed_code = code.trim().trim_end_matches(';').trim();
                     if trimmed_code == "break" {
                         if let Some(exit_lbl) = scope_tree.loop_exit_labels.last().cloned() {
-                            let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
-                            for _ in entry_depth..scope_tree.active_try_depth {
-                                ir.push_str("  call void @__omni_try_pop()\n");
+                            if let Some(&mark) = scope_tree.loop_cleanup_marks.last() {
+                                if mark <= deferred_frees.len() {
+                                    Self::emit_cleanups(ir, &deferred_frees[mark..], temp_counter, "Break Loop Jump");
+                                }
+                            } else {
+                                let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
+                                for _ in entry_depth..scope_tree.active_try_depth {
+                                    ir.push_str("  call void @__omni_try_pop()\n");
+                                }
                             }
                             ir.push_str(&format!("  br label %{}\n", exit_lbl));
                             custom_return = true;
@@ -8000,9 +9617,15 @@ impl<'a> CodeGenerator<'a> {
                     }
                     if trimmed_code == "continue" {
                         if let Some(cond_lbl) = scope_tree.loop_cond_labels.last().cloned() {
-                            let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
-                            for _ in entry_depth..scope_tree.active_try_depth {
-                                ir.push_str("  call void @__omni_try_pop()\n");
+                            if let Some(&mark) = scope_tree.loop_cleanup_marks.last() {
+                                if mark <= deferred_frees.len() {
+                                    Self::emit_cleanups(ir, &deferred_frees[mark..], temp_counter, "Continue Loop Jump");
+                                }
+                            } else {
+                                let entry_depth = scope_tree.loop_entry_try_depths.last().copied().unwrap_or(0);
+                                for _ in entry_depth..scope_tree.active_try_depth {
+                                    ir.push_str("  call void @__omni_try_pop()\n");
+                                }
                             }
                             ir.push_str(&format!("  br label %{}\n", cond_lbl));
                             custom_return = true;
@@ -8032,6 +9655,9 @@ impl<'a> CodeGenerator<'a> {
                     // Stack-unwinding `raise` / `throw` via `_Thread_local` `setjmp`/`longjmp`
                     if let Some((exc_type_opt, msg_opt)) = Self::parse_raise_or_throw(trimmed_code) {
                         if exc_type_opt.is_none() && msg_opt.is_none() {
+                            if scope_tree.active_try_depth == 0 {
+                                Self::emit_cleanups(ir, deferred_frees, temp_counter, "Rethrow Function Unwind");
+                            }
                             ir.push_str("  call void @__omni_rethrow()\n");
                             ir.push_str("  unreachable\n");
                         } else {
@@ -8052,6 +9678,9 @@ impl<'a> CodeGenerator<'a> {
                             } else {
                                 self.eval_str_ptr("\"\"", ir, scope_tree, string_constants, temp_counter)
                             };
+                            if scope_tree.active_try_depth == 0 {
+                                Self::emit_cleanups(ir, deferred_frees, temp_counter, "Throw Function Unwind");
+                            }
                             ir.push_str(&format!(
                                 "  call void @__omni_throw(i64 1, i8* {}, i8* {})\n",
                                 ty_ptr, msg_ptr
@@ -8060,6 +9689,41 @@ impl<'a> CodeGenerator<'a> {
                         }
                         custom_return = true;
                         break;
+                    }
+
+                    // Python `del m[k]` / `del m[k1], m[k2]` map entry deletion (`[C5.2]`)
+                    if let Some(del_rest) = trimmed_code.strip_prefix("del ") {
+                        let mut handled_all_del = false;
+                        for del_item in omni_parser::OmniParser::split_respecting_quotes(del_rest.trim(), ',') {
+                            let dt = del_item.trim();
+                            if let (Some(lb), true) = (dt.find('['), dt.ends_with(']')) {
+                                let map_var = dt[..lb].trim();
+                                let key_expr = dt[lb + 1..dt.len() - 1].trim();
+                                if let Some(b) = scope_tree.resolve(map_var).cloned() {
+                                    if b.type_hint.contains("omni_map") {
+                                        let m_ld = format!("%del_map_ld_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", m_ld, b.llvm_ptr));
+                                        let ktv = self.eval_typed(key_expr, ir, scope_tree, string_constants, temp_counter);
+                                        if ktv.ty == IrType::Ptr {
+                                            let kp = self.coerce_to_ptr(ktv, ir, temp_counter);
+                                            let d_ign = format!("%del_res_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = call i64 @__omni_map_delete(i8* {}, i8* {})\n", d_ign, m_ld, kp));
+                                        } else {
+                                            let ki = self.coerce_to_i64(ktv, ir, temp_counter);
+                                            let d_ign = format!("%del_res_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = call i64 @__omni_map_delete_int(i8* {}, i64 {})\n", d_ign, m_ld, ki));
+                                        }
+                                        handled_all_del = true;
+                                    }
+                                }
+                            }
+                        }
+                        if handled_all_del {
+                            continue;
+                        }
                     }
 
                     // Builtin exit(code)
@@ -8190,6 +9854,9 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", p8));
                             }
                             let ret_val = self.coerce_to_raw_i64_bits(rtv, ir, temp_counter);
+                            if !scope_tree.closure_env_writebacks.is_empty() {
+                                Self::emit_closure_writebacks(ir, &scope_tree.closure_env_writebacks, temp_counter);
+                            }
                             Self::emit_cleanups(ir, deferred_frees, temp_counter, "Implicit Return");
                             ir.push_str(&format!("  ret i64 {}\n", ret_val));
                             custom_return = true;
@@ -8256,13 +9923,21 @@ impl<'a> CodeGenerator<'a> {
                             let cls_cand = raw_cls_cand.split('<').next().unwrap_or(raw_cls_cand).trim();
                             if scope_tree.class_fields.contains_key(cls_cand) {
                                 let cls_name = cls_cand.to_string();
-                                let inst_alloc = format!("%inst_alloc_with_{}", *temp_counter);
-                                *temp_counter += 1;
-                                ir.push_str(&format!("  {} = alloca %struct.{}\n", inst_alloc, cls_name));
-
+                                let f_count = scope_tree.class_fields.get(&cls_name).map(|m| m.len()).unwrap_or(1);
+                                let alloc_bytes = (f_count * 8).max(8);
+                                let tid = scope_tree.class_type_ids.get(&cls_name).copied().unwrap_or(0);
                                 let raw_inst = format!("%raw_with_init_{}", *temp_counter);
+                                let inst_alloc = format!("%inst_alloc_with_{}", *temp_counter);
+                                let hold_slot = format!("%with_hold_{}", *temp_counter);
                                 *temp_counter += 1;
-                                ir.push_str(&format!("  {} = bitcast %struct.{}* {} to i8*\n", raw_inst, cls_name, inst_alloc));
+                                ir.push_str(&format!(
+                                    "  {} = call i8* @__omni_obj_alloc(i64 {}, i64 {})\n  {} = bitcast i8* {} to %struct.{}*\n  {} = alloca %struct.{}*\n  store %struct.{}* {}, %struct.{}** {}\n",
+                                    raw_inst, alloc_bytes, tid, inst_alloc, raw_inst, cls_name, hold_slot, cls_name, cls_name, inst_alloc, cls_name, hold_slot
+                                ));
+                                deferred_frees.push(CleanupOp::FreeHeapPtr {
+                                    slot_ptr: hold_slot,
+                                    elem_ty: format!("%struct.{}*", cls_name),
+                                });
 
                                 let inner = &with_cand_expr[open + 1..with_cand_expr.len() - 1];
                                 let raw_args: Vec<String> = if inner.is_empty() {
@@ -8429,7 +10104,7 @@ impl<'a> CodeGenerator<'a> {
                             let rhs_tv = self.eval_typed(expr_trim, ir, scope_tree, string_constants, temp_counter);
                             let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
                             *temp_counter += 1;
-                            ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
+                            ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", tramp_ptr));
                             let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
@@ -8444,7 +10119,7 @@ impl<'a> CodeGenerator<'a> {
                         let rhs_tv = self.eval_typed(expr_trim, ir, scope_tree, string_constants, temp_counter);
                         let tramp_ptr = format!("%tramp_unpack_src_{}", *temp_counter);
                         *temp_counter += 1;
-                        ir.push_str(&format!("  {} = call i8* @__omni_c_get_returned_ptr()\n", tramp_ptr));
+                        ir.push_str(&format!("  {} = call i8* @__omni_c_consume_returned_ptr()\n", tramp_ptr));
                         let tramp_is_null = format!("%tramp_is_null_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = icmp eq i8* {}, null\n", tramp_is_null, tramp_ptr));
@@ -8460,17 +10135,6 @@ impl<'a> CodeGenerator<'a> {
                         None
                     } else if expr_trim.contains(".accept(") {
                         Some(vec![IrType::I64, IrType::Ptr])
-                    } else if expr_trim.contains("newkeys(") {
-                        if scope_tree.class_fields.contains_key("PublicKey")
-                            && scope_tree.class_fields.contains_key("PrivateKey")
-                        {
-                            Some(vec![
-                                IrType::StructPtr("PublicKey".to_string()),
-                                IrType::StructPtr("PrivateKey".to_string()),
-                            ])
-                        } else {
-                            Some(vec![IrType::Ptr, IrType::Ptr])
-                        }
                     } else if let Some(open) = expr_trim.find('(') {
                         let raw_callee = expr_trim[..open].trim();
                         let fn_ident = raw_callee.rsplit('.').next().unwrap_or(raw_callee).trim();
@@ -8738,10 +10402,13 @@ impl<'a> CodeGenerator<'a> {
                         Self::emit_cleanups(ir, &deferred_frees[try_cleanup_mark..], temp_counter, "Try Normal Exit");
                         ir.push_str(&format!("  br label %{}\n\n", finally_lbl));
                     }
-                    deferred_frees.truncate(try_cleanup_mark);
 
                     // --- Catch Dispatch (`longjmp` already popped the `OmniTryFrame` in C runtime) ---
                     ir.push_str(&format!("{}:\n", catch_disp_lbl));
+                    if try_cleanup_mark + 1 < deferred_frees.len() {
+                        Self::emit_cleanups(ir, &deferred_frees[try_cleanup_mark + 1..], temp_counter, "Try Unwind Cleanup");
+                    }
+                    deferred_frees.truncate(try_cleanup_mark);
                     if catch_clauses.is_empty() {
                         ir.push_str(&format!("  br label %{}\n\n", unhandled_lbl));
                     } else {
@@ -8856,11 +10523,17 @@ impl<'a> CodeGenerator<'a> {
                         scope_tree.exit_scope();
                         if !fin_ret {
                             Self::emit_cleanups(ir, &deferred_frees[fin_mark..], temp_counter, "Finally Unhandled Exit");
+                            if scope_tree.active_try_depth == 0 {
+                                Self::emit_cleanups(ir, &deferred_frees[..fin_mark], temp_counter, "Unhandled Function Unwind");
+                            }
                             ir.push_str("  call void @__omni_rethrow()\n");
                             ir.push_str("  unreachable\n\n");
                         }
                         deferred_frees.truncate(fin_mark);
                     } else {
+                        if scope_tree.active_try_depth == 0 {
+                            Self::emit_cleanups(ir, deferred_frees, temp_counter, "Unhandled Function Unwind");
+                        }
                         ir.push_str("  call void @__omni_rethrow()\n");
                         ir.push_str("  unreachable\n\n");
                     }
@@ -8897,13 +10570,70 @@ impl<'a> CodeGenerator<'a> {
                     ir.push_str(&format!("  br label %{}\n\n", end_lbl));
                     ir.push_str(&format!("{}:\n", end_lbl));
                 }
+
+                // 16. Nested Local Function / Lambda Declaration (`def inner(x): ...`, `f = lambda x: ...`)
+                Statement::LocalFnDef { func } => {
+                    let clos_ptr = self.lower_closure_def(func, ir, scope_tree, string_constants, temp_counter);
+                    let slot = if let Some(eb) = scope_tree
+                        .resolve(&func.name)
+                        .filter(|b| b.type_hint.starts_with("i8*"))
+                    {
+                        let p = eb.llvm_ptr.clone();
+                        let old_ld = format!("%clos_old_{}", *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!(
+                            "  {} = load i8*, i8** {}\n  call void @__omni_rc_release(i8* {})\n",
+                            old_ld, p, old_ld
+                        ));
+                        p
+                    } else {
+                        let p = format!("%clos_var_{}_{}", func.name, *temp_counter);
+                        *temp_counter += 1;
+                        ir.push_str(&format!("  {} = alloca i8*\n", p));
+                        deferred_frees.push(CleanupOp::ReleaseRc(p.clone()));
+                        scope_tree.insert(
+                            func.name.clone(),
+                            SymbolBinding {
+                                name: func.name.clone(),
+                                llvm_ptr: p.clone(),
+                                type_hint: "i8* (omni_fn)".to_string(),
+                                is_scoped: true,
+                            },
+                        );
+                        p
+                    };
+                    ir.push_str(&format!("  store i8* {}, i8** {}\n", clos_ptr, slot));
+                    scope_tree.fn_param_defs.insert(func.name.clone(), func.params.clone());
+                    if let Some(ref rt) = func.return_type {
+                        scope_tree
+                            .fn_return_types
+                            .insert(func.name.clone(), classify_type_token(rt, &scope_tree.class_fields));
+                    } else {
+                        let mut sc = None;
+                        let mut tp = None;
+                        let mut lmap = Self::build_param_ir_types(&func.params, &scope_tree.class_fields);
+                        Self::infer_return_signature_with_locals(&func.body, &scope_tree.class_fields, None, &mut lmap, &mut sc, &mut tp);
+                        if let Some(slots) = tp {
+                            let resolved: Vec<IrType> = slots.into_iter().map(|o| o.unwrap_or(IrType::I64)).collect();
+                            scope_tree.fn_tuple_return_types.insert(func.name.clone(), resolved);
+                            scope_tree.fn_return_types.insert(func.name.clone(), IrType::Ptr);
+                        } else if let Some(s_ty) = sc {
+                            scope_tree.fn_return_types.insert(func.name.clone(), s_ty);
+                        }
+                        if let Some(pk) = Self::infer_return_ptr_kind(&func.body, &func.params) {
+                            scope_tree.fn_return_ptr_kinds.insert(func.name.clone(), pk);
+                        }
+                    }
+                }
             }
         }
 
         Ok(custom_return)
     }
 
-    /// Hoist all `alloca` instructions in a single LLVM function body to immediately after `entry:`
+    /// Hoist all `alloca` instructions in a single LLVM function body to immediately after `entry:`,
+    /// zero-initializing pointer `alloca` slots (`i8*`, `%struct.X*`, `%enum.E*`) to `null` so early
+    /// `break` / `continue` / `_setjmp` unwind cleanups never read uninitialized stack slots.
     fn hoist_allocas(fn_ir: &str) -> String {
         let mut allocas = Vec::new();
         let mut body_lines = Vec::new();
@@ -8917,7 +10647,7 @@ impl<'a> CodeGenerator<'a> {
         if allocas.is_empty() {
             return fn_ir.to_string();
         }
-        let mut out = String::with_capacity(fn_ir.len() + 32);
+        let mut out = String::with_capacity(fn_ir.len() + allocas.len() * 32);
         let mut inserted = false;
         for line in body_lines {
             out.push_str(line);
@@ -8927,36 +10657,193 @@ impl<'a> CodeGenerator<'a> {
                     out.push_str(a);
                     out.push('\n');
                 }
+                for a in &allocas {
+                    if let Some((lhs, rhs)) = a.trim().split_once(" = alloca ") {
+                        let ty = rhs.trim();
+                        if ty.ends_with('*') {
+                            out.push_str(&format!("  store {} null, {}* {}\n", ty, ty, lhs.trim()));
+                        }
+                    }
+                }
                 inserted = true;
             }
         }
         out
     }
 
+    #[allow(dead_code)]
     fn parse_default_i64(def_opt: &Option<String>) -> Option<i64> {
         let d = def_opt.as_ref()?.trim();
         if d == "True" || d == "true" {
             Some(1)
         } else if d == "False" || d == "false" || is_null_literal(d) {
             Some(0)
-        } else if d.contains("DEFAULT_EXPONENT") {
-            Some(65537)
         } else {
             parse_polyglot_i64(d)
         }
     }
 
+    fn build_param_ir_types(
+        params: &[omni_parser::ParamDef],
+        class_fields: &HashMap<String, HashMap<String, usize>>,
+    ) -> HashMap<String, IrType> {
+        let mut map = HashMap::new();
+        for p in params {
+            if let Some(ref th) = p.type_hint {
+                let clean = th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim();
+                if is_float_type_hint(clean) {
+                    map.insert(p.name.clone(), IrType::F64);
+                } else if is_string_type_hint(clean) || clean == "str" {
+                    map.insert(p.name.clone(), IrType::Ptr);
+                } else if class_fields.contains_key(clean) {
+                    map.insert(p.name.clone(), IrType::StructPtr(clean.to_string()));
+                }
+            } else if let Some(ref dv) = p.default_val {
+                let dt = dv.trim();
+                if (dt.starts_with('"') && dt.ends_with('"')) || (dt.starts_with('\'') && dt.ends_with('\'')) {
+                    map.insert(p.name.clone(), IrType::Ptr);
+                } else if Self::parse_default_i64(&p.default_val).is_none() && parse_polyglot_f64(dt).is_some() {
+                    map.insert(p.name.clone(), IrType::F64);
+                }
+            }
+        }
+        map
+    }
+
+    fn infer_return_ptr_kind(stmts: &[Statement], params: &[omni_parser::ParamDef]) -> Option<String> {
+        fn walk(stmts: &[Statement], kinds: &mut HashMap<String, String>, out: &mut Option<String>) {
+            for s in stmts {
+                if let Statement::LocalFnDef { func } = s {
+                    kinds.insert(func.name.clone(), "i8* (omni_fn)".to_string());
+                }
+            }
+            for s in stmts {
+                match s {
+                    Statement::ListInit { target, .. } => {
+                        kinds.insert(target.trim().to_string(), "i8* (omni_slice)".to_string());
+                    }
+                    Statement::MapInit { target, .. } => {
+                        kinds.insert(target.trim().to_string(), "i8* (omni_map)".to_string());
+                    }
+                    Statement::Assign { target, expr, .. } => {
+                        let e = expr.trim();
+                        if !target.contains('.') && !target.contains('[') {
+                            let k_opt = if (e.starts_with('[') && e.ends_with(']'))
+                                || (e.starts_with("list(") && e.ends_with(')'))
+                                || e.contains(".split(")
+                                || e.ends_with(".chars()")
+                                || e.starts_with("divmod(")
+                            {
+                                Some("i8* (omni_slice)".to_string())
+                            } else if OmniParser::try_parse_lambda_expr(e).is_some() {
+                                Some("i8* (omni_fn)".to_string())
+                            } else if e.starts_with('{') && e.ends_with('}') {
+                                Some("i8* (omni_map)".to_string())
+                            } else if e.starts_with("make(") && e.contains("chan") {
+                                Some("i8* (omni_chan)".to_string())
+                            } else {
+                                kinds.get(e).cloned()
+                            };
+                            if let Some(k) = k_opt {
+                                kinds.insert(target.trim().to_string(), k);
+                            }
+                        }
+                    }
+                    Statement::Return { expr: Some(e) } => {
+                        let t = e.trim();
+                        let u = if t.starts_with('(') && t.ends_with(')') {
+                            t[1..t.len() - 1].trim()
+                        } else {
+                            t
+                        };
+                        if OmniParser::split_respecting_quotes(u, ',').len() > 1
+                            || (u.starts_with('[') && u.ends_with(']'))
+                            || (u.starts_with("list(") && u.ends_with(')'))
+                            || u.contains(".split(")
+                            || u.starts_with("divmod(")
+                        {
+                            *out = Some("i8* (omni_slice)".to_string());
+                        } else if OmniParser::try_parse_lambda_expr(u).is_some() {
+                            *out = Some("i8* (omni_fn)".to_string());
+                        } else if u.starts_with('{') && u.ends_with('}') {
+                            *out = Some("i8* (omni_map)".to_string());
+                        } else if let Some(k) = kinds.get(u) {
+                            *out = Some(k.clone());
+                        }
+                    }
+                    Statement::If { then_branch, else_branch, .. } => {
+                        walk(then_branch, kinds, out);
+                        if let Some(eb) = else_branch {
+                            walk(eb, kinds, out);
+                        }
+                    }
+                    Statement::WhileLoop { body, .. }
+                    | Statement::ForLoop { body, .. }
+                    | Statement::WithContext { body, .. } => {
+                        walk(body, kinds, out);
+                    }
+                    Statement::TryCatch { try_block, catch_clauses, finally_block } => {
+                        walk(try_block, kinds, out);
+                        for c in catch_clauses {
+                            walk(&c.body, kinds, out);
+                        }
+                        if let Some(fb) = finally_block {
+                            walk(fb, kinds, out);
+                        }
+                    }
+                    Statement::Match { arms, .. } => {
+                        for arm in arms {
+                            walk(&arm.body, kinds, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut kinds = HashMap::new();
+        for p in params {
+            let pl = p.name.to_lowercase();
+            let th_l = p.type_hint.as_deref().unwrap_or("").to_lowercase();
+            if th_l.contains("slice") || th_l.contains("list") || matches!(pl.as_str(), "slice" | "items" | "arr" | "list") {
+                kinds.insert(p.name.clone(), "i8* (omni_slice)".to_string());
+            } else if th_l.contains("map") || th_l.contains("dict") || matches!(pl.as_str(), "map" | "dict") {
+                kinds.insert(p.name.clone(), "i8* (omni_map)".to_string());
+            } else if th_l.contains("chan") || matches!(pl.as_str(), "ch" | "chan") {
+                kinds.insert(p.name.clone(), "i8* (omni_chan)".to_string());
+            } else if th_l.contains("callable") || th_l.contains("fn") || pl == "callback" || pl.ends_with("_fn") || pl.ends_with("_func") {
+                kinds.insert(p.name.clone(), "i8* (omni_fn)".to_string());
+            }
+        }
+        let mut out = None;
+        walk(stmts, &mut kinds, &mut out);
+        out
+    }
+
+    #[allow(dead_code)]
     fn infer_expr_return_ir_type(
         expr: &str,
         class_fields: &HashMap<String, HashMap<String, usize>>,
         self_field_types: Option<&HashMap<String, String>>,
     ) -> Option<IrType> {
+        Self::infer_expr_return_ir_type_with_locals(expr, class_fields, self_field_types, None)
+    }
+
+    fn infer_expr_return_ir_type_with_locals(
+        expr: &str,
+        class_fields: &HashMap<String, HashMap<String, usize>>,
+        self_field_types: Option<&HashMap<String, String>>,
+        local_types: Option<&HashMap<String, IrType>>,
+    ) -> Option<IrType> {
         let e = expr.trim();
         if e.is_empty() || is_null_literal(e) {
             return None;
         }
-        if (e.starts_with('"') && e.ends_with('"'))
-            || (e.starts_with('\'') && e.ends_with('\''))
+        if let Some(lt_map) = local_types {
+            if let Some(found) = lt_map.get(e) {
+                return Some(found.clone());
+            }
+        }
+        if Self::strip_str_literal_quotes(e).is_some()
             || e.starts_with("f\"")
             || e.starts_with("f'")
             || e.starts_with("errors.New(")
@@ -8973,17 +10860,36 @@ impl<'a> CodeGenerator<'a> {
         if let Some(open) = e.find('(') {
             if e.ends_with(')') {
                 let head = e[..open].trim().trim_start_matches("new ").trim();
+                let head_base = head.split('<').next().unwrap_or(head).trim();
+                if class_fields.contains_key(head_base) {
+                    return Some(IrType::StructPtr(head_base.to_string()));
+                }
+            }
+        }
+        if let Some(open_b) = e.find('{') {
+            if e.ends_with('}') {
+                let head = e[..open_b].trim();
                 if class_fields.contains_key(head) {
                     return Some(IrType::StructPtr(head.to_string()));
                 }
             }
         }
+        if OmniParser::try_parse_lambda_expr(e).is_some() {
+            return Some(IrType::Ptr);
+        }
         if let Ok(ast) = OmniParser::parse_expr(e) {
             match ast.node {
+                ExprAst::Ident(ref id) => {
+                    if let Some(lt_map) = local_types {
+                        if let Some(found) = lt_map.get(id) {
+                            return Some(found.clone());
+                        }
+                    }
+                }
                 ExprAst::FloatLit(_) => return Some(IrType::F64),
                 ExprAst::StrLit(_) | ExprAst::ListLit(_) | ExprAst::MapLit(_) => return Some(IrType::Ptr),
                 ExprAst::Unary { op, rhs } if op == "-" || op == "+" => {
-                    return Self::infer_expr_return_ir_type(rhs.slice(e), class_fields, self_field_types);
+                    return Self::infer_expr_return_ir_type_with_locals(rhs.slice(e), class_fields, self_field_types, local_types);
                 }
                 ExprAst::Member { target, field } => {
                     let rec = target.slice(e);
@@ -9004,8 +10910,8 @@ impl<'a> CodeGenerator<'a> {
                 }
                 ExprAst::Binary { op, lhs, rhs } => {
                     if matches!(op.as_str(), "+" | "-" | "*" | "/" | "**" | "%") {
-                        let lt = Self::infer_expr_return_ir_type(lhs.slice(e), class_fields, self_field_types);
-                        let rt = Self::infer_expr_return_ir_type(rhs.slice(e), class_fields, self_field_types);
+                        let lt = Self::infer_expr_return_ir_type_with_locals(lhs.slice(e), class_fields, self_field_types, local_types);
+                        let rt = Self::infer_expr_return_ir_type_with_locals(rhs.slice(e), class_fields, self_field_types, local_types);
                         if lt == Some(IrType::F64) || rt == Some(IrType::F64) {
                             return Some(IrType::F64);
                         }
@@ -9020,6 +10926,7 @@ impl<'a> CodeGenerator<'a> {
         Some(IrType::I64)
     }
 
+    #[allow(dead_code)]
     fn infer_return_signature_recursive(
         stmts: &[Statement],
         class_fields: &HashMap<String, HashMap<String, usize>>,
@@ -9027,8 +10934,39 @@ impl<'a> CodeGenerator<'a> {
         scalar_acc: &mut Option<IrType>,
         tuple_acc: &mut Option<Vec<Option<IrType>>>,
     ) {
+        let mut lmap = HashMap::new();
+        Self::infer_return_signature_with_locals(stmts, class_fields, self_field_types, &mut lmap, scalar_acc, tuple_acc);
+    }
+
+    fn infer_return_signature_with_locals(
+        stmts: &[Statement],
+        class_fields: &HashMap<String, HashMap<String, usize>>,
+        self_field_types: Option<&HashMap<String, String>>,
+        local_types: &mut HashMap<String, IrType>,
+        scalar_acc: &mut Option<IrType>,
+        tuple_acc: &mut Option<Vec<Option<IrType>>>,
+    ) {
+        let mut local_fn_names: HashSet<String> = HashSet::new();
+        for s in stmts {
+            if let Statement::LocalFnDef { func } = s {
+                local_fn_names.insert(func.name.clone());
+                local_types.insert(func.name.clone(), IrType::Ptr);
+            }
+        }
         for s in stmts {
             match s {
+                Statement::Assign { target, expr, .. } => {
+                    if !target.contains('.') && !target.contains('[') {
+                        if let Some(inferred) = Self::infer_expr_return_ir_type_with_locals(expr, class_fields, self_field_types, Some(local_types)) {
+                            if matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
+                                local_types.insert(target.trim().to_string(), inferred);
+                            }
+                        }
+                    }
+                }
+                Statement::ListInit { target, .. } | Statement::MapInit { target, .. } => {
+                    local_types.insert(target.trim().to_string(), IrType::Ptr);
+                }
                 Statement::Return { expr: Some(e) } => {
                     let trimmed_e = e.trim();
                     let unwrapped = if trimmed_e.starts_with('(') && trimmed_e.ends_with(')') {
@@ -9046,6 +10984,10 @@ impl<'a> CodeGenerator<'a> {
                     } else {
                         trimmed_e
                     };
+                    if local_fn_names.contains(unwrapped) {
+                        *scalar_acc = Some(IrType::Ptr);
+                        continue;
+                    }
                     let parts = omni_parser::OmniParser::split_respecting_quotes(unwrapped, ',');
                     if parts.len() > 1 {
                         let slots = tuple_acc.get_or_insert_with(|| vec![None; parts.len()]);
@@ -9053,41 +10995,41 @@ impl<'a> CodeGenerator<'a> {
                             if idx >= slots.len() {
                                 break;
                             }
-                            if let Some(inferred) = Self::infer_expr_return_ir_type(p, class_fields, self_field_types) {
+                            if let Some(inferred) = Self::infer_expr_return_ir_type_with_locals(p, class_fields, self_field_types, Some(local_types)) {
                                 if slots[idx].is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
                                     slots[idx] = Some(inferred);
                                 }
                             }
                         }
-                    } else if let Some(inferred) = Self::infer_expr_return_ir_type(unwrapped, class_fields, self_field_types) {
+                    } else if let Some(inferred) = Self::infer_expr_return_ir_type_with_locals(unwrapped, class_fields, self_field_types, Some(local_types)) {
                         if scalar_acc.is_none() || matches!(inferred, IrType::Ptr | IrType::F64 | IrType::StructPtr(_)) {
                             *scalar_acc = Some(inferred);
                         }
                     }
                 }
                 Statement::If { then_branch, else_branch, .. } => {
-                    Self::infer_return_signature_recursive(then_branch, class_fields, self_field_types, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_with_locals(then_branch, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     if let Some(eb) = else_branch {
-                        Self::infer_return_signature_recursive(eb, class_fields, self_field_types, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_with_locals(eb, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     }
                 }
                 Statement::WhileLoop { body, .. }
                 | Statement::ForLoop { body, .. }
                 | Statement::WithContext { body, .. } => {
-                    Self::infer_return_signature_recursive(body, class_fields, self_field_types, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_with_locals(body, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                 }
                 Statement::TryCatch { try_block, catch_clauses, finally_block } => {
-                    Self::infer_return_signature_recursive(try_block, class_fields, self_field_types, scalar_acc, tuple_acc);
+                    Self::infer_return_signature_with_locals(try_block, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     for c in catch_clauses {
-                        Self::infer_return_signature_recursive(&c.body, class_fields, self_field_types, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_with_locals(&c.body, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     }
                     if let Some(fb) = finally_block {
-                        Self::infer_return_signature_recursive(fb, class_fields, self_field_types, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_with_locals(fb, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     }
                 }
                 Statement::Match { arms, .. } => {
                     for arm in arms {
-                        Self::infer_return_signature_recursive(&arm.body, class_fields, self_field_types, scalar_acc, tuple_acc);
+                        Self::infer_return_signature_with_locals(&arm.body, class_fields, self_field_types, local_types, scalar_acc, tuple_acc);
                     }
                 }
                 _ => {}
@@ -9102,37 +11044,89 @@ impl<'a> CodeGenerator<'a> {
         param: &omni_parser::ParamDef,
         reg_src: &str,
         class_fields_map: &HashMap<String, HashMap<String, usize>>,
+        string_constants: &[(String, String, usize)],
     ) {
         let p_name_lower = param.name.to_lowercase();
         let clean_th = param
             .type_hint
             .as_deref()
             .map(|th| th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim());
+        let th_is_float = clean_th.map(is_float_type_hint).unwrap_or(false);
+
+        // Compute universal default `i64` bit-pattern BEFORE branching on parameter type (`[C2.1]–[C2.4]`)
+        let mut inferred_str_default = false;
+        let mut inferred_float_default = false;
+        let fallback_bits = if let Some(ref dv) = param.default_val {
+            let dt = dv.trim();
+            if (dt.starts_with('"') && dt.ends_with('"')) || (dt.starts_with('\'') && dt.ends_with('\'')) {
+                inferred_str_default = true;
+                let inner = &dt[1..dt.len() - 1];
+                let (cn, clen) = Self::find_string_constant(string_constants, inner)
+                    .or_else(|| Self::find_string_constant(string_constants, ""))
+                    .unwrap_or(("@.str.omni_0", 1));
+                let sgep = format!("%param_def_sgep_{}_{}", param.name, *temp_counter);
+                let si64 = format!("%param_def_si64_{}_{}", param.name, *temp_counter);
+                *temp_counter += 1;
+                functions_ir.push_str(&format!(
+                    "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n  {} = ptrtoint i8* {} to i64\n",
+                    sgep, clen, clen, cn, si64, sgep
+                ));
+                si64
+            } else if let Some(iv) = Self::parse_default_i64(&param.default_val) {
+                if th_is_float
+                    && !is_null_literal(dt)
+                    && dt != "True"
+                    && dt != "true"
+                    && dt != "False"
+                    && dt != "false"
+                {
+                    ((iv as f64).to_bits() as i64).to_string()
+                } else {
+                    iv.to_string()
+                }
+            } else if let Some(fv) = parse_polyglot_f64(dt) {
+                inferred_float_default = true;
+                (fv.to_bits() as i64).to_string()
+            } else {
+                "0".to_string()
+            }
+        } else {
+            "0".to_string()
+        };
+
+        let is_unset = format!("%param_unset_{}_{}", param.name, *temp_counter);
+        let clean_reg = format!("%param_dsel_{}_{}", param.name, *temp_counter);
+        *temp_counter += 1;
+        functions_ir.push_str(&format!(
+            "  {} = icmp eq i64 {}, -581005069656919554\n  {} = select i1 {}, i64 {}, i64 {}\n",
+            is_unset, reg_src, clean_reg, is_unset, fallback_bits, reg_src
+        ));
+
+        if th_is_float || (param.type_hint.is_none() && inferred_float_default) {
+            let fp = format!("%param_f64_{}_{}", param.name, *temp_counter);
+            *temp_counter += 1;
+            functions_ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fp, clean_reg));
+            let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+            *temp_counter += 1;
+            functions_ir.push_str(&format!("  {} = alloca double\n", ptr));
+            functions_ir.push_str(&format!("  store double {}, double* {}\n", fp, ptr));
+            scope_tree.insert(
+                param.name.clone(),
+                SymbolBinding {
+                    name: param.name.clone(),
+                    llvm_ptr: ptr,
+                    type_hint: "double".to_string(),
+                    is_scoped: true,
+                },
+            );
+            return;
+        }
 
         if let Some(th) = clean_th {
-            if is_float_type_hint(th) {
-                let fp = format!("%param_f64_{}_{}", param.name, *temp_counter);
-                *temp_counter += 1;
-                functions_ir.push_str(&format!("  {} = bitcast i64 {} to double\n", fp, reg_src));
-                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
-                *temp_counter += 1;
-                functions_ir.push_str(&format!("  {} = alloca double\n", ptr));
-                functions_ir.push_str(&format!("  store double {}, double* {}\n", fp, ptr));
-                scope_tree.insert(
-                    param.name.clone(),
-                    SymbolBinding {
-                        name: param.name.clone(),
-                        llvm_ptr: ptr,
-                        type_hint: "double".to_string(),
-                        is_scoped: true,
-                    },
-                );
-                return;
-            }
             if class_fields_map.contains_key(th) {
                 let sp = format!("%param_sp_{}_{}", param.name, *temp_counter);
                 *temp_counter += 1;
-                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", sp, reg_src, th));
+                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to %struct.{}*\n", sp, clean_reg, th));
                 let ptr = format!("%param_{}_{}", param.name, *temp_counter);
                 *temp_counter += 1;
                 functions_ir.push_str(&format!("  {} = alloca %struct.{}*\n", ptr, th));
@@ -9151,7 +11145,7 @@ impl<'a> CodeGenerator<'a> {
             if is_string_type_hint(th) || th == "str" {
                 let sp = format!("%param_strp_{}_{}", param.name, *temp_counter);
                 *temp_counter += 1;
-                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sp, reg_src));
+                functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", sp, clean_reg));
                 let ptr = format!("%param_{}_{}", param.name, *temp_counter);
                 *temp_counter += 1;
                 functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
@@ -9205,7 +11199,7 @@ impl<'a> CodeGenerator<'a> {
         if is_chan || is_slice || is_map || is_callable {
             let ptr_cast = format!("%ptr_cast_{}_{}", param.name, *temp_counter);
             *temp_counter += 1;
-            functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, reg_src));
+            functions_ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n", ptr_cast, clean_reg));
             let ptr = format!("%param_{}_{}", param.name, *temp_counter);
             *temp_counter += 1;
             functions_ir.push_str(&format!("  {} = alloca i8*\n", ptr));
@@ -9231,29 +11225,30 @@ impl<'a> CodeGenerator<'a> {
             return;
         }
 
-        let val_i64 = if let Some(def_val) = Self::parse_default_i64(&param.default_val) {
-            if def_val != 0 {
-                let is_z = format!("%param_isz_{}_{}", param.name, *temp_counter);
-                *temp_counter += 1;
-                functions_ir.push_str(&format!("  {} = icmp eq i64 {}, 0\n", is_z, reg_src));
-                let sel = format!("%param_i64_{}_{}", param.name, *temp_counter);
-                *temp_counter += 1;
-                functions_ir.push_str(&format!(
-                    "  {} = select i1 {}, i64 {}, i64 {}\n",
-                    sel, is_z, def_val, reg_src
-                ));
-                sel
-            } else {
-                reg_src.to_string()
-            }
-        } else {
-            reg_src.to_string()
-        };
+        if param.type_hint.is_none() && inferred_str_default {
+            let sp = format!("%param_strd_{}_{}", param.name, *temp_counter);
+            let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+            *temp_counter += 1;
+            functions_ir.push_str(&format!(
+                "  {} = inttoptr i64 {} to i8*\n  {} = alloca i8*\n  store i8* {}, i8** {}\n",
+                sp, clean_reg, ptr, sp, ptr
+            ));
+            scope_tree.insert(
+                param.name.clone(),
+                SymbolBinding {
+                    name: param.name.clone(),
+                    llvm_ptr: ptr,
+                    type_hint: "i8* (string)".to_string(),
+                    is_scoped: true,
+                },
+            );
+            return;
+        }
 
         let ptr = format!("%param_{}_{}", param.name, *temp_counter);
         *temp_counter += 1;
         functions_ir.push_str(&format!("  {} = alloca i64\n", ptr));
-        functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", val_i64, ptr));
+        functions_ir.push_str(&format!("  store i64 {}, i64* {}\n", clean_reg, ptr));
         scope_tree.insert(
             param.name.clone(),
             SymbolBinding {
@@ -9268,15 +11263,48 @@ impl<'a> CodeGenerator<'a> {
     /// Generate unified LLVM IR text from OmniModule
     pub fn generate_module_ir(&self, module: &OmniModule, temp: f32) -> anyhow::Result<String> {
         self.pending_semantic_errors.borrow_mut().clear();
+        self.lifted_closures_ir.borrow_mut().clear();
+        self.vdispatch_emitted.borrow_mut().clear();
+        self.closure_counter.set(0);
+
         let mut string_constants: Vec<(String, String, usize)> = Vec::new();
         let mut str_counter = 0;
 
-        // Always intern empty string & default "Exception" so exception lowering always has fallback GEP constants
+        // Always intern empty string, "Exception", and "ZeroDivisionError" so unwinding/div0 always has GEP constants
         Self::intern_string(&mut string_constants, &mut str_counter, "");
         Self::intern_string(&mut string_constants, &mut str_counter, "Exception");
+        Self::intern_string(&mut string_constants, &mut str_counter, "ZeroDivisionError");
+        Self::intern_string(&mut string_constants, &mut str_counter, "division by zero");
 
-        // Pre-scan statements recursively to extract string & exception constants
+        let intern_param_default_strings = |params: &[omni_parser::ParamDef], sc: &mut Vec<(String, String, usize)>, cnt: &mut usize| {
+            for p in params {
+                if let Some(ref dv) = p.default_val {
+                    let chars: Vec<char> = dv.chars().collect();
+                    let mut idx = 0;
+                    while idx < chars.len() {
+                        if chars[idx] == '"' || chars[idx] == '\'' {
+                            let q = chars[idx];
+                            let st = idx + 1;
+                            idx += 1;
+                            while idx < chars.len() {
+                                if chars[idx] == '\\' { idx += 2; continue; }
+                                if chars[idx] == q {
+                                    let s: String = chars[st..idx].iter().collect();
+                                    Self::intern_string(sc, cnt, &s);
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        };
+
+        // Pre-scan statements & parameter defaults recursively to extract string & exception constants
         for func in &module.functions {
+            intern_param_default_strings(&func.params, &mut string_constants, &mut str_counter);
             self.scan_strings_recursive(&func.body, &mut string_constants, &mut str_counter);
         }
         for cls in &module.structs_and_classes {
@@ -9290,23 +11318,68 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
             for method in &cls.methods {
+                intern_param_default_strings(&method.params, &mut string_constants, &mut str_counter);
                 self.scan_strings_recursive(&method.body, &mut string_constants, &mut str_counter);
             }
         }
         self.scan_strings_recursive(&module.top_level_statements, &mut string_constants, &mut str_counter);
 
-        // Extract ecosystem and import context
+        // Extract ecosystem, import context, and valid external module/symbol sets (`[C1]`)
         let mut ecosystem_hints = Vec::new();
         let mut import_chain = Vec::new();
         let mut c_module_aliases_set = HashSet::new();
+        let mut valid_extmod_prefixes: HashSet<String> = HashSet::new();
+        let mut local_foreign_syms: HashSet<String> = self.foreign_symbols.clone();
+        let mut has_open_ns_import = false;
+        let mut has_unaliased_c_import = false;
+
+        let sanitize_ext_id = |s: &str| -> String {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        };
+        let insert_mod_prefixes = |raw: &str, out: &mut HashSet<String>| {
+            let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+            if trimmed.is_empty() {
+                return;
+            }
+            out.insert(sanitize_ext_id(trimmed));
+            for seg in trimmed.split(|c: char| c == '.' || c == '/' || c == ':') {
+                let s = seg.trim();
+                if !s.is_empty() && s != "*" {
+                    out.insert(sanitize_ext_id(s));
+                }
+            }
+        };
 
         for imp in &module.imports {
             match imp {
                 omni_preamble::ImportDirective::Ecosystem { ecosystem, module, alias } => {
-                    if ecosystem == "c" || ecosystem == "cpp" {
+                    let eco_l = ecosystem.to_ascii_lowercase();
+                    insert_mod_prefixes(module, &mut valid_extmod_prefixes);
+                    if let Some(a) = alias {
+                        for part in a.split(',') {
+                            let pt = part.trim();
+                            if !pt.is_empty() {
+                                valid_extmod_prefixes.insert(sanitize_ext_id(pt));
+                                local_foreign_syms.insert(pt.to_string());
+                            }
+                        }
+                    }
+                    if matches!(
+                        eco_l.as_str(),
+                        "csharp" | "c#" | "dotnet" | "java" | "jvm" | "kotlin" | "cpp" | "c++"
+                    ) && alias.is_none()
+                        || module.ends_with('*')
+                    {
+                        has_open_ns_import = true;
+                    }
+                    if eco_l == "c" || eco_l == "cpp" || eco_l == "c++" {
                         c_module_aliases_set.insert(module.clone());
                         if let Some(a) = alias {
                             c_module_aliases_set.insert(a.clone());
+                        } else {
+                            has_unaliased_c_import = true;
                         }
                     }
                     let desc = match alias {
@@ -9317,6 +11390,16 @@ impl<'a> CodeGenerator<'a> {
                     import_chain.push(desc);
                 }
                 omni_preamble::ImportDirective::FileAlias { path, alias } => {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        insert_mod_prefixes(stem, &mut valid_extmod_prefixes);
+                        let clean = stem.trim_start_matches("lib");
+                        if !clean.is_empty() {
+                            insert_mod_prefixes(clean, &mut valid_extmod_prefixes);
+                        }
+                    }
+                    if let Some(a) = alias {
+                        insert_mod_prefixes(a, &mut valid_extmod_prefixes);
+                    }
                     let ext = path
                         .extension()
                         .and_then(|e| e.to_str())
@@ -9341,6 +11424,8 @@ impl<'a> CodeGenerator<'a> {
                         }
                         if let Some(a) = alias {
                             c_module_aliases_set.insert(a.clone());
+                        } else {
+                            has_unaliased_c_import = true;
                         }
                     }
                     let desc = match alias {
@@ -9350,6 +11435,12 @@ impl<'a> CodeGenerator<'a> {
                     import_chain.push(desc);
                 }
                 omni_preamble::ImportDirective::DirectoryAlias { path, alias } => {
+                    if let Some(dn) = path.file_name().and_then(|s| s.to_str()) {
+                        insert_mod_prefixes(dn, &mut valid_extmod_prefixes);
+                    }
+                    if let Some(a) = alias {
+                        insert_mod_prefixes(a, &mut valid_extmod_prefixes);
+                    }
                     let desc = match alias {
                         Some(a) => format!("dir: {} as {}", path.display(), a),
                         None => format!("dir: {}", path.display()),
@@ -9357,6 +11448,18 @@ impl<'a> CodeGenerator<'a> {
                     import_chain.push(desc);
                 }
                 omni_preamble::ImportDirective::FromDirectory { dir_path, symbols } => {
+                    if let Some(dn) = dir_path.file_name().and_then(|s| s.to_str()) {
+                        insert_mod_prefixes(dn, &mut valid_extmod_prefixes);
+                    }
+                    for sym_n in symbols {
+                        for part in sym_n.split(" as ") {
+                            let pt = part.trim();
+                            if !pt.is_empty() {
+                                local_foreign_syms.insert(pt.to_string());
+                                insert_mod_prefixes(pt, &mut valid_extmod_prefixes);
+                            }
+                        }
+                    }
                     import_chain.push(format!("from {}: {:?}", dir_path.display(), symbols));
                 }
             }
@@ -9561,18 +11664,39 @@ impl<'a> CodeGenerator<'a> {
             struct_defs.push(s_def_annotated);
         }
 
+        let mut class_type_ids_map: HashMap<String, u64> = HashMap::new();
+        for (cls_idx, cls) in module.structs_and_classes.iter().enumerate() {
+            class_type_ids_map.insert(cls.name.clone(), (cls_idx + 1) as u64);
+        }
+
         let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
         let mut method_return_types_map: HashMap<(String, String), IrType> = HashMap::new();
+        let mut method_param_defs_map: HashMap<(String, String), Vec<omni_parser::ParamDef>> = HashMap::new();
         for cls in &module.structs_and_classes {
             let self_ft_opt = class_field_types_map.get(&cls.name);
             for m in &cls.methods {
                 method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
+                let skip_n = if m
+                    .params
+                    .first()
+                    .map(|p| p.name == "self" || p.name == "this" || p.name == "cls")
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                method_param_defs_map.insert(
+                    (cls.name.clone(), m.name.clone()),
+                    m.params.iter().skip(skip_n).cloned().collect(),
+                );
                 let m_ret = if let Some(ref rt) = m.return_type {
                     classify_type_token(rt, &class_fields_map)
                 } else {
                     let mut sc = None;
                     let mut tp = None;
-                    Self::infer_return_signature_recursive(&m.body, &class_fields_map, self_ft_opt, &mut sc, &mut tp);
+                    let mut lmap = Self::build_param_ir_types(&m.params[skip_n..], &class_fields_map);
+                    Self::infer_return_signature_with_locals(&m.body, &class_fields_map, self_ft_opt, &mut lmap, &mut sc, &mut tp);
                     if tp.is_some() {
                         IrType::Ptr
                     } else {
@@ -9592,6 +11716,9 @@ impl<'a> CodeGenerator<'a> {
                             method_defining_map.entry((cls.name.clone(), m.name.clone())).or_insert(b.clone());
                             if let Some(base_rt) = method_return_types_map.get(&(b.clone(), m.name.clone())).cloned() {
                                 method_return_types_map.entry((cls.name.clone(), m.name.clone())).or_insert(base_rt);
+                            }
+                            if let Some(base_pd) = method_param_defs_map.get(&(b.clone(), m.name.clone())).cloned() {
+                                method_param_defs_map.entry((cls.name.clone(), m.name.clone())).or_insert(base_pd);
                             }
                         }
                         for bb in &base_cls.base_classes {
@@ -9619,14 +11746,61 @@ impl<'a> CodeGenerator<'a> {
 
         // 2. Functions & Return Type Lattice
         let mut known_functions_set = HashSet::new();
+        let mut fn_param_defs_map: HashMap<String, Vec<omni_parser::ParamDef>> = HashMap::new();
         let mut fn_return_types_map: HashMap<String, IrType> = HashMap::new();
+        let mut fn_return_ptr_kinds_map: HashMap<String, String> = HashMap::new();
+        let mut fn_curried_return_types_map: HashMap<String, IrType> = HashMap::new();
         let mut fn_tuple_return_types_map: HashMap<String, Vec<IrType>> = HashMap::new();
+        let mut main_param_count = 0usize;
 
         for f in &module.functions {
             known_functions_set.insert(f.name.clone());
+            fn_param_defs_map.insert(f.name.clone(), f.params.clone());
             if f.name == "main" {
+                main_param_count = f.params.len();
                 fn_return_types_map.insert(f.name.clone(), IrType::I32);
                 continue;
+            }
+            // Infer curried inner closure return type (`def make_greeter(): def greet(name="World"): return "Hi " + name; return greet`)
+            let mut local_fn_map: HashMap<String, &omni_parser::FunctionDef> = HashMap::new();
+            for s in &f.body {
+                if let Statement::LocalFnDef { func } = s {
+                    local_fn_map.insert(func.name.clone(), func);
+                }
+            }
+            for s in &f.body {
+                if let Statement::Return { expr: Some(ref re) } = s {
+                    let rt_trim = re.trim();
+                    if let Some(inner_f) = local_fn_map.get(rt_trim) {
+                        if let Some(ref irt) = inner_f.return_type {
+                            fn_curried_return_types_map.insert(f.name.clone(), classify_type_token(irt, &class_fields_map));
+                        } else {
+                            let mut isc = None;
+                            let mut itp = None;
+                            let mut ilmap = Self::build_param_ir_types(&f.params, &class_fields_map);
+                            ilmap.extend(Self::build_param_ir_types(&inner_f.params, &class_fields_map));
+                            Self::infer_return_signature_with_locals(&inner_f.body, &class_fields_map, None, &mut ilmap, &mut isc, &mut itp);
+                            if let Some(irty) = isc {
+                                fn_curried_return_types_map.insert(f.name.clone(), irty);
+                            }
+                        }
+                    } else if let Some((lps, lbody)) = OmniParser::try_parse_lambda_expr(rt_trim) {
+                        let mut ilmap = Self::build_param_ir_types(&f.params, &class_fields_map);
+                        ilmap.extend(Self::build_param_ir_types(&lps, &class_fields_map));
+                        let irty_opt = if lbody.starts_with('{') && lbody.ends_with('}') {
+                            let lstmts = OmniParser::new().parse_module("cur_lam", &lbody[1..lbody.len() - 1]).top_level_statements;
+                            let mut isc = None;
+                            let mut itp = None;
+                            Self::infer_return_signature_with_locals(&lstmts, &class_fields_map, None, &mut ilmap, &mut isc, &mut itp);
+                            isc
+                        } else {
+                            Self::infer_expr_return_ir_type_with_locals(&lbody, &class_fields_map, None, Some(&ilmap))
+                        };
+                        if let Some(irty) = irty_opt {
+                            fn_curried_return_types_map.insert(f.name.clone(), irty);
+                        }
+                    }
+                }
             }
             if let Some(ref rt) = f.return_type {
                 if let Some(tup) = parse_tuple_return_types(rt, &class_fields_map) {
@@ -9638,7 +11812,8 @@ impl<'a> CodeGenerator<'a> {
             } else {
                 let mut sc = None;
                 let mut tp = None;
-                Self::infer_return_signature_recursive(&f.body, &class_fields_map, None, &mut sc, &mut tp);
+                let mut lmap = Self::build_param_ir_types(&f.params, &class_fields_map);
+                Self::infer_return_signature_with_locals(&f.body, &class_fields_map, None, &mut lmap, &mut sc, &mut tp);
                 if let Some(slots) = tp {
                     let resolved: Vec<IrType> = slots
                         .into_iter()
@@ -9646,13 +11821,18 @@ impl<'a> CodeGenerator<'a> {
                         .collect();
                     fn_tuple_return_types_map.insert(f.name.clone(), resolved);
                     fn_return_types_map.insert(f.name.clone(), IrType::Ptr);
+                    fn_return_ptr_kinds_map.insert(f.name.clone(), "i8* (omni_slice)".to_string());
                 } else if let Some(s_ty) = sc {
                     fn_return_types_map.insert(f.name.clone(), s_ty);
                 }
             }
+            if let Some(pk) = Self::infer_return_ptr_kind(&f.body, &f.params) {
+                fn_return_ptr_kinds_map.insert(f.name.clone(), pk);
+            }
         }
 
         let mut functions_ir = String::new();
+        let mut user_emitted_ir = String::new();
         let mut dynamic_declarations = HashSet::new();
         let mut has_user_main = false;
         let mut cur_str_idx = 0;
@@ -9697,9 +11877,31 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 1-C. Struct & Class Inherent Methods (`i64 @__omni_method_<cls>_<method>(i8*, i64 x 5)`)
+        // 1-C. Struct & Class Inherent Methods (`i64 @__omni_method_<cls>_<method>(i8*, i64 x max(5, arity))`)
         for cls in &module.structs_and_classes {
             for method in &cls.methods {
+                let skip_count = if method
+                    .params
+                    .first()
+                    .map(|p| p.name == "self" || p.name == "this" || p.name == "cls")
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                let m_arity = method.params.len().saturating_sub(skip_count).max(5);
+                let m_param_sig = (0..m_arity)
+                    .map(|i| {
+                        if i == 0 {
+                            "i64 %len".to_string()
+                        } else {
+                            format!("i64 %arg{}", i + 1)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
                 let qualified = format!("{}.{}", cls.name, method.name);
                 let is_reachable = reachable_symbols.contains(&method.name)
                     || reachable_symbols.contains(&qualified)
@@ -9707,8 +11909,8 @@ impl<'a> CodeGenerator<'a> {
 
                 if !is_reachable {
                     functions_ir.push_str(&format!(
-                        "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
-                        cls.name, method.name
+                        "define i64 @__omni_method_{}_{}(i8* %self_raw, {}) {{\nentry:\n  ret i64 0\n}}\n\n",
+                        cls.name, method.name, m_param_sig
                     ));
                     continue;
                 }
@@ -9719,8 +11921,8 @@ impl<'a> CodeGenerator<'a> {
                 let method_saved_temp = temp_counter;
 
                 functions_ir.push_str(&format!(
-                    "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n",
-                    cls.name, method.name
+                    "define i64 @__omni_method_{}_{}(i8* %self_raw, {}) {{\nentry:\n",
+                    cls.name, method.name, m_param_sig
                 ));
 
                 let mut scope_tree = ScopeTree::new();
@@ -9728,11 +11930,18 @@ impl<'a> CodeGenerator<'a> {
                 scope_tree.class_field_types = class_field_types_map.clone();
                 scope_tree.class_field_order = class_field_order_map.clone();
                 scope_tree.class_decorators = class_decorators_map.clone();
+                scope_tree.class_type_ids = class_type_ids_map.clone();
                 scope_tree.c_module_aliases = c_module_aliases_set.clone();
+                scope_tree.valid_extmod_prefixes = valid_extmod_prefixes.clone();
+                scope_tree.has_open_ns_import = has_open_ns_import;
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
+                scope_tree.fn_param_defs = fn_param_defs_map.clone();
+                scope_tree.method_param_defs = method_param_defs_map.clone();
                 scope_tree.method_defining_class = method_defining_map.clone();
                 scope_tree.fn_return_types = fn_return_types_map.clone();
+                scope_tree.fn_return_ptr_kinds = fn_return_ptr_kinds_map.clone();
+                scope_tree.fn_curried_return_types = fn_curried_return_types_map.clone();
                 scope_tree.fn_tuple_return_types = fn_tuple_return_types_map.clone();
                 scope_tree.method_return_types = method_return_types_map.clone();
                 let mut deferred_frees: Vec<CleanupOp> = Vec::new();
@@ -9764,34 +11973,20 @@ impl<'a> CodeGenerator<'a> {
                     is_scoped: true,
                 });
 
-                let skip_count = if method
-                    .params
-                    .first()
-                    .map(|p| p.name == "self" || p.name == "this" || p.name == "cls")
-                    .unwrap_or(false)
-                {
-                    1
-                } else {
-                    0
-                };
                 for (p_idx, param) in method.params.iter().skip(skip_count).enumerate() {
-                    if p_idx >= 5 {
-                        break;
-                    }
-                    let reg_src = match p_idx {
-                        0 => "%len",
-                        1 => "%arg2",
-                        2 => "%arg3",
-                        3 => "%arg4",
-                        _ => "%arg5",
+                    let reg_src = if p_idx == 0 {
+                        "%len".to_string()
+                    } else {
+                        format!("%arg{}", p_idx + 1)
                     };
                     Self::bind_abi_param_i64(
                         &mut functions_ir,
                         &mut scope_tree,
                         &mut temp_counter,
                         param,
-                        reg_src,
+                        &reg_src,
                         &class_fields_map,
+                        &string_constants,
                     );
                 }
 
@@ -9856,8 +12051,8 @@ impl<'a> CodeGenerator<'a> {
                             lbl_counter = method_saved_lbl;
                             temp_counter = method_saved_temp;
                             functions_ir.push_str(&format!(
-                                "define i64 @__omni_method_{}_{}(i8* %self_raw, i64 %len, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
-                                cls.name, method.name
+                                "define i64 @__omni_method_{}_{}(i8* %self_raw, {}) {{\nentry:\n  ret i64 0\n}}\n\n",
+                                cls.name, method.name, m_param_sig
                             ));
                         }
                     }
@@ -9865,9 +12060,34 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 2. Functions (namespaced as `i64 @__omni_fn_<name>(i64 x 6)` or `i32 @__omni_fn_main(i8*, i64)`)
+        // 2. Functions (namespaced as `i64 @__omni_fn_<name>(i64 x max(6, arity))` or `i32 @__omni_fn_main(i8*, i64)`)
         for func in &module.functions {
-            let is_reachable = reachable_symbols.contains(&func.name);
+            let fn_arity = func.params.len().max(6);
+            let fn_param_sig = (0..fn_arity)
+                .map(|i| format!("i64 %arg{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tramp_zero_tail = if fn_arity > 1 {
+                format!(", {}", vec!["i64 -581005069656919554"; fn_arity - 1].join(", "))
+            } else {
+                String::new()
+            };
+            let mut pack_loads = String::new();
+            let mut pack_args = Vec::with_capacity(fn_arity);
+            for idx in 0..fn_arity {
+                if idx < 6 {
+                    pack_loads.push_str(&format!(
+                        "  %p{0} = getelementptr inbounds i64, i64* %p64, i64 {0}\n  %a{0} = load i64, i64* %p{0}\n",
+                        idx
+                    ));
+                    pack_args.push(format!("i64 %a{}", idx));
+                } else {
+                    pack_args.push("i64 -581005069656919554".to_string());
+                }
+            }
+            let pack_args_str = pack_args.join(", ");
+
+            let is_reachable = reachable_symbols.contains(&func.name) || self.is_user_fn(&func.name);
             let func_start_len = functions_ir.len();
             let func_saved_str_idx = cur_str_idx;
             let func_saved_lbl = lbl_counter;
@@ -9881,8 +12101,8 @@ impl<'a> CodeGenerator<'a> {
                     );
                 } else {
                     functions_ir.push_str(&format!(
-                        "define i64 @__omni_fn_{0}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 %arg0\n}}\n\ndefine void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int, i64 0, i64 0, i64 0, i64 0, i64 0)\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n  %p0 = getelementptr inbounds i64, i64* %p64, i64 0\n  %a0 = load i64, i64* %p0\n  %p1 = getelementptr inbounds i64, i64* %p64, i64 1\n  %a1 = load i64, i64* %p1\n  %p2 = getelementptr inbounds i64, i64* %p64, i64 2\n  %a2 = load i64, i64* %p2\n  %p3 = getelementptr inbounds i64, i64* %p64, i64 3\n  %a3 = load i64, i64* %p3\n  %p4 = getelementptr inbounds i64, i64* %p64, i64 4\n  %a4 = load i64, i64* %p4\n  %p5 = getelementptr inbounds i64, i64* %p64, i64 5\n  %a5 = load i64, i64* %p5\n  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n  ret void\n}}\n\n",
-                        func.name
+                        "define i64 @__omni_fn_{0}({1}) {{\nentry:\n  ret i64 %arg0\n}}\n\ndefine void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int{2})\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n{3}  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}({4})\n  ret void\n}}\n\n",
+                        func.name, fn_param_sig, tramp_zero_tail, pack_loads, pack_args_str
                     ));
                 }
                 continue;
@@ -9895,8 +12115,8 @@ impl<'a> CodeGenerator<'a> {
                 );
             } else {
                 functions_ir.push_str(&format!(
-                    "define i64 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n",
-                    func.name
+                    "define i64 @__omni_fn_{}({}) {{\nentry:\n",
+                    func.name, fn_param_sig
                 ));
             }
 
@@ -9905,11 +12125,18 @@ impl<'a> CodeGenerator<'a> {
             scope_tree.class_field_types = class_field_types_map.clone();
             scope_tree.class_field_order = class_field_order_map.clone();
             scope_tree.class_decorators = class_decorators_map.clone();
+            scope_tree.class_type_ids = class_type_ids_map.clone();
             scope_tree.c_module_aliases = c_module_aliases_set.clone();
+            scope_tree.valid_extmod_prefixes = valid_extmod_prefixes.clone();
+            scope_tree.has_open_ns_import = has_open_ns_import;
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
+            scope_tree.fn_param_defs = fn_param_defs_map.clone();
+            scope_tree.method_param_defs = method_param_defs_map.clone();
             scope_tree.method_defining_class = method_defining_map.clone();
             scope_tree.fn_return_types = fn_return_types_map.clone();
+            scope_tree.fn_return_ptr_kinds = fn_return_ptr_kinds_map.clone();
+            scope_tree.fn_curried_return_types = fn_curried_return_types_map.clone();
             scope_tree.fn_tuple_return_types = fn_tuple_return_types_map.clone();
             scope_tree.method_return_types = method_return_types_map.clone();
             let mut deferred_frees: Vec<CleanupOp> = Vec::new();
@@ -9922,11 +12149,12 @@ impl<'a> CodeGenerator<'a> {
                         || p_name_lower == "ch" || p_name_lower == "chan" || p_name_lower.starts_with("chan_") || p_name_lower.ends_with("_chan") || p_name_lower.starts_with("ch_");
                     let is_slice = param.type_hint.as_deref().map(|th| th.contains("slice") || th.contains("list")).unwrap_or(false)
                         || p_name_lower == "slice" || p_name_lower == "items" || p_name_lower == "arr" || p_name_lower == "list"
+                        || p_name_lower == "args" || p_name_lower == "argv"
                         || p_name_lower.starts_with("items_") || p_name_lower.starts_with("arr_") || p_name_lower.starts_with("slice_") || p_name_lower.ends_with("_arr") || p_name_lower.ends_with("_slice") || p_name_lower.ends_with("_list");
                     let is_map = param.type_hint.as_deref().map(|th| th.contains("map") || th.contains("dict")).unwrap_or(false)
                         || p_name_lower == "map" || p_name_lower == "dict" || p_name_lower.starts_with("map_") || p_name_lower.starts_with("dict_") || p_name_lower.ends_with("_map") || p_name_lower.ends_with("_dict");
                     let is_int = param.type_hint.as_deref().map(|th| th == "int" || th == "i32" || th == "i64" || th == "int64").unwrap_or(false)
-                        || (!is_chan && !is_slice && !is_map && (p_name_lower == "val" || p_name_lower == "num" || p_name_lower == "count" || p_name_lower == "idx" || p_name_lower == "n" || p_name_lower == "x" || p_name_lower == "y" || p_name_lower == "z"));
+                        || (!is_chan && !is_slice && !is_map && (p_name_lower == "val" || p_name_lower == "num" || p_name_lower == "count" || p_name_lower == "idx" || p_name_lower == "n" || p_name_lower == "x" || p_name_lower == "y" || p_name_lower == "z" || p_name_lower == "argc"));
 
                     if i == 0 {
                         if is_int {
@@ -9950,6 +12178,7 @@ impl<'a> CodeGenerator<'a> {
                             let type_hint = if is_map {
                                 "i8* (omni_map)".to_string()
                             } else if is_slice {
+                                scope_tree.collection_elem_types.insert(param.name.clone(), "i8* (string)".to_string());
                                 "i8* (omni_slice)".to_string()
                             } else {
                                 "i8* (omni_chan)".to_string()
@@ -9986,9 +12215,6 @@ impl<'a> CodeGenerator<'a> {
                 }
             } else {
                 for (i, param) in func.params.iter().enumerate() {
-                    if i >= 6 {
-                        break;
-                    }
                     let arg_src = format!("%arg{}", i);
                     Self::bind_abi_param_i64(
                         &mut functions_ir,
@@ -9997,6 +12223,7 @@ impl<'a> CodeGenerator<'a> {
                         param,
                         &arg_src,
                         &class_fields_map,
+                        &string_constants,
                     );
                 }
             }
@@ -10037,6 +12264,10 @@ impl<'a> CodeGenerator<'a> {
             match lower_res {
                 Ok(custom_ret) => {
                     if !custom_ret {
+                        if func.name == "main" && !self.target_triple.starts_with("thumb") {
+                            functions_ir.push_str("  call void @__omni_fiber_join_all()\n");
+                            functions_ir.push_str("  call void @__omni_thread_join_all()\n");
+                        }
                         Self::emit_cleanups(&mut functions_ir, &deferred_frees, &mut temp_counter, "Function Exit");
                         if func.name == "main" {
                             functions_ir.push_str("  ret i32 0\n");
@@ -10049,9 +12280,13 @@ impl<'a> CodeGenerator<'a> {
                     functions_ir.truncate(func_start_len);
                     functions_ir.push_str(&hoisted);
                     functions_ir.push('\n');
+                    if self.is_user_fn(&func.name) {
+                        user_emitted_ir.push_str(&hoisted);
+                        user_emitted_ir.push('\n');
+                    }
                 }
                 Err(e) => {
-                    if func.name == "main" {
+                    if func.name == "main" || self.is_user_fn(&func.name) {
                         return Err(e);
                     } else {
                         functions_ir.truncate(func_start_len);
@@ -10059,8 +12294,8 @@ impl<'a> CodeGenerator<'a> {
                         lbl_counter = func_saved_lbl;
                         temp_counter = func_saved_temp;
                         functions_ir.push_str(&format!(
-                            "define i64 @__omni_fn_{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
-                            func.name
+                            "define i64 @__omni_fn_{}({}) {{\nentry:\n  ret i64 0\n}}\n\n",
+                            func.name, fn_param_sig
                         ));
                     }
                 }
@@ -10074,9 +12309,26 @@ impl<'a> CodeGenerator<'a> {
                 ));
             } else {
                 functions_ir.push_str(&format!(
-                    "define void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int, i64 0, i64 0, i64 0, i64 0, i64 0)\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n  %p0 = getelementptr inbounds i64, i64* %p64, i64 0\n  %a0 = load i64, i64* %p0\n  %p1 = getelementptr inbounds i64, i64* %p64, i64 1\n  %a1 = load i64, i64* %p1\n  %p2 = getelementptr inbounds i64, i64* %p64, i64 2\n  %a2 = load i64, i64* %p2\n  %p3 = getelementptr inbounds i64, i64* %p64, i64 3\n  %a3 = load i64, i64* %p3\n  %p4 = getelementptr inbounds i64, i64* %p64, i64 4\n  %a4 = load i64, i64* %p4\n  %p5 = getelementptr inbounds i64, i64* %p64, i64 5\n  %a5 = load i64, i64* %p5\n  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5)\n  ret void\n}}\n\n",
-                    func.name
+                    "define void @__omni_trampoline_{0}(i8* %raw_arg) {{\nentry:\n  %raw_int = ptrtoint i8* %raw_arg to i64\n  %res = call i64 @__omni_fn_{0}(i64 %raw_int{1})\n  ret void\n}}\n\ndefine void @__omni_trampoline_pack_{0}(i8* %raw_pack) {{\nentry:\n  %p64 = bitcast i8* %raw_pack to i64*\n{2}  call void @free(i8* %raw_pack)\n  %res = call i64 @__omni_fn_{0}({3})\n  ret void\n}}\n\n",
+                    func.name, tramp_zero_tail, pack_loads, pack_args_str
                 ));
+            }
+        }
+
+        // Emit lambda-lifted local closures & polymorphic virtual dispatchers before symbol harvesting
+        let lifted_clos = self.lifted_closures_ir.borrow().clone();
+        if !lifted_clos.is_empty() {
+            functions_ir.push_str(&lifted_clos);
+            user_emitted_ir.push_str(&lifted_clos);
+        }
+        {
+            let vd_map = self.vdispatch_emitted.borrow();
+            let mut vd_keys: Vec<_> = vd_map.keys().cloned().collect();
+            vd_keys.sort();
+            for k in vd_keys {
+                if let Some(vd_def) = vd_map.get(&k) {
+                    functions_ir.push_str(vd_def);
+                }
             }
         }
 
@@ -10091,9 +12343,16 @@ impl<'a> CodeGenerator<'a> {
         synth_scope.class_field_types = class_field_types_map.clone();
         synth_scope.class_field_order = class_field_order_map.clone();
         synth_scope.class_decorators = class_decorators_map.clone();
+        synth_scope.class_type_ids = class_type_ids_map.clone();
         synth_scope.method_defining_class = method_defining_map.clone();
+        synth_scope.method_param_defs = method_param_defs_map.clone();
         synth_scope.known_functions = known_functions_set.clone();
+        synth_scope.fn_param_defs = fn_param_defs_map.clone();
+        synth_scope.fn_return_types = fn_return_types_map.clone();
+        synth_scope.fn_return_ptr_kinds = fn_return_ptr_kinds_map.clone();
         synth_scope.c_module_aliases = c_module_aliases_set.clone();
+        synth_scope.valid_extmod_prefixes = valid_extmod_prefixes.clone();
+        synth_scope.has_open_ns_import = has_open_ns_import;
 
         for cap in call_c_re.captures_iter(&functions_ir) {
             let sym = cap[1].to_string();
@@ -10132,7 +12391,7 @@ impl<'a> CodeGenerator<'a> {
                     });
                     if let Some(synth_fn) = synthesized_opt {
                         missing_omni_stubs.push(format!("{}\n", Self::hoist_allocas(&synth_fn)));
-                    } else if module.imports.is_empty() {
+                    } else if module.imports.is_empty() || user_emitted_ir.contains(&format!("@{}(", sym)) {
                         if let Some((cname, mname)) = matched_cls {
                             let mut flds: Vec<&str> = synth_scope
                                 .class_fields
@@ -10175,10 +12434,48 @@ impl<'a> CodeGenerator<'a> {
                 if !functions_ir.contains(&format!("define i64 @{}(", sym))
                     && !functions_ir.contains(&format!("define i32 @{}(", sym))
                 {
+                    let fn_short = &sym["__omni_fn_".len()..];
+                    let stub_n = synth_scope.fn_abi_arity(fn_short);
+                    let stub_sig = (0..stub_n).map(|i| format!("i64 %arg{}", i)).collect::<Vec<_>>().join(", ");
                     missing_omni_stubs.push(format!(
-                        "define i64 @{}(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\nentry:\n  ret i64 0\n}}\n\n",
-                        sym
+                        "define i64 @{}({}) {{\nentry:\n  ret i64 0\n}}\n\n",
+                        sym, stub_sig
                     ));
+                }
+            } else if sym.starts_with("__omni_extmod_") {
+                if !functions_ir.contains(&format!("define i64 @{}(", sym))
+                    && !functions_ir.contains(&format!("define weak i64 @{}(", sym))
+                {
+                    let ext_tail = sym
+                        .strip_prefix("__omni_extmod__")
+                        .or_else(|| sym.strip_prefix("__omni_extmod_"))
+                        .unwrap_or(&sym);
+                    let (ext_rec, ext_mth) = ext_tail.split_once("__").unwrap_or((ext_tail, ""));
+                    if module.imports.is_empty() {
+                        anyhow::bail!(
+                            "[OMNIC SEMANTIC ERROR] Undefined module or foreign call '{}.{}' (module declares 0 imports)",
+                            ext_rec,
+                            ext_mth
+                        );
+                    } else if !has_open_ns_import
+                        && !valid_extmod_prefixes.contains(ext_rec)
+                        && user_emitted_ir.contains(&format!("@{}(", sym))
+                    {
+                        let mut imp_list: Vec<&str> = valid_extmod_prefixes.iter().map(|s| s.as_str()).collect();
+                        imp_list.sort();
+                        anyhow::bail!(
+                            "[OMNIC SEMANTIC ERROR] Undefined module or receiver '{}' in call '{}.{}':\n  Evidence: module imports [{}].",
+                            ext_rec,
+                            ext_rec,
+                            ext_mth,
+                            imp_list.join(", ")
+                        );
+                    } else {
+                        missing_omni_stubs.push(format!(
+                            "define weak i64 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {{\nentry:\n  ret i64 %a0\n}}\n\n",
+                            sym
+                        ));
+                    }
                 }
             } else if !sym.starts_with("__omni_")
                 && sym != "_setjmp"
@@ -10205,7 +12502,7 @@ impl<'a> CodeGenerator<'a> {
                     );
                 } else if sym == "pow" {
                     missing_omni_stubs.push(
-                        "define weak i64 @pow(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %raw = call i64 @__omni_pow_i64(i64 %a0, i64 %a1)\n  %has_mod = icmp sgt i64 %a2, 0\n  br i1 %has_mod, label %do_mod, label %done\ndo_mod:\n  %m = srem i64 %raw, %a2\n  br label %done\ndone:\n  %res = phi i64 [ %m, %do_mod ], [ %raw, %entry ]\n  ret i64 %res\n}\n\n".to_string()
+                        "define weak i64 @pow(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %raw = call i64 @__omni_ipow64(i64 %a0, i64 %a1)\n  %has_mod = icmp sgt i64 %a2, 0\n  br i1 %has_mod, label %do_mod, label %done\ndo_mod:\n  %m = srem i64 %raw, %a2\n  br label %done\ndone:\n  %res = phi i64 [ %m, %do_mod ], [ %raw, %entry ]\n  ret i64 %res\n}\n\n".to_string()
                     );
                 } else if sym == "max" {
                     missing_omni_stubs.push(
@@ -10219,7 +12516,12 @@ impl<'a> CodeGenerator<'a> {
                     missing_omni_stubs.push(
                         "define weak i64 @divmod(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {\nentry:\n  %z = icmp eq i64 %a1, 0\n  %d = select i1 %z, i64 1, i64 %a1\n  %q = sdiv i64 %a0, %d\n  %m = srem i64 %a0, %d\n  %s = call i8* @__omni_slice_create(i64 2)\n  call void @__omni_slice_append(i8* %s, i64 %q)\n  call void @__omni_slice_append(i8* %s, i64 %m)\n  call void @__omni_c_return_ptr(i8* %s)\n  %r = ptrtoint i8* %s to i64\n  ret i64 %r\n}\n\n".to_string()
                     );
-                } else if module.imports.is_empty() {
+                } else if local_foreign_syms.contains(&sym) || has_unaliased_c_import {
+                    missing_omni_stubs.push(format!(
+                        "define weak i64 @{}(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5) {{\nentry:\n  ret i64 %a0\n}}\n\n",
+                        sym
+                    ));
+                } else if module.imports.is_empty() || user_emitted_ir.contains(&format!("@{}(", sym)) {
                     let mut known_vec: Vec<&str> = known_functions_set.iter().map(|s| s.as_str()).collect();
                     known_vec.sort();
                     let mut cands: Vec<(usize, &str)> = known_vec
@@ -10234,7 +12536,7 @@ impl<'a> CodeGenerator<'a> {
                         cands.into_iter().take(3).map(|(_, s)| s).collect::<Vec<_>>().join(", ")
                     };
                     anyhow::bail!(
-                        "[OMNIC SEMANTIC ERROR] Undefined function or symbol '{}':\n  Evidence: module declares 0 imports and defines functions [{}].\n  Closest matches: [{}]",
+                        "[OMNIC SEMANTIC ERROR] Undefined function or symbol '{}':\n  Evidence: module defines functions [{}].\n  Closest matches: [{}]",
                         sym,
                         known_vec.join(", "),
                         closest
@@ -10300,15 +12602,43 @@ impl<'a> CodeGenerator<'a> {
         ir.push_str("define i32 @main(i32 %argc, i8** %argv) {\nentry:\n");
 
         if has_user_main {
-            ir.push_str("  %exit_code = call i32 @__omni_fn_main(i8* null, i64 0)\n");
-            ir.push_str("  call void @__omni_thread_join_all()\n");
-            ir.push_str("  ret i32 %exit_code\n");
+            if main_param_count > 0 && !self.target_triple.starts_with("thumb") {
+                ir.push_str("  %argc64 = sext i32 %argc to i64\n");
+                ir.push_str("  %argv_sl = call i8* @__omni_slice_create(i64 %argc64)\n");
+                ir.push_str("  %argv_idx = alloca i64\n");
+                ir.push_str("  store i64 0, i64* %argv_idx\n");
+                ir.push_str("  br label %argv_loop_cond\n\n");
+                ir.push_str("argv_loop_cond:\n");
+                ir.push_str("  %ai = load i64, i64* %argv_idx\n");
+                ir.push_str("  %acmp = icmp slt i64 %ai, %argc64\n");
+                ir.push_str("  br i1 %acmp, label %argv_loop_body, label %argv_loop_done\n\n");
+                ir.push_str("argv_loop_body:\n");
+                ir.push_str("  %aptr = getelementptr inbounds i8*, i8** %argv, i64 %ai\n");
+                ir.push_str("  %astr = load i8*, i8** %aptr\n");
+                ir.push_str("  %aint = ptrtoint i8* %astr to i64\n");
+                ir.push_str("  call void @__omni_slice_append(i8* %argv_sl, i64 %aint)\n");
+                ir.push_str("  %anext = add i64 %ai, 1\n");
+                ir.push_str("  store i64 %anext, i64* %argv_idx\n");
+                ir.push_str("  br label %argv_loop_cond\n\n");
+                ir.push_str("argv_loop_done:\n");
+                ir.push_str("  %exit_code = call i32 @__omni_fn_main(i8* %argv_sl, i64 %argc64)\n");
+                ir.push_str("  call void @__omni_slice_destroy(i8* %argv_sl)\n");
+                ir.push_str("  ret i32 %exit_code\n");
+            } else {
+                ir.push_str("  %exit_code = call i32 @__omni_fn_main(i8* null, i64 0)\n");
+                ir.push_str("  ret i32 %exit_code\n");
+            }
         } else if let Some(f) = module.functions.first() {
+            let f_arity = f.params.len().max(6);
+            let z_args = vec!["i64 -581005069656919554"; f_arity].join(", ");
             ir.push_str(&format!(
-                "  %res = call i64 @__omni_fn_{}(i64 0, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
-                f.name
+                "  %res = call i64 @__omni_fn_{}({})\n",
+                f.name, z_args
             ));
-            ir.push_str("  call void @__omni_thread_join_all()\n");
+            if !self.target_triple.starts_with("thumb") {
+                ir.push_str("  call void @__omni_fiber_join_all()\n");
+                ir.push_str("  call void @__omni_thread_join_all()\n");
+            }
             ir.push_str("  ret i32 0\n");
         } else {
             ir.push_str("  ret i32 0\n");
@@ -10661,6 +12991,440 @@ fn main() {
             )
             .is_ok(),
             "Valid IR reading %var_alpha_1 and storing to %var_out_2 must pass"
+        );
+    }
+
+    #[test]
+    fn test_exact_arity_defaults_zero_preservation_and_fail_closed_helpers() {
+        let src = r#"
+fn sum8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    return a + b + c + d + e + f + g + h
+}
+
+class Accumulator:
+    def __init__(self, bias=5):
+        self.bias = bias
+
+    def combine7(self, a, b, c, d, e, f, g=100):
+        return self.bias + a + b + c + d + e + f + g
+
+def with_defaults(x=42, y=100):
+    return x + y
+
+def greet(tag: str):
+    return "hi_" + tag
+
+def greet_opt(tag="W"):
+    return "yo_" + tag
+
+def num_id(n):
+    return n
+
+def main():
+    s8 = sum8(1, 2, 3, 4, 5, 6, 7, 8)
+    acc_def = Accumulator()
+    acc_zero = Accumulator(0)
+    m7_all = acc_def.combine7(10, 20, 30, 40, 50, 60, 70)
+    m7_def = acc_zero.combine7(1, 2, 3, 4, 5, 6)
+
+    d_both = with_defaults()
+    d_zero_first = with_defaults(0)
+    d_zero_both = with_defaults(0, 0)
+    d_kwargs = with_defaults(y=7, x=3)
+
+    nested_str = greet("A") + ":" + str(num_id(99)) + ":" + greet("B") + ":" + greet_opt()
+    print(s8, m7_all, m7_def)
+    print(d_both, d_zero_first, d_zero_both, d_kwargs)
+    print(nested_str)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("arity_defaults_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        let verifier = LlvmVerifier::new().expect("Verifier init failed");
+        verifier.verify_ir(&ir).expect("IR verification failed");
+
+        let runtime_c = omni_runtime::runtime_c_sources();
+        let (status, out, stderr) = verifier
+            .run_jit_captured(&ir, 0, &runtime_c, &[])
+            .expect("JIT failed");
+        assert!(status.success(), "JIT stderr: {}", stderr);
+        assert!(out.contains("36 285 121"), "Arity/ctor output mismatch:\n{}", out);
+        assert!(out.contains("142 100 0 10"), "Default/zero-arg output mismatch:\n{}", out);
+        assert!(out.contains("hi_A:99:hi_B:yo_W"), "Nested TLS return output mismatch:\n{}", out);
+
+        // Non-main helper calling typoed bare function EVEN WITH imports must fail closed
+        let bad_helper_with_import = r#"
+import 'python' math
+
+def helper(v):
+    return compute_checksm(v)
+
+def compute_checksum(v):
+    return v * 2
+
+def main():
+    print(helper(21))
+    return 0
+"#;
+        let m_bad = parser.parse_module("bad_helper_imp", bad_helper_with_import);
+        let err = codegen
+            .generate_module_ir(&m_bad, 0.0)
+            .expect_err("Expected fail-closed error on typo inside helper even with import");
+        assert!(
+            err.to_string().contains("OMNIC SEMANTIC ERROR") && err.to_string().contains("compute_checksum"),
+            "Unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_perceus_rc_escaping_aggregates_div_zero_and_loop_unwind() {
+        let src = r#"
+struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+
+fn make_point(px: i64, py: i64) -> Point {
+    let pt = Point { x: px, y: py };
+    return pt
+}
+
+def make_aliased_slice():
+    a = [11, 22]
+    b = a
+    b.append(33)
+    return b
+
+def div_probe(a, b):
+    try:
+        return a / b
+    except ZeroDivisionError as err:
+        print(err)
+        return -999
+
+def main():
+    p = make_point(30, 47)
+    escaped_sum = p.x + p.y
+
+    s = make_aliased_slice()
+    alias2 = s
+    alias_sum = alias2[0] + alias2[1] + alias2[2]
+
+    loop_acc = 0
+    for i in 8:
+        inner = [i, i * 10]
+        if i == 2:
+            continue
+        if i == 5:
+            break
+        loop_acc = loop_acc + inner[1]
+
+    dz_ok = div_probe(84, 2)
+    dz_err = div_probe(10, 0)
+
+    print(escaped_sum, alias_sum, len(alias2), loop_acc, dz_ok, dz_err)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("perceus_escape_div0_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        let verifier = LlvmVerifier::new().expect("Verifier init failed");
+        verifier.verify_ir(&ir).expect("IR verification failed");
+
+        let runtime_c = omni_runtime::runtime_c_sources();
+        let (status, out, stderr) = verifier
+            .run_jit_captured(&ir, 0, &runtime_c, &[])
+            .expect("JIT failed");
+        assert!(status.success(), "JIT stderr: {}", stderr);
+        assert!(out.contains("division by zero"), "Expected ZeroDivisionError message:\n{}", out);
+        // i in 0,1,3,4 -> 0 + 10 + 30 + 40 = 80
+        assert!(out.contains("77 66 3 80 42 -999"), "Unexpected output:\n{}", out);
+    }
+
+    #[test]
+    fn test_cooperative_multi_fiber_utf8_codepoints_and_typed_map_keys() {
+        let src = r#"
+def producer(ch_out):
+    for i in 1..13:
+        ch_out <- i
+    return 0
+
+def relay(ch_in, ch_out):
+    for k in 12:
+        v := <-ch_in
+        ch_out <- (v * 2)
+    return 0
+
+def main():
+    c1 := make(chan int, 1)
+    c2 := make(chan int, 1)
+    go producer(c1)
+    go relay(c1, c2)
+
+    fib_sum = 0
+    for j in 12:
+        got := <-c2
+        fib_sum = fib_sum + got
+
+    u = "héllo🚀"
+    u_len = len(u)
+    ch1 = u[1]
+    ch5 = u[5]
+    rev = "héllo"[::-1]
+
+    m = {"42": 111}
+    m[42] = 999
+    str_val = m["42"]
+    int_val = m[42]
+
+    print(fib_sum, u_len, str_val, int_val)
+    print(ch1 + ":" + ch5 + ":" + rev)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("fiber_utf8_map_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        let verifier = LlvmVerifier::new().expect("Verifier init failed");
+        verifier.verify_ir(&ir).expect("IR verification failed");
+
+        let runtime_c = omni_runtime::runtime_c_sources();
+        let (status, out, stderr) = verifier
+            .run_jit_captured(&ir, 0, &runtime_c, &[])
+            .expect("JIT failed");
+        assert!(status.success(), "JIT stderr: {}", stderr);
+        // sum(1..=12)*2 = 78*2 = 156
+        assert!(out.contains("156 6 111 999"), "Fiber/UTF-8/Map output mismatch:\n{}", out);
+        assert!(out.contains("é:🚀:olléh"), "UTF-8 char_at/reverse mismatch:\n{}", out);
+    }
+
+    #[test]
+    fn test_closures_lambdas_for_else_multiline_and_polymorphic_vdispatch() {
+        let src = r#"
+class Circle:
+    def __init__(self, r):
+        self.r = r
+
+    def area(self):
+        return self.r * self.r * 3
+
+class Rect:
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+
+    def area(self):
+        return self.w * self.h
+
+def make_adder(k):
+    def add(x, bonus=1):
+        return x + k + bonus
+    return add
+
+def apply_twice(fn_val, seed):
+    first = fn_val(seed)
+    return fn_val(first)
+
+def search_else_probe(limit_hit):
+    tag = 0
+    for i in 5:
+        if i == limit_hit:
+            tag = 99
+            break
+    else:
+        tag = 777
+    return tag
+
+def main():
+    add10 = make_adder(10)
+    c_a = add10(5)
+    c_b = add10(5, 0)
+    c_curried = make_adder(20)(7)
+
+    factor = 4
+    py_lam = lambda x: x * factor
+    js_lam = (x, y) => x + y + factor
+    rs_lam = |v| v + 3
+    lam_res = py_lam(6) + js_lam(2, 3) + apply_twice(rs_lam, 10)
+
+    no_brk = search_else_probe(99)
+    with_brk = search_else_probe(3)
+
+    chained = "  omni  "
+        .strip()
+        .upper()
+
+    shapes = [Circle(3), Rect(4, 5), Circle(2)]
+    total_area = 0
+    for s in shapes:
+        total_area = total_area + s.area()
+
+    print(c_a, c_b, c_curried, lam_res)
+    print(no_brk, with_brk, total_area, chained)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("closures_poly_test", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        assert!(ir.contains("@__omni_closure_create"));
+        assert!(ir.contains("@__omni_vdispatch_"));
+
+        let verifier = LlvmVerifier::new().expect("Verifier init failed");
+        verifier.verify_ir(&ir).expect("IR verification failed");
+
+        let runtime_c = omni_runtime::runtime_c_sources();
+        let (status, out, stderr) = verifier
+            .run_jit_captured(&ir, 0, &runtime_c, &[])
+            .expect("JIT failed");
+        assert!(status.success(), "JIT stderr: {}", stderr);
+        // c_a=16, c_b=15, c_curried=28, lam_res = 24 + 9 + 16 = 49
+        assert!(out.contains("16 15 28 49"), "Closure/lambda output mismatch:\n{}", out);
+        // shapes: Circle(3)->27 + Rect(4,5)->20 + Circle(2)->12 = 59
+        assert!(out.contains("777 99 59 OMNI"), "for-else/vdispatch/multiline mismatch:\n{}", out);
+    }
+
+    #[test]
+    fn test_polyglot_audit_remediations_e2e_jit() {
+        let src = r#"
+class FCircle:
+    def __init__(self, r):
+        self.r = r
+
+    def area(self):
+        return self.r * self.r * 3.14
+
+class IRect:
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+
+    def area(self):
+        return self.w * self.h
+
+struct Vec2 {
+    pub x: i64,
+    pub y: i64,
+}
+
+def make_greeter(prefix="Hi"):
+    def greet(name="World"):
+        return prefix + " " + name
+    return greet
+
+def scale_val(x, factor=2.5):
+    return x * factor
+
+def make_counter(start):
+    c = start
+    def step():
+        c = c + 1
+        return c
+    return step
+
+def capture_local_slice():
+    xs = [100, 200, 300]
+    return lambda idx=1: xs[idx]
+
+def alias_escape_vec():
+    p1 = Vec2 { x: 12, y: 30 }
+    p2 = p1
+    p1 = Vec2 { x: 1, y: 2 }
+    return p2
+
+def main():
+    g1 = make_greeter()()
+    g2 = make_greeter("Yo")("Omni")
+
+    sf1 = scale_val(4)
+    sf2 = (scale_val)(6)
+
+    cnt = make_counter(10)
+    c1 = cnt()
+    c2 = cnt()
+
+    cap_fn = capture_local_slice()
+    cap_v = cap_fn() + cap_fn(2)
+
+    ep = alias_escape_vec()
+    ep_sum = ep.x + ep.y
+
+    b0 = len(bytes())
+    b2 = bytes([65, 66])
+    malf = "\xE0AB"[::2]
+
+    mp = {42: 999, "42": 111}
+    del mp[42]
+    mp_str = mp["42"]
+    mp_has_int = 1 if 42 in mp else 0
+
+    rs_clos = move |a, b| a * b
+    kt_clos = { n -> n + 7 }
+    cpp_clos = [=](z) { return z * 3; }
+    js_blk = (v) => {
+        let doubled = v * 2;
+        return doubled + 5;
+    }
+    poly_clos_sum = rs_clos(3, 4) + kt_clos(8) + cpp_clos(5) + js_blk(10)
+
+    mixed_shapes = [FCircle(2), new IRect(4, 5)]
+    mixed_area = 0.0
+    for sh in mixed_shapes:
+        mixed_area = mixed_area + sh.area()
+
+    print(g1 + "|" + g2 + "|" + b2 + "|" + malf)
+    print(sf1, sf2, c1, c2, cap_v, ep_sum)
+    print(b0, mp_str, mp_has_int, poly_clos_sum, mixed_area)
+    return 0
+"#;
+        let parser = OmniParser::new();
+        let module = parser.parse_module("polyglot_audit_remediations", src);
+        let engine = MockSynthesisEngine::new();
+        let codegen = CodeGenerator::new(&engine);
+
+        let ir = codegen.generate_module_ir(&module, 0.0).expect("Codegen failed");
+        let verifier = LlvmVerifier::new().expect("Verifier init failed");
+        verifier.verify_ir(&ir).expect("IR verification failed");
+
+        let runtime_c = omni_runtime::runtime_c_sources();
+        let (status, out, stderr) = verifier
+            .run_jit_captured(&ir, 0, &runtime_c, &[])
+            .expect("JIT failed");
+        assert!(status.success(), "JIT stderr: {}", stderr);
+        assert!(out.contains("Hi World|Yo Omni|AB|\u{FFFD}B"), "String/bytes/UTF-8 mismatch:\n{}", out);
+        assert!(out.contains("10.0 15.0 11 12 500 42") || out.contains("10 15 11 12 500 42"), "Float/counter/capture/escape mismatch:\n{}", out);
+        // rs_clos=12 + kt_clos=15 + cpp_clos=15 + js_blk=25 = 67; mixed_area = 12.56 + 20.0 = 32.56
+        assert!(out.contains("0 111 0 67 32.56"), "Map/polyglot-closure/mixed-vdispatch mismatch:\n{}", out);
+
+        // [C1] Verify bogus unimported receiver fails closed even when another ecosystem module is imported
+        let bad_extmod_src = r#"
+import 'python' math
+
+def main():
+    x = bogus_mod.typo_fn(99)
+    print(x)
+    return 0
+"#;
+        let bad_mod = parser.parse_module("bad_extmod_test", bad_extmod_src);
+        let err = codegen
+            .generate_module_ir(&bad_mod, 0.0)
+            .expect_err("Expected fail-closed error on unimported module receiver");
+        assert!(
+            err.to_string().contains("OMNIC SEMANTIC ERROR") && err.to_string().contains("bogus_mod"),
+            "Unexpected error message: {}",
+            err
         );
     }
 }

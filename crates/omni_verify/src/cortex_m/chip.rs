@@ -15,8 +15,13 @@ pub struct RpChipProfile {
     pub heap_start: u32,
     pub heap_limit: u32,
     pub xosc_base: u32,
+    pub pll_sys_base: u32,
+    pub pll_fbdiv_int: u32,
+    pub pll_prim_postdiv: u32,
     pub clocks_base: u32,
+    pub clk_sys_div_1: u32,
     pub resets_base: u32,
+    pub resets_pll_sys_mask: u32,
     pub resets_unreset_mask: u32,
     pub io_bank0_base: u32,
     pub pads_bank0_base: u32,
@@ -51,10 +56,16 @@ impl RpChipProfile {
             heap_start: 0x2000_4000,
             heap_limit: 0x2003_8000,
             xosc_base: 0x4002_4000,
+            pll_sys_base: 0x4002_8000,
+            // 12 MHz / 1 * 125 = 1500 MHz VCO; POSTDIV1=6, POSTDIV2=2 -> 125 MHz CLK_SYS
+            pll_fbdiv_int: 125,
+            pll_prim_postdiv: (6 << 16) | (2 << 12),
             clocks_base: 0x4000_8000,
+            clk_sys_div_1: 1 << 8, // RP2040 CLK_SYS_DIV INT field is [31:8]
             resets_base: 0x4000_C000,
-            // IO_BANK0 (1<<5) | PADS_BANK0 (1<<8) | PIO0 (1<<10) | PIO1 (1<<11) | TIMER (1<<21) | UART0 (1<<22)
-            resets_unreset_mask: 0x0060_0D20,
+            resets_pll_sys_mask: 1 << 12, // PLL_SYS (bit 12 on RP2040)
+            // IO_BANK0 (1<<5) | PADS_BANK0 (1<<8) | PIO0 (1<<10) | PIO1 (1<<11) | PLL_SYS (1<<12) | TIMER (1<<21) | UART0 (1<<22)
+            resets_unreset_mask: 0x0060_1D20,
             io_bank0_base: 0x4001_4000,
             pads_bank0_base: 0x4001_C000,
             pads_clear_iso: false,
@@ -88,10 +99,16 @@ impl RpChipProfile {
             heap_start: 0x2000_4000,
             heap_limit: 0x2007_8000,
             xosc_base: 0x4004_8000,
+            pll_sys_base: 0x4005_0000,
+            // 12 MHz / 1 * 125 = 1500 MHz VCO (<= 1600 MHz RP2350 max VCO); POSTDIV1=5, POSTDIV2=2 -> 150 MHz CLK_SYS
+            pll_fbdiv_int: 125,
+            pll_prim_postdiv: (5 << 16) | (2 << 12),
             clocks_base: 0x4001_0000,
+            clk_sys_div_1: 1 << 16, // RP2350 CLK_SYS_DIV INT field is [31:16]
             resets_base: 0x4002_0000,
-            // IO_BANK0 (1<<6) | PADS_BANK0 (1<<9) | PIO0 (1<<11) | PIO1 (1<<12) | PIO2 (1<<13) | TIMER0 (1<<23) | UART0 (1<<26)
-            resets_unreset_mask: 0x0480_3A40,
+            resets_pll_sys_mask: 1 << 14, // PLL_SYS (bit 14 on RP2350)
+            // IO_BANK0 (1<<6) | PADS_BANK0 (1<<9) | PIO0 (1<<11) | PIO1 (1<<12) | PIO2 (1<<13) | PLL_SYS (1<<14) | TIMER0 (1<<23) | UART0 (1<<26)
+            resets_unreset_mask: 0x0480_7A40,
             io_bank0_base: 0x4002_8000,
             pads_bank0_base: 0x4003_8000,
             pads_clear_iso: true, // Clear bit 8 ISO pad isolation on RP2350!

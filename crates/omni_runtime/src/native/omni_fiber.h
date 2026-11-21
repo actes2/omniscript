@@ -21,13 +21,17 @@ typedef struct OmniFiber {
     int status;
     void (*entry)(void*);
     void* arg;
+    void* unwind_ctx;           // Per-fiber isolated setjmp/longjmp exception stack
+    void* saved_ret_ptr;        // Per-fiber isolated returned pointer slot
     struct OmniFiber* next;
 } OmniFiber;
 
 void __omni_fiber_init(void);
 int __omni_fiber_is_in_fiber(void);
+int __omni_fiber_has_runnable(void);
 OmniFiber* __omni_fiber_create(void (*entry)(void*), void* arg, size_t stack_size);
 void __omni_fiber_yield(void);
+void __omni_fiber_join_all(void);
 void __omni_fiber_destroy(OmniFiber* fiber);
 void __omni_go_spawn(void (*entry)(void*), void* arg);
 void __omni_thread_spawn(void (*entry)(void*), void* arg);

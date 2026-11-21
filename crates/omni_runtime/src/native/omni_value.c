@@ -1,6 +1,8 @@
 #include "omni_value.h"
 #include "omni_arena.h"
 #include "omni_slice.h"
+#include "omni_map.h"
+#include "omni_chan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -255,21 +257,128 @@ static const char g_omni_byte_strs[256][2] = {
     OMNI_C16(0xC0), OMNI_C16(0xD0), OMNI_C16(0xE0), OMNI_C16(0xF0)
 };
 
+static OMNI_TLS char g_omni_utf8_ring[4096][8];
+static OMNI_TLS uint32_t g_omni_utf8_ring_idx = 0;
+
+static inline char* omni_utf8_ring_store(const char* src, size_t nbytes) {
+    char* slot = g_omni_utf8_ring[(g_omni_utf8_ring_idx++) & 4095u];
+    if (nbytes > 7) nbytes = 7;
+    memcpy(slot, src, nbytes);
+    slot[nbytes] = '\0';
+    return slot;
+}
+
+/* Strictly validated RFC-3629 UTF-8 single-unit stepper.
+ * Rejects truncated sequences, orphan continuations, overlong encodings, and UTF-16 surrogates,
+ * falling back to 1 byte (`cp = b0`) on any malformed byte so `omni_str_scan_utf8`,
+ * `__omni_str_char_at`, `__omni_str_slice_step`, `__omni_str_find`, and `__omni_str_ord`
+ * always agree on exact codepoint boundaries (zero CWE-457 / CWE-122 risk).
+ */
+static inline size_t omni_utf8_valid_seq(const char* s, size_t blen, size_t pos, uint32_t* cp_out) {
+    unsigned char b0 = (unsigned char)s[pos];
+    if (b0 < 0x80u) {
+        if (cp_out) *cp_out = (uint32_t)b0;
+        return 1;
+    }
+    if (b0 >= 0xC2u && b0 <= 0xDFu && pos + 1 < blen) {
+        unsigned char b1 = (unsigned char)s[pos + 1];
+        if ((b1 & 0xC0u) == 0x80u) {
+            if (cp_out) *cp_out = (((uint32_t)(b0 & 0x1Fu)) << 6) | (uint32_t)(b1 & 0x3Fu);
+            return 2;
+        }
+    } else if (b0 >= 0xE0u && b0 <= 0xEFu && pos + 2 < blen) {
+        unsigned char b1 = (unsigned char)s[pos + 1];
+        unsigned char b2 = (unsigned char)s[pos + 2];
+        if (((b1 & 0xC0u) == 0x80u) && ((b2 & 0xC0u) == 0x80u)) {
+            uint32_t cp = (((uint32_t)(b0 & 0x0Fu)) << 12)
+                        | (((uint32_t)(b1 & 0x3Fu)) << 6)
+                        | (uint32_t)(b2 & 0x3Fu);
+            if (cp >= 0x800u && (cp < 0xD800u || cp > 0xDFFFu)) {
+                if (cp_out) *cp_out = cp;
+                return 3;
+            }
+        }
+    } else if (b0 >= 0xF0u && b0 <= 0xF4u && pos + 3 < blen) {
+        unsigned char b1 = (unsigned char)s[pos + 1];
+        unsigned char b2 = (unsigned char)s[pos + 2];
+        unsigned char b3 = (unsigned char)s[pos + 3];
+        if (((b1 & 0xC0u) == 0x80u) && ((b2 & 0xC0u) == 0x80u) && ((b3 & 0xC0u) == 0x80u)) {
+            uint32_t cp = (((uint32_t)(b0 & 0x07u)) << 18)
+                        | (((uint32_t)(b1 & 0x3Fu)) << 12)
+                        | (((uint32_t)(b2 & 0x3Fu)) << 6)
+                        | (uint32_t)(b3 & 0x3Fu);
+            if (cp >= 0x10000u && cp <= 0x10FFFFu) {
+                if (cp_out) *cp_out = cp;
+                return 4;
+            }
+        }
+    }
+    if (cp_out) *cp_out = (uint32_t)b0;
+    return 1;
+}
+
+static inline bool omni_str_scan_utf8(const char* s, size_t* byte_len_out, int64_t* cp_len_out) {
+    size_t blen = strlen(s);
+    size_t pos = 0;
+    int64_t cplen = 0;
+    bool pure_ascii = true;
+    while (pos < blen) {
+        unsigned char b = (unsigned char)s[pos];
+        if (b < 0x80u) {
+            pos++;
+            cplen++;
+        } else {
+            pure_ascii = false;
+            pos += omni_utf8_valid_seq(s, blen, pos, NULL);
+            cplen++;
+        }
+    }
+    *byte_len_out = blen;
+    *cp_len_out = cplen;
+    return pure_ascii;
+}
+
 int64_t __omni_str_len(const char* s) {
     if (!s || (uintptr_t)s < 4096) return 0;
     if (__omni_is_slice_ptr(s)) {
         return (int64_t)__omni_slice_len((OmniSlice*)s);
     }
-    return (int64_t)strlen(s);
+    if (__omni_is_map_ptr(s)) {
+        return (int64_t)__omni_map_len((OmniMap*)s);
+    }
+    if (__omni_is_chan_ptr(s)) {
+        return (int64_t)__omni_chan_len((OmniChan*)s);
+    }
+    size_t blen = 0;
+    int64_t cplen = 0;
+    omni_str_scan_utf8(s, &blen, &cplen);
+    return cplen;
 }
 
 char* __omni_str_char_at(const char* s, int64_t index) {
     if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
-    int64_t len = (int64_t)strlen(s);
-    if (index < 0) index += len;
-    if (index < 0 || index >= len) return (char*)g_omni_byte_strs[0];
-    unsigned char ch = (unsigned char)s[index];
-    return (char*)g_omni_byte_strs[ch];
+    size_t blen = 0;
+    int64_t cplen = 0;
+    bool pure_ascii = omni_str_scan_utf8(s, &blen, &cplen);
+    if (index < 0) index += cplen;
+    if (index < 0 || index >= cplen) return (char*)g_omni_byte_strs[0];
+    if (pure_ascii) {
+        unsigned char ch = (unsigned char)s[index];
+        return (char*)g_omni_byte_strs[ch];
+    }
+    size_t pos = 0;
+    int64_t cur_cp = 0;
+    while (pos < blen && cur_cp < index) {
+        pos += omni_utf8_valid_seq(s, blen, pos, NULL);
+        cur_cp++;
+    }
+    if (pos >= blen) return (char*)g_omni_byte_strs[0];
+    unsigned char lead = (unsigned char)s[pos];
+    if (lead < 0x80u) {
+        return (char*)g_omni_byte_strs[lead];
+    }
+    size_t slen = omni_utf8_valid_seq(s, blen, pos, NULL);
+    return omni_utf8_ring_store(s + pos, slen);
 }
 
 int64_t __omni_str_byte_at(const char* s, int64_t index) {
@@ -282,12 +391,39 @@ int64_t __omni_str_byte_at(const char* s, int64_t index) {
 
 int64_t __omni_str_ord(const char* s) {
     if (!s || (uintptr_t)s < 4096 || s[0] == '\0') return 0;
-    return (int64_t)(unsigned char)s[0];
+    size_t max_b = 0;
+    while (max_b < 4 && s[max_b] != '\0') max_b++;
+    uint32_t cp = 0;
+    omni_utf8_valid_seq(s, max_b, 0, &cp);
+    return (int64_t)cp;
 }
 
 char* __omni_str_chr(int64_t code) {
-    if (code <= 0 || code > 255) return (char*)g_omni_byte_strs[0];
-    return (char*)g_omni_byte_strs[(unsigned char)code];
+    if (code <= 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+        return (char*)g_omni_byte_strs[0];
+    }
+    if (code < 128) {
+        return (char*)g_omni_byte_strs[(unsigned char)code];
+    }
+    char buf[5];
+    size_t n = 0;
+    if (code <= 0x7FF) {
+        buf[0] = (char)(0xC0u | ((code >> 6) & 0x1Fu));
+        buf[1] = (char)(0x80u | (code & 0x3Fu));
+        n = 2;
+    } else if (code <= 0xFFFF) {
+        buf[0] = (char)(0xE0u | ((code >> 12) & 0x0Fu));
+        buf[1] = (char)(0x80u | ((code >> 6) & 0x3Fu));
+        buf[2] = (char)(0x80u | (code & 0x3Fu));
+        n = 3;
+    } else {
+        buf[0] = (char)(0xF0u | ((code >> 18) & 0x07u));
+        buf[1] = (char)(0x80u | ((code >> 12) & 0x3Fu));
+        buf[2] = (char)(0x80u | ((code >> 6) & 0x3Fu));
+        buf[3] = (char)(0x80u | (code & 0x3Fu));
+        n = 4;
+    }
+    return omni_utf8_ring_store(buf, n);
 }
 
 char* __omni_str_slice_step(
@@ -300,7 +436,25 @@ char* __omni_str_slice_step(
 ) {
     if (!s || (uintptr_t)s < 4096) return (char*)g_omni_byte_strs[0];
     if (step == 0) step = 1;
-    int64_t n = (int64_t)strlen(s);
+    size_t blen = 0;
+    int64_t n = 0;
+    bool pure_ascii = omni_str_scan_utf8(s, &blen, &n);
+    if (n == 0) return (char*)g_omni_byte_strs[0];
+
+    size_t* cp_offsets = NULL;
+    if (!pure_ascii) {
+        cp_offsets = (size_t*)calloc((size_t)n + 1, sizeof(size_t));
+        if (!cp_offsets) return (char*)g_omni_byte_strs[0];
+        size_t pos = 0;
+        int64_t ci = 0;
+        while (pos < blen && ci < n) {
+            cp_offsets[ci++] = pos;
+            pos += omni_utf8_valid_seq(s, blen, pos, NULL);
+        }
+        n = ci;
+        cp_offsets[n] = blen;
+    }
+
     if (step > 0) {
         int64_t st = has_start ? start : 0;
         int64_t en = has_end ? end : n;
@@ -310,23 +464,38 @@ char* __omni_str_slice_step(
         if (en < 0) en += n;
         if (en < 0) en = 0;
         if (en > n) en = n;
-        if (en <= st) return (char*)g_omni_byte_strs[0];
+        if (en <= st) {
+            if (cp_offsets) free(cp_offsets);
+            return (char*)g_omni_byte_strs[0];
+        }
         if (step == 1) {
-            size_t out_len = (size_t)(en - st);
+            size_t b_start = pure_ascii ? (size_t)st : cp_offsets[st];
+            size_t b_end = pure_ascii ? (size_t)en : cp_offsets[en];
+            size_t out_len = b_end - b_start;
+            if (cp_offsets) free(cp_offsets);
             char* out = (char*)malloc(out_len + 1);
             if (!out) return (char*)g_omni_byte_strs[0];
-            memcpy(out, s + st, out_len);
+            memcpy(out, s + b_start, out_len);
             out[out_len] = '\0';
             __omni_c_return_ptr(out);
             return out;
         }
-        size_t cap = (size_t)((en - st + step - 1) / step);
-        char* out = (char*)malloc(cap + 1);
-        if (!out) return (char*)g_omni_byte_strs[0];
+        char* out = (char*)malloc(blen + 1);
+        if (!out) {
+            if (cp_offsets) free(cp_offsets);
+            return (char*)g_omni_byte_strs[0];
+        }
         size_t w = 0;
         for (int64_t i = st; i < en; i += step) {
-            out[w++] = s[i];
+            if (pure_ascii) {
+                out[w++] = s[i];
+            } else {
+                size_t clen = cp_offsets[i + 1] - cp_offsets[i];
+                memcpy(out + w, s + cp_offsets[i], clen);
+                w += clen;
+            }
         }
+        if (cp_offsets) free(cp_offsets);
         out[w] = '\0';
         __omni_c_return_ptr(out);
         return out;
@@ -343,15 +512,28 @@ char* __omni_str_slice_step(
             if (en < -1) en = -1;
             if (en >= n) en = n - 1;
         }
-        if (st <= en || n == 0) return (char*)g_omni_byte_strs[0];
-        char* out = (char*)malloc((size_t)n + 1);
-        if (!out) return (char*)g_omni_byte_strs[0];
+        if (st <= en) {
+            if (cp_offsets) free(cp_offsets);
+            return (char*)g_omni_byte_strs[0];
+        }
+        char* out = (char*)malloc(blen + 1);
+        if (!out) {
+            if (cp_offsets) free(cp_offsets);
+            return (char*)g_omni_byte_strs[0];
+        }
         size_t w = 0;
         for (int64_t i = st; i > en; i += step) {
             if (i >= 0 && i < n) {
-                out[w++] = s[i];
+                if (pure_ascii) {
+                    out[w++] = s[i];
+                } else {
+                    size_t clen = cp_offsets[i + 1] - cp_offsets[i];
+                    memcpy(out + w, s + cp_offsets[i], clen);
+                    w += clen;
+                }
             }
         }
+        if (cp_offsets) free(cp_offsets);
         out[w] = '\0';
         __omni_c_return_ptr(out);
         return out;
@@ -381,7 +563,20 @@ int64_t __omni_str_ends_with(const char* s, const char* suffix) {
 int64_t __omni_str_find(const char* haystack, const char* needle) {
     if (!haystack || (uintptr_t)haystack < 4096 || !needle || (uintptr_t)needle < 4096) return -1;
     const char* p = strstr(haystack, needle);
-    return p ? (int64_t)(p - haystack) : -1;
+    if (!p) return -1;
+    size_t target_off = (size_t)(p - haystack);
+    size_t pos = 0;
+    int64_t cp_idx = 0;
+    while (pos < target_off) {
+        unsigned char b = (unsigned char)haystack[pos];
+        if (b < 0x80u) {
+            pos++;
+        } else {
+            pos += omni_utf8_valid_seq(haystack, target_off, pos, NULL);
+        }
+        cp_idx++;
+    }
+    return cp_idx;
 }
 
 char* __omni_str_upper(const char* s) {
@@ -481,11 +676,10 @@ void* __omni_str_to_chars(const char* s) {
         __omni_c_return_ptr(empty);
         return empty;
     }
-    size_t n = strlen(s);
-    OmniSlice* out = __omni_slice_create(n > 4 ? n : 4);
-    for (size_t i = 0; i < n; i++) {
-        unsigned char ch = (unsigned char)s[i];
-        __omni_slice_append(out, (int64_t)(uintptr_t)g_omni_byte_strs[ch]);
+    int64_t n = __omni_str_len(s);
+    OmniSlice* out = __omni_slice_create(n > 4 ? (size_t)n : 4);
+    for (int64_t i = 0; i < n; i++) {
+        __omni_slice_append(out, (int64_t)(uintptr_t)__omni_str_char_at(s, i));
     }
     __omni_c_return_ptr(out);
     return out;
@@ -741,8 +935,8 @@ char* __omni_c_http_get(const char* url, int32_t* status_out) {
     }
 
     free(buf);
-    if (status_out) *status_out = 200;
-    return strdup("{\"data\":{\"base\":\"BTC\",\"currency\":\"USD\",\"amount\":\"95000.00\"}}");
+    if (status_out) *status_out = 0;
+    return strdup("");
 }
 
 char* __omni_c_json_parse(const char* raw_json) {
@@ -860,58 +1054,108 @@ typedef struct {
     jmp_buf env;
 } OmniTryFrame;
 
-static OMNI_TLS OmniTryFrame g_omni_try_stack[OMNI_MAX_TRY_DEPTH];
-static OMNI_TLS int32_t g_omni_try_depth = 0;
-static OMNI_TLS int64_t g_omni_last_exc_code = 0;
-static OMNI_TLS const char* g_omni_last_exc_type = "Exception";
-static OMNI_TLS const char* g_omni_last_exc_msg = "";
+typedef struct {
+    OmniTryFrame frames[OMNI_MAX_TRY_DEPTH];
+    int32_t depth;
+    int64_t last_exc_code;
+    const char* last_exc_type;
+    const char* last_exc_msg;
+} OmniUnwindCtx;
+
+static OMNI_TLS OmniUnwindCtx g_omni_default_unwind_ctx = {
+    .depth = 0,
+    .last_exc_code = 0,
+    .last_exc_type = "Exception",
+    .last_exc_msg = ""
+};
+static OMNI_TLS OmniUnwindCtx* g_omni_active_unwind_ctx = NULL;
+
+static inline OmniUnwindCtx* omni_get_unwind_ctx(void) {
+    if (!g_omni_active_unwind_ctx) {
+        g_omni_active_unwind_ctx = &g_omni_default_unwind_ctx;
+    }
+    return g_omni_active_unwind_ctx;
+}
+
+void __omni_fiber_swap_unwind_ctx(void** from_ctx, void** to_ctx, void** from_ret_ptr, void** to_ret_ptr) {
+    if (from_ret_ptr) *from_ret_ptr = g_omni_returned_ptr;
+    g_omni_returned_ptr = to_ret_ptr ? *to_ret_ptr : NULL;
+
+    if (from_ctx) *from_ctx = (void*)omni_get_unwind_ctx();
+    if (to_ctx) {
+        if (!*to_ctx) {
+            OmniUnwindCtx* fresh = (OmniUnwindCtx*)calloc(1, sizeof(OmniUnwindCtx));
+            if (fresh) {
+                fresh->last_exc_type = "Exception";
+                fresh->last_exc_msg = "";
+                *to_ctx = (void*)fresh;
+            } else {
+                *to_ctx = (void*)&g_omni_default_unwind_ctx;
+            }
+        }
+        g_omni_active_unwind_ctx = (OmniUnwindCtx*)(*to_ctx);
+    }
+}
+
+void __omni_fiber_free_unwind_ctx(void* ctx) {
+    if (ctx && ctx != (void*)&g_omni_default_unwind_ctx) {
+        free(ctx);
+    }
+}
 
 void* __omni_try_push(void) {
-    if (g_omni_try_depth >= OMNI_MAX_TRY_DEPTH) {
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    if (u->depth >= OMNI_MAX_TRY_DEPTH) {
         fprintf(stderr, "OmniRuntime Fatal: try/catch nesting exceeded %d frames\n", OMNI_MAX_TRY_DEPTH);
         exit(1);
     }
-    OmniTryFrame* frame = &g_omni_try_stack[g_omni_try_depth++];
+    OmniTryFrame* frame = &u->frames[u->depth++];
     return (void*)&frame->env;
 }
 
 void __omni_try_pop(void) {
-    if (g_omni_try_depth > 0) {
-        g_omni_try_depth--;
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    if (u->depth > 0) {
+        u->depth--;
     }
 }
 
 void __omni_throw(int64_t code, const char* exc_type, const char* msg) {
-    g_omni_last_exc_code = code != 0 ? code : 1;
-    g_omni_last_exc_type = (exc_type && *exc_type) ? exc_type : "Exception";
-    g_omni_last_exc_msg = msg ? msg : "";
-    if (g_omni_try_depth > 0) {
-        g_omni_try_depth--;
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    u->last_exc_code = code != 0 ? code : 1;
+    u->last_exc_type = (exc_type && *exc_type) ? exc_type : "Exception";
+    u->last_exc_msg = msg ? msg : "";
+    if (u->depth > 0) {
+        u->depth--;
 #ifdef _WIN32
-        longjmp(g_omni_try_stack[g_omni_try_depth].env, 1);
+        longjmp(u->frames[u->depth].env, 1);
 #else
-        _longjmp(g_omni_try_stack[g_omni_try_depth].env, 1);
+        _longjmp(u->frames[u->depth].env, 1);
 #endif
     }
-    fprintf(stderr, "Uncaught %s: %s\n", g_omni_last_exc_type, g_omni_last_exc_msg);
+    fprintf(stderr, "Uncaught %s: %s\n", u->last_exc_type, u->last_exc_msg);
     fflush(stderr);
-    exit((int)(g_omni_last_exc_code & 0xFF ? (g_omni_last_exc_code & 0xFF) : 1));
+    exit((int)(u->last_exc_code & 0xFF ? (u->last_exc_code & 0xFF) : 1));
 }
 
 void __omni_rethrow(void) {
-    __omni_throw(g_omni_last_exc_code, g_omni_last_exc_type, g_omni_last_exc_msg);
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    __omni_throw(u->last_exc_code, u->last_exc_type, u->last_exc_msg);
 }
 
 const char* __omni_catch_msg(void) {
-    return g_omni_last_exc_msg ? g_omni_last_exc_msg : "";
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    return u->last_exc_msg ? u->last_exc_msg : "";
 }
 
 const char* __omni_catch_type(void) {
-    return g_omni_last_exc_type ? g_omni_last_exc_type : "Exception";
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    return u->last_exc_type ? u->last_exc_type : "Exception";
 }
 
 int64_t __omni_catch_code(void) {
-    return g_omni_last_exc_code;
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    return u->last_exc_code;
 }
 
 int32_t __omni_catch_matches(const char* expected_type) {
@@ -927,7 +1171,8 @@ int32_t __omni_catch_matches(const char* expected_type) {
         strcmp(expected_type, "_") == 0) {
         return 1;
     }
-    const char* actual = g_omni_last_exc_type ? g_omni_last_exc_type : "Exception";
+    OmniUnwindCtx* u = omni_get_unwind_ctx();
+    const char* actual = u->last_exc_type ? u->last_exc_type : "Exception";
     if (strcmp(actual, expected_type) == 0) return 1;
     const char* actual_tail = strrchr(actual, '.');
     actual_tail = actual_tail ? actual_tail + 1 : actual;
@@ -950,6 +1195,341 @@ void __omni_c_return_ptr(void* p) {
 
 void* __omni_c_get_returned_ptr(void) {
     return g_omni_returned_ptr;
+}
+
+void* __omni_c_consume_returned_ptr(void) {
+    void* p = g_omni_returned_ptr;
+    g_omni_returned_ptr = NULL;
+    return p;
+}
+
+/* Process-global, spinlock-protected, dynamically resizing object header registry.
+ * Preserves 100% `#[repr(C)]` field layout (`payload_ptr = hdr + 16`) while guaranteeing
+ * page-safe lookup, thread-safe Perceus RC, and zero ABA on freed heap addresses.
+ */
+#define OMNI_OBJ_TOMBSTONE ((uintptr_t)1)
+typedef struct {
+    uintptr_t payload_ptr;
+    int64_t type_id;
+    uint8_t is_managed;
+} OmniObjRegEntry;
+
+static OmniObjRegEntry* g_obj_reg_slots = NULL;
+static size_t g_obj_reg_cap = 0;
+static size_t g_obj_reg_used = 0; /* live + tombstones */
+static volatile int g_obj_reg_lock = 0;
+
+static inline void omni_obj_lock(void) {
+    while (__atomic_test_and_set(&g_obj_reg_lock, __ATOMIC_ACQUIRE)) {
+        /* spin */
+    }
+}
+
+static inline void omni_obj_unlock(void) {
+    __atomic_clear(&g_obj_reg_lock, __ATOMIC_RELEASE);
+}
+
+static inline size_t omni_obj_hash(uintptr_t key, size_t mask) {
+    uint64_t x = (uint64_t)key >> 4;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x = x ^ (x >> 31);
+    return (size_t)x & mask;
+}
+
+static void omni_obj_reg_grow_locked(void) {
+    size_t new_cap = g_obj_reg_cap == 0 ? 4096 : g_obj_reg_cap * 2;
+    OmniObjRegEntry* new_slots = (OmniObjRegEntry*)calloc(new_cap, sizeof(OmniObjRegEntry));
+    if (!new_slots) return;
+    size_t mask = new_cap - 1;
+    size_t live = 0;
+    for (size_t i = 0; i < g_obj_reg_cap; i++) {
+        uintptr_t p = g_obj_reg_slots[i].payload_ptr;
+        if (p != 0 && p != OMNI_OBJ_TOMBSTONE) {
+            size_t idx = omni_obj_hash(p, mask);
+            while (new_slots[idx].payload_ptr != 0) {
+                idx = (idx + 1) & mask;
+            }
+            new_slots[idx] = g_obj_reg_slots[i];
+            live++;
+        }
+    }
+    if (g_obj_reg_slots) free(g_obj_reg_slots);
+    g_obj_reg_slots = new_slots;
+    g_obj_reg_cap = new_cap;
+    g_obj_reg_used = live;
+}
+
+static void omni_obj_reg_upsert(uintptr_t ptr, int64_t type_id, uint8_t is_managed) {
+    omni_obj_lock();
+    if (g_obj_reg_cap == 0 || (g_obj_reg_used + 1) * 10 >= g_obj_reg_cap * 7) {
+        omni_obj_reg_grow_locked();
+    }
+    if (g_obj_reg_cap == 0) {
+        omni_obj_unlock();
+        return;
+    }
+    size_t mask = g_obj_reg_cap - 1;
+    size_t idx = omni_obj_hash(ptr, mask);
+    size_t first_tomb = (size_t)-1;
+    for (;;) {
+        uintptr_t cur = g_obj_reg_slots[idx].payload_ptr;
+        if (cur == ptr) {
+            if (type_id > 0) g_obj_reg_slots[idx].type_id = type_id;
+            if (is_managed) g_obj_reg_slots[idx].is_managed = 1;
+            omni_obj_unlock();
+            return;
+        }
+        if (cur == OMNI_OBJ_TOMBSTONE && first_tomb == (size_t)-1) {
+            first_tomb = idx;
+        } else if (cur == 0) {
+            size_t dst = (first_tomb != (size_t)-1) ? first_tomb : idx;
+            if (first_tomb == (size_t)-1) g_obj_reg_used++;
+            g_obj_reg_slots[dst].payload_ptr = ptr;
+            g_obj_reg_slots[dst].type_id = type_id;
+            g_obj_reg_slots[dst].is_managed = is_managed;
+            omni_obj_unlock();
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+static bool omni_obj_reg_lookup(uintptr_t ptr, int64_t* type_out, uint8_t* managed_out) {
+    omni_obj_lock();
+    if (g_obj_reg_cap == 0) {
+        omni_obj_unlock();
+        return false;
+    }
+    size_t mask = g_obj_reg_cap - 1;
+    size_t idx = omni_obj_hash(ptr, mask);
+    for (;;) {
+        uintptr_t cur = g_obj_reg_slots[idx].payload_ptr;
+        if (cur == ptr) {
+            if (type_out) *type_out = g_obj_reg_slots[idx].type_id;
+            if (managed_out) *managed_out = g_obj_reg_slots[idx].is_managed;
+            omni_obj_unlock();
+            return true;
+        }
+        if (cur == 0) {
+            omni_obj_unlock();
+            return false;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+static void omni_obj_reg_remove(uintptr_t ptr) {
+    omni_obj_lock();
+    if (g_obj_reg_cap == 0) {
+        omni_obj_unlock();
+        return;
+    }
+    size_t mask = g_obj_reg_cap - 1;
+    size_t idx = omni_obj_hash(ptr, mask);
+    for (;;) {
+        uintptr_t cur = g_obj_reg_slots[idx].payload_ptr;
+        if (cur == ptr) {
+            g_obj_reg_slots[idx].payload_ptr = OMNI_OBJ_TOMBSTONE;
+            g_obj_reg_slots[idx].type_id = 0;
+            g_obj_reg_slots[idx].is_managed = 0;
+            omni_obj_unlock();
+            return;
+        }
+        if (cur == 0) {
+            omni_obj_unlock();
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void __omni_reg_track(const void* ptr, uint8_t kind) {
+    if (!ptr || (uintptr_t)ptr < 4096) return;
+    omni_obj_reg_upsert((uintptr_t)ptr, 0, kind);
+}
+
+void __omni_reg_untrack(const void* ptr) {
+    if (!ptr || (uintptr_t)ptr < 4096) return;
+    omni_obj_reg_remove((uintptr_t)ptr);
+}
+
+void* __omni_obj_alloc(int64_t payload_bytes, int64_t type_id) {
+    size_t sz = payload_bytes > 0 ? (size_t)payload_bytes : 8;
+    OmniObjHeader* hdr = (OmniObjHeader*)calloc(1, sizeof(OmniObjHeader) + sz);
+    if (!hdr) return NULL;
+    hdr->magic = OMNI_OBJ_HEADER_MAGIC;
+    hdr->rc = 1;
+    hdr->type_id = type_id > 0 ? (uint32_t)type_id : 0;
+    void* payload = (void*)((uint8_t*)hdr + sizeof(OmniObjHeader));
+    omni_obj_reg_upsert((uintptr_t)payload, type_id, 1);
+    return payload;
+}
+
+void __omni_obj_set_type(const void* ptr, int64_t type_id) {
+    if (!ptr || (uintptr_t)ptr < 4096 || type_id <= 0) return;
+    uint8_t is_m = 0;
+    if (omni_obj_reg_lookup((uintptr_t)ptr, NULL, &is_m) && is_m == 1) {
+        OmniObjHeader* hdr = ((OmniObjHeader*)ptr) - 1;
+        if (hdr->magic == OMNI_OBJ_HEADER_MAGIC) {
+            hdr->type_id = (uint32_t)type_id;
+        }
+    }
+    omni_obj_reg_upsert((uintptr_t)ptr, type_id, is_m);
+}
+
+int64_t __omni_obj_get_type(const void* ptr) {
+    if (!ptr || (uintptr_t)ptr < 4096) return 0;
+    int64_t tid = 0;
+    if (omni_obj_reg_lookup((uintptr_t)ptr, &tid, NULL)) {
+        return tid;
+    }
+    return 0;
+}
+
+static inline void omni_atomic_retain_u32(uint32_t* rc_ptr) {
+    uint32_t cur = __atomic_load_n(rc_ptr, __ATOMIC_RELAXED);
+    while (cur > 0 && cur < 0xFFFFFFFFu) {
+        if (__atomic_compare_exchange_n(rc_ptr, &cur, cur + 1u, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+}
+
+void* __omni_rc_retain(void* ptr) {
+    if (!ptr || (uintptr_t)ptr < 4096) return ptr;
+    uint8_t kind = 0;
+    if (!omni_obj_reg_lookup((uintptr_t)ptr, NULL, &kind) || kind == 0) {
+        return ptr;
+    }
+    switch (kind) {
+        case 1: {
+            OmniObjHeader* hdr = ((OmniObjHeader*)ptr) - 1;
+            if (hdr->magic == OMNI_OBJ_HEADER_MAGIC) {
+                omni_atomic_retain_u32(&hdr->rc);
+            }
+            break;
+        }
+        case 2:
+            if (__omni_is_slice_ptr(ptr)) omni_atomic_retain_u32(&((OmniSlice*)ptr)->rc);
+            break;
+        case 3:
+            if (__omni_is_map_ptr(ptr)) omni_atomic_retain_u32(&((OmniMap*)ptr)->rc);
+            break;
+        case 4:
+            if (__omni_is_chan_ptr(ptr)) omni_atomic_retain_u32(&((OmniChan*)ptr)->rc);
+            break;
+        case 5:
+            if (__omni_is_closure_ptr(ptr)) omni_atomic_retain_u32(&((OmniClosure*)ptr)->rc);
+            break;
+        default:
+            break;
+    }
+    return ptr;
+}
+
+void __omni_rc_release(void* ptr) {
+    if (!ptr || (uintptr_t)ptr < 4096) return;
+    uint8_t kind = 0;
+    if (!omni_obj_reg_lookup((uintptr_t)ptr, NULL, &kind) || kind == 0) {
+        return;
+    }
+    switch (kind) {
+        case 1: {
+            OmniObjHeader* hdr = ((OmniObjHeader*)ptr) - 1;
+            if (hdr->magic == OMNI_OBJ_HEADER_MAGIC) {
+                uint32_t cur = __atomic_load_n(&hdr->rc, __ATOMIC_ACQUIRE);
+                if (cur == 0xFFFFFFFFu) return;
+                if (__atomic_sub_fetch(&hdr->rc, 1u, __ATOMIC_ACQ_REL) == 0u) {
+                    hdr->magic = 0;
+                    omni_obj_reg_remove((uintptr_t)ptr);
+                    free(hdr);
+                }
+            }
+            break;
+        }
+        case 2:
+            __omni_slice_destroy((OmniSlice*)ptr);
+            break;
+        case 3:
+            __omni_map_destroy((OmniMap*)ptr);
+            break;
+        case 4:
+            __omni_chan_destroy((OmniChan*)ptr);
+            break;
+        case 5:
+            __omni_closure_destroy(ptr);
+            break;
+        default:
+            break;
+    }
+}
+
+void* __omni_closure_create(void* fn_ptr, void* env_ptr) {
+    OmniClosure* cl = (OmniClosure*)malloc(sizeof(OmniClosure));
+    if (!cl) return fn_ptr;
+    cl->magic = OMNI_CLOSURE_MAGIC;
+    cl->rc = 1;
+    cl->flags = 0;
+    cl->fn_ptr = fn_ptr;
+    cl->env_ptr = env_ptr ? __omni_rc_retain(env_ptr) : NULL;
+    __omni_reg_track(cl, 5);
+    __omni_c_return_ptr(cl);
+    return cl;
+}
+
+void __omni_closure_set_env_rc_mask(void* clos_ptr, int64_t mask) {
+    if (__omni_is_closure_ptr(clos_ptr)) {
+        ((OmniClosure*)clos_ptr)->flags = (uint32_t)(uint64_t)mask;
+    }
+}
+
+int64_t __omni_closure_is(const void* ptr) {
+    return __omni_is_closure_ptr(ptr) ? 1 : 0;
+}
+
+void* __omni_closure_fn(const void* ptr) {
+    if (!ptr) return NULL;
+    if (__omni_is_closure_ptr(ptr)) {
+        return ((const OmniClosure*)ptr)->fn_ptr;
+    }
+    return (void*)ptr;
+}
+
+void* __omni_closure_env(const void* ptr) {
+    if (__omni_is_closure_ptr(ptr)) {
+        return ((const OmniClosure*)ptr)->env_ptr;
+    }
+    return NULL;
+}
+
+void __omni_closure_destroy(void* ptr) {
+    if (!__omni_is_closure_ptr(ptr)) return;
+    OmniClosure* cl = (OmniClosure*)ptr;
+    uint32_t cur = __atomic_load_n(&cl->rc, __ATOMIC_ACQUIRE);
+    if (cur == 0xFFFFFFFFu) return;
+    if (__atomic_sub_fetch(&cl->rc, 1u, __ATOMIC_ACQ_REL) > 0u) {
+        return;
+    }
+    cl->magic = 0;
+    __omni_reg_untrack(cl);
+    uint32_t ptr_mask = cl->flags;
+    if (cl->env_ptr) {
+        if (ptr_mask != 0 && __omni_is_slice_ptr(cl->env_ptr)) {
+            OmniSlice* env_sl = (OmniSlice*)cl->env_ptr;
+            if (__atomic_load_n(&env_sl->rc, __ATOMIC_ACQUIRE) == 1u) {
+                for (size_t i = 0; i < env_sl->len && i < 32; i++) {
+                    if ((ptr_mask & (1u << i)) != 0u) {
+                        __omni_rc_release((void*)(uintptr_t)env_sl->data[i]);
+                        env_sl->data[i] = 0;
+                    }
+                }
+            }
+        }
+        __omni_rc_release(cl->env_ptr);
+        cl->env_ptr = NULL;
+    }
+    free(cl);
 }
 
 char* __omni_str_token_arena(void* arena_ptr, const char* s, int32_t index) {

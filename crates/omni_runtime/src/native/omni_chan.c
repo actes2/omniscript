@@ -1,5 +1,6 @@
 #include "omni_chan.h"
 #include "omni_fiber.h"
+#include "omni_value.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +42,8 @@ OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
     }
 
     chan->magic = OMNI_CHAN_MAGIC;
+    chan->rc = 1;
+    chan->flags = 0;
     chan->capacity = capacity;
     chan->elem_size = elem_size;
     chan->head = 0;
@@ -51,6 +54,7 @@ OmniChan* __omni_chan_make(size_t capacity, size_t elem_size) {
     omni_mutex_init(&chan->lock);
     omni_cond_init(&chan->not_empty);
     omni_cond_init(&chan->not_full);
+    __omni_reg_track(chan, 4);
 
     return chan;
 }
@@ -61,7 +65,7 @@ bool __omni_chan_send(OmniChan* chan, const void* elem_ptr) {
     omni_mutex_lock(&chan->lock);
 
     while (chan->count == chan->capacity && !chan->closed) {
-        if (__omni_fiber_is_in_fiber()) {
+        if (__omni_fiber_is_in_fiber() || __omni_fiber_has_runnable()) {
             omni_mutex_unlock(&chan->lock);
             __omni_fiber_yield();
             omni_mutex_lock(&chan->lock);
@@ -93,7 +97,7 @@ bool __omni_chan_recv(OmniChan* chan, void* out_elem_ptr) {
     omni_mutex_lock(&chan->lock);
 
     while (chan->count == 0 && !chan->closed) {
-        if (__omni_fiber_is_in_fiber()) {
+        if (__omni_fiber_is_in_fiber() || __omni_fiber_has_runnable()) {
             omni_mutex_unlock(&chan->lock);
             __omni_fiber_yield();
             omni_mutex_lock(&chan->lock);
@@ -152,7 +156,13 @@ void __omni_chan_close(OmniChan* chan) {
 
 void __omni_chan_destroy(OmniChan* chan) {
     if (!__omni_is_chan_ptr(chan)) return;
+    uint32_t cur = __atomic_load_n(&chan->rc, __ATOMIC_ACQUIRE);
+    if (cur == 0xFFFFFFFFu) return;
+    if (__atomic_sub_fetch(&chan->rc, 1u, __ATOMIC_ACQ_REL) > 0u) {
+        return;
+    }
     chan->magic = 0;
+    __omni_reg_untrack(chan);
     omni_mutex_lock(&chan->lock);
     chan->closed = true;
     omni_cond_broadcast(&chan->not_empty);

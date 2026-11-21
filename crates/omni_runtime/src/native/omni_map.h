@@ -17,6 +17,8 @@ typedef struct {
 
 typedef struct {
     uint64_t magic;
+    uint32_t rc;
+    uint32_t flags;
     OmniMapBucket* buckets;
     size_t capacity;
     size_t count;
@@ -26,7 +28,10 @@ typedef struct {
 static inline bool __omni_is_map_ptr(const void* ptr) {
     const unsigned char* p = (const unsigned char*)ptr;
     if (!p || (uintptr_t)p < 4096) return false;
-    if (p[0] != 0xFF || (((uintptr_t)p & 7u) != 0u)) return false;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (((uintptr_t)p >> 48) != 0u) return false;
+#endif
+    if ((((uintptr_t)p & 7u) != 0u) || p[0] != 0xFF) return false;
     return ((const OmniMap*)ptr)->magic == OMNI_MAP_MAGIC;
 }
 
@@ -38,9 +43,10 @@ void __omni_map_delete(OmniMap* map, const char* key);
 size_t __omni_map_len(OmniMap* map);
 void __omni_map_destroy(OmniMap* map);
 
-// Integer key convenience helpers
+// Integer key convenience helpers (domain-separated from string keys)
 void __omni_map_set_int(OmniMap* map, int64_t key, int64_t val);
 int64_t __omni_map_get_int(OmniMap* map, int64_t key);
 bool __omni_map_contains_int(OmniMap* map, int64_t key);
+void __omni_map_delete_int(OmniMap* map, int64_t key);
 
 #endif // OMNI_MAP_H

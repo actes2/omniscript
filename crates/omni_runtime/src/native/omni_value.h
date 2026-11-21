@@ -105,6 +105,52 @@ void __omni_c_return_str(const char* s);
 const char* __omni_c_get_returned_str(void);
 void __omni_c_return_ptr(void* p);
 void* __omni_c_get_returned_ptr(void);
+void* __omni_c_consume_returned_ptr(void);
+
+// Perceus Refcount & Fat Closure (`{ fn_ptr, env_ptr }`) Primitives
+#define OMNI_CLOSURE_MAGIC    0x434C4F534F4D4EFFULL
+#define OMNI_OBJ_HEADER_MAGIC 0x4F424A484F4D4EFFULL
+
+typedef struct {
+    uint64_t magic;
+    uint32_t rc;
+    uint32_t flags;
+    void* fn_ptr;
+    void* env_ptr;
+} OmniClosure;
+
+typedef struct {
+    uint64_t magic;
+    uint32_t rc;
+    uint32_t type_id;
+} OmniObjHeader;
+
+static inline bool __omni_is_closure_ptr(const void* ptr) {
+    const unsigned char* p = (const unsigned char*)ptr;
+    if (!p || (uintptr_t)p < 4096) return false;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (((uintptr_t)p >> 48) != 0u) return false;
+#endif
+    if ((((uintptr_t)p & 7u) != 0u) || p[0] != 0xFF) return false;
+    return ((const OmniClosure*)ptr)->magic == OMNI_CLOSURE_MAGIC;
+}
+
+void __omni_reg_track(const void* ptr, uint8_t kind);
+void __omni_reg_untrack(const void* ptr);
+
+void* __omni_rc_retain(void* ptr);
+void __omni_rc_release(void* ptr);
+void* __omni_closure_create(void* fn_ptr, void* env_ptr);
+void __omni_closure_set_env_rc_mask(void* clos_ptr, int64_t mask);
+int64_t __omni_closure_is(const void* ptr);
+void* __omni_closure_fn(const void* ptr);
+void* __omni_closure_env(const void* ptr);
+void __omni_closure_destroy(void* ptr);
+void* __omni_obj_alloc(int64_t payload_bytes, int64_t type_id);
+void __omni_obj_set_type(const void* ptr, int64_t type_id);
+int64_t __omni_obj_get_type(const void* ptr);
+void __omni_fiber_swap_unwind_ctx(void** from_ctx, void** to_ctx, void** from_ret_ptr, void** to_ret_ptr);
+void __omni_fiber_free_unwind_ctx(void* ctx);
 char* __omni_str_token(const char* s, int32_t index);
 char* __omni_str_token_arena(void* arena, const char* s, int32_t index);
 char* __omni_os_socket_read_arena(void* arena, int32_t client_fd);

@@ -795,7 +795,7 @@ impl DependencyDriller {
     ) -> EcosystemWalkReport {
         let eco_lower = ecosystem.to_lowercase();
         if eco_lower == "polyglot" {
-            let py_rep = self.crawl_python_module(base_dir, ecosystem, module, target_symbols);
+            let py_rep = self.crawl_python_module(base_dir, "python", module, target_symbols);
             let is_cpython_dynload = py_rep
                 .resolved_origin
                 .as_ref()
@@ -808,33 +808,35 @@ impl DependencyDriller {
                 return py_rep;
             }
             if is_cpython_dynload {
-                let c_rep = self.crawl_c_cpp_module(base_dir, ecosystem, module, target_symbols);
+                let c_rep = self.crawl_c_cpp_module(base_dir, "c", module, target_symbols);
                 if c_rep.resolution_source != "unresolved" && c_rep.resolved_origin.is_some() {
                     return c_rep;
                 }
                 return py_rep;
             }
-            let js_rep = self.crawl_javascript_module(base_dir, ecosystem, module, target_symbols);
+            let js_rep = self.crawl_javascript_module(base_dir, "node", module, target_symbols);
             if js_rep.resolution_source != "unresolved" {
                 return js_rep;
             }
-            let java_rep = self.crawl_java_module(base_dir, ecosystem, module, target_symbols);
+            let java_rep = self.crawl_java_module(base_dir, "java", module, target_symbols);
             if java_rep.resolution_source != "unresolved" {
                 return java_rep;
             }
-            let rs_rep = self.crawl_rust_module(base_dir, ecosystem, module, target_symbols);
+            let rs_rep = self.crawl_rust_module(base_dir, "rust", module, target_symbols);
             if rs_rep.resolution_source != "unresolved" {
                 return rs_rep;
             }
-            let go_rep = self.crawl_go_module(base_dir, ecosystem, module, target_symbols);
+            let go_rep = self.crawl_go_module(base_dir, "go", module, target_symbols);
             if go_rep.resolution_source != "unresolved" {
                 return go_rep;
             }
-            let c_rep = self.crawl_c_cpp_module(base_dir, ecosystem, module, target_symbols);
+            let c_rep = self.crawl_c_cpp_module(base_dir, "c", module, target_symbols);
             if c_rep.resolution_source != "unresolved" {
                 return c_rep;
             }
-            return py_rep;
+            let mut unresolved = py_rep;
+            unresolved.ecosystem = ecosystem.to_string();
+            return unresolved;
         }
         if eco_lower == "python" || eco_lower == "py" {
             return self.crawl_python_module(base_dir, ecosystem, module, target_symbols);

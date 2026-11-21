@@ -316,14 +316,26 @@ impl SsaContextEnvelope {
             }
             out.push_str("  </drilled_context>\n");
         }
-        if feedback.is_some() && !abductive_evidence.is_empty() {
+        let (clean_intent, embedded_diag) =
+            if let Some(idx) = self.raw_intent.find("\n[Compiler Diagnostic Feedback:") {
+                let intent_part = &self.raw_intent[..idx];
+                let diag_part = self.raw_intent[idx + 1..]
+                    .trim_start_matches("[Compiler Diagnostic Feedback:")
+                    .trim_end_matches(']');
+                (intent_part.trim(), Some(diag_part.trim()))
+            } else {
+                (self.raw_intent.trim(), None)
+            };
+        let active_diag = feedback.or(embedded_diag);
+
+        if active_diag.is_some() && !abductive_evidence.is_empty() {
             out.push_str("  <abductive_evidence>\n");
             for ev in abductive_evidence.into_iter().take(12) {
                 out.push_str(&format!("    <proof>{}</proof>\n", ev));
             }
             out.push_str("  </abductive_evidence>\n");
         }
-        if feedback.is_some() && !semantic_obligations.is_empty() {
+        if active_diag.is_some() && !semantic_obligations.is_empty() {
             out.push_str("  <semantic_obligations>\n");
             for ob in semantic_obligations.into_iter().take(12) {
                 out.push_str(&format!("    <must>{}</must>\n", ob));
@@ -331,7 +343,7 @@ impl SsaContextEnvelope {
             out.push_str("  </semantic_obligations>\n");
         }
         // Only surface pre-assembled failover hints when retrying after a diagnostic failure
-        if feedback.is_some() && !short_circuit_hints.is_empty() {
+        if active_diag.is_some() && !short_circuit_hints.is_empty() {
             out.push_str("  <c_short_circuit>\n");
             for sc in short_circuit_hints {
                 for l in sc.lines() {
@@ -345,21 +357,10 @@ impl SsaContextEnvelope {
         out.push_str("    Core runtime intrinsics: @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), @__omni_str_concat(i8*, i8*), @__omni_int_to_str(i64).\n");
         out.push_str("  </platform_abi>\n");
 
-        let (clean_intent, embedded_diag) =
-            if let Some(idx) = self.raw_intent.find("\n[Compiler Diagnostic Feedback:") {
-                let intent_part = &self.raw_intent[..idx];
-                let diag_part = self.raw_intent[idx + 1..]
-                    .trim_start_matches("[Compiler Diagnostic Feedback:")
-                    .trim_end_matches(']');
-                (intent_part.trim(), Some(diag_part.trim()))
-            } else {
-                (self.raw_intent.trim(), None)
-            };
-
         out.push_str(&format!("  <intent>{}</intent>\n", clean_intent));
         out.push_str(&format!("  <next_reg>%t_{}</next_reg>\n", self.next_ssa_idx));
 
-        if let Some(diag) = feedback.or(embedded_diag) {
+        if let Some(diag) = active_diag {
             out.push_str("  <compiler_diagnostic>\n");
             for l in diag.lines() {
                 out.push_str(&format!("    {}\n", l.trim()));
@@ -581,8 +582,21 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_fiber_init",
     "__omni_fiber_create",
     "__omni_fiber_yield",
+    "__omni_fiber_join_all",
     "__omni_fiber_destroy",
     "__omni_go_spawn",
+    "__omni_rc_retain",
+    "__omni_rc_release",
+    "__omni_closure_create",
+    "__omni_closure_set_env_rc_mask",
+    "__omni_closure_is",
+    "__omni_closure_fn",
+    "__omni_closure_env",
+    "__omni_closure_destroy",
+    "__omni_obj_alloc",
+    "__omni_obj_set_type",
+    "__omni_obj_get_type",
+    "__omni_ipow64",
     "__omni_slice_create",
     "__omni_slice_append",
     "__omni_slice_get",
@@ -603,6 +617,7 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_map_set_int",
     "__omni_map_get_int",
     "__omni_map_contains_int",
+    "__omni_map_delete_int",
     "__omni_c_http_get",
     "__omni_c_json_parse",
     "__omni_c_json_get",
@@ -613,6 +628,7 @@ const CANONICAL_OMNI_SYMBOLS: &[&str] = &[
     "__omni_c_get_returned_str",
     "__omni_c_return_ptr",
     "__omni_c_get_returned_ptr",
+    "__omni_c_consume_returned_ptr",
     "__omni_str_token",
     "__omni_str_token_arena",
     "__omni_os_socket_listen",
@@ -812,7 +828,35 @@ pub fn sanitize_llvm_ir(raw: &str) -> String {
             continue;
         }
 
-        if valid_prefixes.iter().any(|prefix| trimmed_ascii.starts_with(prefix)) || (in_fence && !trimmed_ascii.is_empty()) {
+        let no_comment_head = if !trimmed_ascii.starts_with(';') {
+            trimmed_ascii.split(';').next().unwrap_or(trimmed_ascii).trim()
+        } else {
+            trimmed_ascii
+        };
+        let is_bb_label = if let Some(lbl_stem) = no_comment_head.strip_suffix(':') {
+            !lbl_stem.is_empty()
+                && lbl_stem != "entry"
+                && lbl_stem != "Note"
+                && lbl_stem != "Output"
+                && lbl_stem != "Example"
+                && lbl_stem
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '.')
+                    .unwrap_or(false)
+                && lbl_stem
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        } else {
+            false
+        };
+
+        if is_bb_label {
+            out.push_str(no_comment_head);
+            out.push('\n');
+        } else if valid_prefixes.iter().any(|prefix| trimmed_ascii.starts_with(prefix))
+            || (in_fence && !trimmed_ascii.is_empty())
+        {
             let clean_line = rectify_omni_call_line(trimmed_ascii);
             out.push_str("  ");
             out.push_str(&clean_line);
@@ -1134,6 +1178,59 @@ impl<'a> VerifiedSynthesisEngine<'a> {
         out
     }
 
+    /// Alpha-renames basic-block labels defined within a synthesized sub-CFG so multiple
+    /// multi-block AI blocks inside the same LLVM function never collide on label names.
+    pub fn alpha_rename_internal_labels(ir: &str, scope_id: usize) -> String {
+        let suffix = format!("_ai_{}", scope_id);
+        let mut labels: Vec<String> = Vec::new();
+        for line in ir.lines() {
+            let t_raw = line.trim();
+            let t = if !t_raw.starts_with(';') {
+                t_raw.split(';').next().unwrap_or(t_raw).trim()
+            } else {
+                t_raw
+            };
+            if let Some(stem) = t.strip_suffix(':') {
+                if !stem.is_empty()
+                    && !stem.starts_with(';')
+                    && !stem.starts_with('%')
+                    && !stem.ends_with(&suffix)
+                    && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                {
+                    if !labels.iter().any(|l| l == stem) {
+                        labels.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        if labels.is_empty() {
+            return ir.to_string();
+        }
+        // Sort longest-first to prevent prefix partial replacements
+        labels.sort_by(|a, b| b.len().cmp(&a.len()));
+        let mut out = ir.to_string();
+        for lbl in &labels {
+            let new_lbl = format!("{}{}", lbl, suffix);
+            out = out.replace(&format!("{}:\n", lbl), &format!("{}:\n", new_lbl));
+            out = out.replace(&format!("{}: ;", lbl), &format!("{}: ;", new_lbl));
+            out = out.replace(&format!("{}:;", lbl), &format!("{}:;", new_lbl));
+            let old_ref = format!("%{}", lbl);
+            let new_ref = format!("%{}", new_lbl);
+            for delim in ["\n", "\r", " ", ",", "]"] {
+                out = out.replace(
+                    &format!("{}{}", old_ref, delim),
+                    &format!("{}{}", new_ref, delim),
+                );
+            }
+            if out.ends_with(&old_ref) {
+                let n = out.len() - old_ref.len();
+                out.truncate(n);
+                out.push_str(&new_ref);
+            }
+        }
+        out
+    }
+
     /// Strips quoted string literals so identifier scanning only inspects actual code tokens.
     fn strip_quoted_literals(src: &str) -> String {
         let mut out = String::with_capacity(src.len());
@@ -1331,16 +1428,25 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
                 pre_assembled_sc.clone().unwrap()
             } else {
                 let mut trial_env = envelope.clone();
+                let eff_temp = if attempt == 0 {
+                    temp
+                } else {
+                    temp.max(0.25 + 0.15 * ((attempt - 1) as f32))
+                };
                 if let Some(err_msg) = feedback {
                     trial_env.raw_intent = format!(
                         "{}\n[Compiler Diagnostic Feedback: {}]",
                         envelope.raw_intent, err_msg
                     );
                 }
-                self.backend.lower_intent(&trial_env, temp)?
+                self.backend.lower_intent(&trial_env, eff_temp)?
             };
             let mut sanitized = sanitize_llvm_ir(&raw_ir);
             sanitized = Self::rectify_live_registers(&sanitized, &envelope.active_symbols);
+            sanitized = Self::alpha_rename_internal_labels(
+                &sanitized,
+                envelope.anchor_id.unwrap_or(envelope.next_ssa_idx),
+            );
 
             // Check if Attempt 0 from the AI satisfied the extracted frontier dataflow obligations.
             // If it omitted required frontier calls, indirect casts, or target register stores, record a
@@ -2016,10 +2122,15 @@ impl InferenceEngine for CandleGgufEngine {
                     }
                     if let Some((completed_lines, _tail)) = curr_str.rsplit_once('\n') {
                         let clean_probe = sanitize_llvm_ir(completed_lines);
-                        let has_llvm_instr = clean_probe.contains("call ")
-                            || clean_probe.contains("store ")
-                            || clean_probe.contains(" = ")
-                            || clean_probe.contains("ret ");
+                        let has_llvm_instr = clean_probe.lines().any(|l| {
+                            let t = l.trim();
+                            !t.is_empty()
+                                && !t.starts_with(';')
+                                && (t.starts_with("call ")
+                                    || t.starts_with("store ")
+                                    || t.contains(" = ")
+                                    || t.starts_with("ret "))
+                        });
                         let has_completed_terminator = clean_probe.lines().any(|l| {
                             let t = l.trim();
                             t.starts_with("ret ") || t == "unreachable"

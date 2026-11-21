@@ -348,6 +348,29 @@ impl<'a> FnLowerCtx<'a> {
         Ok(())
     }
 
+    /// Load 32-bit operand respecting `Float32` IEEE-754 single-precision literal encoding when `ty == Float32`.
+    fn load_op32_typed(
+        &self,
+        asm: &mut ThumbAssembler,
+        op: &str,
+        ty: &LowerType,
+        rd: u8,
+    ) -> Result<(), String> {
+        let t = op.trim();
+        if matches!(ty, LowerType::Float32)
+            && !self.alloca_storage.contains_key(t)
+            && !self.ssa_slots.contains_key(t)
+            && !t.starts_with('@')
+            && !t.starts_with("getelementptr")
+            && strip_const_cast_wrapper(t).is_none()
+        {
+            let bits32 = parse_ir_const_f32_bits(t)?;
+            asm.emit_load_u32(rd, bits32);
+            return Ok(());
+        }
+        self.load_op32(asm, t, rd)
+    }
+
     /// Load full 64-bit value of operand into `(rd_lo, rd_hi)` respecting `ty` sign/zero extension if narrower.
     fn load_op64(
         &self,
@@ -377,7 +400,11 @@ impl<'a> FnLowerCtx<'a> {
             asm.emit_movs_imm8(rd_hi, 0);
             return Ok(());
         }
-        let val64 = parse_ir_const64(t)?;
+        let val64 = if matches!(ty, LowerType::Float64) {
+            parse_ir_const_f64_bits(t)? as i64
+        } else {
+            parse_ir_const64(t)?
+        };
         asm.emit_load_u32(rd_lo, (val64 & 0xFFFF_FFFF) as u32);
         asm.emit_load_u32(rd_hi, ((val64 as u64) >> 32) as u32);
         Ok(())
@@ -635,7 +662,7 @@ fn emit_phi_moves_for_edge(
             ctx.load_op64(asm, val, &phi.ty, 0, 1)?;
             ctx.store_ssa64(asm, &phi.dst, 0, 1);
         } else {
-            ctx.load_op32(asm, val, 0)?;
+            ctx.load_op32_typed(asm, val, &phi.ty, 0)?;
             ctx.store_ssa32(asm, &phi.dst, 0);
         }
         return Ok(());
@@ -649,7 +676,7 @@ fn emit_phi_moves_for_edge(
             asm.emit_str_sp(0, tmp_off);
             asm.emit_str_sp(1, tmp_off + 4);
         } else {
-            ctx.load_op32(asm, val, 0)?;
+            ctx.load_op32_typed(asm, val, &phi.ty, 0)?;
             asm.emit_str_sp(0, tmp_off);
         }
     }
@@ -698,7 +725,7 @@ fn lower_instruction(
         if ty.is_64bit_scalar() {
             ctx.load_op64(asm, val, &ty, 0, 1)?;
         } else {
-            ctx.load_op32(asm, val, 0)?;
+            ctx.load_op32_typed(asm, val, &ty, 0)?;
             asm.emit_movs_imm8(1, 0);
         }
         if ctx.frame_bytes > 0 {
@@ -797,7 +824,7 @@ fn lower_instruction(
                 asm.emit_str_imm(1, 2, 4);
             }
             _ => {
-                ctx.load_op32(asm, val_op, 0)?;
+                ctx.load_op32_typed(asm, val_op, &val_ty, 0)?;
                 asm.emit_str_imm(0, 2, 0);
             }
         }
@@ -902,10 +929,10 @@ fn lower_instruction(
                 asm.bind_label(end_lbl);
                 ctx.store_ssa64(asm, dst, 0, 1);
             } else {
-                ctx.load_op32(asm, t_op, 0)?;
+                ctx.load_op32_typed(asm, t_op, &v_ty, 0)?;
                 asm.emit_b_label_short(end_lbl);
                 asm.bind_label(f_lbl);
-                ctx.load_op32(asm, f_op, 0)?;
+                ctx.load_op32_typed(asm, f_op, &v_ty, 0)?;
                 asm.bind_label(end_lbl);
                 ctx.store_ssa32(asm, dst, 0);
             }
@@ -953,17 +980,31 @@ fn lower_instruction(
     }
 
     if let Some(rest) = rhs.strip_prefix("fneg ") {
-        let (ty, op) = split_type_and_val(rest)?;
-        ctx.load_op64(asm, op, &ty, 0, 1)?;
-        asm.emit_load_u32(2, 0x8000_0000);
-        asm.emit_eors(1, 2);
-        ctx.store_ssa64(asm, dst, 0, 1);
+        let mut rem = rest.trim();
+        for flag in [
+            "fast ", "nnan ", "ninf ", "nsz ", "arcp ", "contract ", "afn ", "reassoc ",
+        ] {
+            while let Some(r) = rem.strip_prefix(flag) {
+                rem = r.trim();
+            }
+        }
+        let (ty, op) = split_type_and_val(rem)?;
+        if matches!(ty, LowerType::Float32) {
+            ctx.load_op32_typed(asm, op, &ty, 0)?;
+            asm.emit_load_u32(2, 0x8000_0000);
+            asm.emit_eors(0, 2);
+            ctx.store_ssa32(asm, dst, 0);
+        } else {
+            ctx.load_op64(asm, op, &ty, 0, 1)?;
+            asm.emit_load_u32(2, 0x8000_0000);
+            asm.emit_eors(1, 2);
+            ctx.store_ssa64(asm, dst, 0, 1);
+        }
         return Ok(());
     }
 
-    if rhs.starts_with("fcmp ") {
-        asm.emit_movs_imm8(0, 0);
-        ctx.store_ssa32(asm, dst, 0);
+    if let Some(rest) = rhs.strip_prefix("fcmp ") {
+        lower_fcmp(asm, ctx, dst, rest)?;
         return Ok(());
     }
 
@@ -976,7 +1017,11 @@ fn lower_gep(
     dst: &str,
     rest: &str,
 ) -> Result<(), String> {
-    let clean = rest.trim().trim_start_matches("inbounds").trim();
+    let clean0 = rest.trim().trim_start_matches("inbounds").trim();
+    let clean = clean0
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(clean0);
     let parts = split_top_commas(clean);
     if parts.len() < 2 {
         return Err(format!("malformed GEP: '{}'", rest));
@@ -1081,9 +1126,22 @@ fn lower_binop(
     op: &str,
     rest: &str,
 ) -> Result<(), String> {
-    // Strip optional flags (`nsw`, `nuw`, `exact`, `fast`, `disjoint`)
+    // Strip optional integer & IEEE-754 fast-math flags
     let mut rem = rest.trim();
-    for flag in ["nsw ", "nuw ", "exact ", "disjoint ", "fast "] {
+    for flag in [
+        "nsw ",
+        "nuw ",
+        "exact ",
+        "disjoint ",
+        "fast ",
+        "nnan ",
+        "ninf ",
+        "nsz ",
+        "arcp ",
+        "contract ",
+        "afn ",
+        "reassoc ",
+    ] {
         while let Some(r) = rem.strip_prefix(flag) {
             rem = r.trim();
         }
@@ -1095,15 +1153,45 @@ fn lower_binop(
     let (ty, lhs_op) = split_type_and_val(&parts[0])?;
     let rhs_op = parts[1].trim();
 
+    if matches!(op, "fadd" | "fsub" | "fmul" | "fdiv" | "frem") {
+        let helper = match op {
+            "fadd" => "__omni_fadd64",
+            "fsub" => "__omni_fsub64",
+            "fmul" => "__omni_fmul64",
+            "fdiv" => "__omni_fdiv64",
+            "frem" => "__omni_frem64",
+            _ => unreachable!(),
+        };
+        if matches!(ty, LowerType::Float32) {
+            ctx.load_op32_typed(asm, rhs_op, &ty, 0)?;
+            asm.emit_bl_sym("__omni_f32_to_f64");
+            asm.emit_movs_reg(4, 0);
+            asm.emit_movs_reg(5, 1);
+            ctx.load_op32_typed(asm, lhs_op, &ty, 0)?;
+            asm.emit_bl_sym("__omni_f32_to_f64");
+            asm.emit_movs_reg(2, 4);
+            asm.emit_movs_reg(3, 5);
+            asm.emit_bl_sym(helper);
+            asm.emit_bl_sym("__omni_f64_to_f32");
+            ctx.store_ssa32(asm, dst, 0);
+        } else {
+            ctx.load_op64(asm, lhs_op, &ty, 0, 1)?;
+            ctx.load_op64(asm, rhs_op, &ty, 2, 3)?;
+            asm.emit_bl_sym(helper);
+            ctx.store_ssa64(asm, dst, 0, 1);
+        }
+        return Ok(());
+    }
+
     if ty.is_64bit_scalar() {
         ctx.load_op64(asm, lhs_op, &ty, 0, 1)?;
         ctx.load_op64(asm, rhs_op, &ty, 2, 3)?;
         match op {
-            "add" | "fadd" => {
+            "add" => {
                 asm.emit_adds_reg(0, 0, 2);
                 asm.emit_adcs(1, 3);
             }
-            "sub" | "fsub" => {
+            "sub" => {
                 asm.emit_subs_reg(0, 0, 2);
                 asm.emit_sbcs(1, 3);
             }
@@ -1119,10 +1207,10 @@ fn lower_binop(
                 asm.emit_eors(0, 2);
                 asm.emit_eors(1, 3);
             }
-            "mul" | "fmul" => asm.emit_bl_sym("__omni_mul64"),
-            "sdiv" | "fdiv" => asm.emit_bl_sym("__omni_sdiv64"),
+            "mul" => asm.emit_bl_sym("__omni_mul64"),
+            "sdiv" => asm.emit_bl_sym("__omni_sdiv64"),
             "udiv" => asm.emit_bl_sym("__omni_udiv64"),
-            "srem" | "frem" => asm.emit_bl_sym("__omni_srem64"),
+            "srem" => asm.emit_bl_sym("__omni_srem64"),
             "urem" => asm.emit_bl_sym("__omni_urem64"),
             "shl" => asm.emit_bl_sym("__omni_shl64"),
             "lshr" => asm.emit_bl_sym("__omni_lshr64"),
@@ -1315,6 +1403,156 @@ fn lower_icmp(
     Ok(())
 }
 
+fn lower_fcmp(
+    asm: &mut ThumbAssembler,
+    ctx: &FnLowerCtx,
+    dst: &str,
+    rest: &str,
+) -> Result<(), String> {
+    let mut rem = rest.trim();
+    for flag in [
+        "fast ", "nnan ", "ninf ", "nsz ", "arcp ", "contract ", "afn ", "reassoc ",
+    ] {
+        while let Some(r) = rem.strip_prefix(flag) {
+            rem = r.trim();
+        }
+    }
+    let mut it = rem.splitn(2, char::is_whitespace);
+    let pred = it.next().unwrap_or("").trim();
+    let ops_str = it.next().unwrap_or("").trim();
+    let parts = split_top_commas(ops_str);
+    if parts.len() != 2 {
+        return Err(format!("malformed fcmp: '{}'", rest));
+    }
+    let (ty, lhs_op) = split_type_and_val(&parts[0])?;
+    let rhs_op = parts[1].trim();
+
+    if !matches!(
+        pred,
+        "false"
+            | "oeq"
+            | "ogt"
+            | "oge"
+            | "olt"
+            | "ole"
+            | "one"
+            | "ord"
+            | "uno"
+            | "ueq"
+            | "ugt"
+            | "uge"
+            | "ult"
+            | "ule"
+            | "une"
+            | "true"
+    ) {
+        return Err(format!("unknown fcmp predicate '{}'", pred));
+    }
+
+    if pred == "false" || pred == "true" {
+        if matches!(ty, LowerType::Float32) {
+            ctx.load_op32_typed(asm, lhs_op, &ty, 0)?;
+            ctx.load_op32_typed(asm, rhs_op, &ty, 2)?;
+        } else {
+            ctx.load_op64(asm, lhs_op, &ty, 0, 1)?;
+            ctx.load_op64(asm, rhs_op, &ty, 2, 3)?;
+        }
+        asm.emit_movs_imm8(0, if pred == "true" { 1 } else { 0 });
+        ctx.store_ssa32(asm, dst, 0);
+        return Ok(());
+    }
+
+    if matches!(ty, LowerType::Float32) {
+        ctx.load_op32_typed(asm, rhs_op, &ty, 0)?;
+        asm.emit_bl_sym("__omni_f32_to_f64");
+        asm.emit_movs_reg(4, 0);
+        asm.emit_movs_reg(5, 1);
+        ctx.load_op32_typed(asm, lhs_op, &ty, 0)?;
+        asm.emit_bl_sym("__omni_f32_to_f64");
+        asm.emit_movs_reg(2, 4);
+        asm.emit_movs_reg(3, 5);
+    } else {
+        ctx.load_op64(asm, lhs_op, &ty, 0, 1)?;
+        ctx.load_op64(asm, rhs_op, &ty, 2, 3)?;
+    }
+    asm.emit_bl_sym("__omni_fcmp64"); // r0 in {-1 (<), 0 (==), 1 (>), 2 (unordered/NaN)}
+
+    let cond = match pred {
+        "oeq" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Eq
+        }
+        "ogt" => {
+            asm.emit_cmp_imm8(0, 1);
+            Cond::Eq
+        }
+        "oge" => {
+            asm.emit_cmp_imm8(0, 1);
+            Cond::Ls // (u32)r0 <= 1 -> {0, 1}
+        }
+        "olt" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Lt // (i32)r0 < 0 -> {-1}
+        }
+        "ole" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Le // (i32)r0 <= 0 -> {-1, 0}
+        }
+        "one" => {
+            asm.emit_movs_imm8(1, 2);
+            asm.emit_bics(0, 1);
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Ne // r0 in {-1, 1}
+        }
+        "ord" => {
+            asm.emit_cmp_imm8(0, 2);
+            Cond::Ne // r0 != 2
+        }
+        "uno" => {
+            asm.emit_cmp_imm8(0, 2);
+            Cond::Eq // r0 == 2
+        }
+        "ueq" => {
+            asm.emit_movs_imm8(1, 2);
+            asm.emit_bics(0, 1);
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Eq // r0 in {0, 2}
+        }
+        "ugt" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Gt // (i32)r0 > 0 -> {1, 2}
+        }
+        "uge" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Ge // (i32)r0 >= 0 -> {0, 1, 2}
+        }
+        "ult" => {
+            asm.emit_cmp_imm8(0, 1);
+            Cond::Hi // (u32)r0 > 1 -> {-1, 2}
+        }
+        "ule" => {
+            asm.emit_cmp_imm8(0, 1);
+            Cond::Ne // r0 != 1 -> {-1, 0, 2}
+        }
+        "une" => {
+            asm.emit_cmp_imm8(0, 0);
+            Cond::Ne // r0 != 0 -> {-1, 1, 2}
+        }
+        _ => unreachable!(),
+    };
+
+    let tr = asm.new_label();
+    let dn = asm.new_label();
+    asm.emit_bcond_label_short(cond, tr);
+    asm.emit_movs_imm8(0, 0);
+    asm.emit_b_label_short(dn);
+    asm.bind_label(tr);
+    asm.emit_movs_imm8(0, 1);
+    asm.bind_label(dn);
+    ctx.store_ssa32(asm, dst, 0);
+    Ok(())
+}
+
 fn lower_cast(
     asm: &mut ThumbAssembler,
     ctx: &FnLowerCtx,
@@ -1328,7 +1566,7 @@ fn lower_cast(
             ctx.load_op64(asm, op, &ty, 0, 1)?;
             ctx.store_ssa64(asm, dst, 0, 1);
         } else {
-            ctx.load_op32(asm, op, 0)?;
+            ctx.load_op32_typed(asm, op, &ty, 0)?;
             ctx.store_ssa32(asm, dst, 0);
         }
         return Ok(());
@@ -1341,7 +1579,93 @@ fn lower_cast(
     let (src_ty, src_op) = split_type_and_val(src_part)?;
 
     match cast_kind {
-        "zext" | "ptrtoint" | "uitofp" => {
+        "uitofp" => {
+            if src_ty.is_64bit_scalar() {
+                ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
+            } else {
+                ctx.load_op32(asm, src_op, 0)?;
+                match src_ty {
+                    LowerType::Int(1) => {
+                        asm.emit_movs_imm8(1, 1);
+                        asm.emit_ands(0, 1);
+                    }
+                    LowerType::Int(8) => asm.emit_uxtb(0, 0),
+                    LowerType::Int(16) => asm.emit_uxth(0, 0),
+                    _ => {}
+                }
+                asm.emit_movs_imm8(1, 0);
+            }
+            asm.emit_bl_sym("__omni_u64_to_f64");
+            if matches!(dst_ty, LowerType::Float32) {
+                asm.emit_bl_sym("__omni_f64_to_f32");
+                ctx.store_ssa32(asm, dst, 0);
+            } else {
+                ctx.store_ssa64(asm, dst, 0, 1);
+            }
+        }
+        "sitofp" => {
+            if src_ty.is_64bit_scalar() {
+                ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
+            } else {
+                ctx.load_op32(asm, src_op, 0)?;
+                match src_ty {
+                    LowerType::Int(1) => {
+                        asm.emit_lsls_imm(0, 0, 31);
+                        asm.emit_asrs_imm(0, 0, 31);
+                    }
+                    LowerType::Int(8) => asm.emit_sxtb(0, 0),
+                    LowerType::Int(16) => asm.emit_sxth(0, 0),
+                    _ => {}
+                }
+                asm.emit_asrs_imm(1, 0, 31);
+            }
+            asm.emit_bl_sym("__omni_i64_to_f64");
+            if matches!(dst_ty, LowerType::Float32) {
+                asm.emit_bl_sym("__omni_f64_to_f32");
+                ctx.store_ssa32(asm, dst, 0);
+            } else {
+                ctx.store_ssa64(asm, dst, 0, 1);
+            }
+        }
+        "fptosi" | "fptoui" => {
+            if matches!(src_ty, LowerType::Float32) {
+                ctx.load_op32_typed(asm, src_op, &src_ty, 0)?;
+                asm.emit_bl_sym("__omni_f32_to_f64");
+            } else {
+                ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
+            }
+            let conv = if cast_kind == "fptosi" {
+                "__omni_f64_to_i64"
+            } else {
+                "__omni_f64_to_u64"
+            };
+            asm.emit_bl_sym(conv);
+            if dst_ty.is_64bit_scalar() {
+                ctx.store_ssa64(asm, dst, 0, 1);
+            } else {
+                match dst_ty {
+                    LowerType::Int(1) => {
+                        asm.emit_movs_imm8(1, 1);
+                        asm.emit_ands(0, 1);
+                    }
+                    LowerType::Int(8) => asm.emit_uxtb(0, 0),
+                    LowerType::Int(16) => asm.emit_uxth(0, 0),
+                    _ => {}
+                }
+                ctx.store_ssa32(asm, dst, 0);
+            }
+        }
+        "fpext" => {
+            ctx.load_op32_typed(asm, src_op, &src_ty, 0)?;
+            asm.emit_bl_sym("__omni_f32_to_f64");
+            ctx.store_ssa64(asm, dst, 0, 1);
+        }
+        "fptrunc" => {
+            ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
+            asm.emit_bl_sym("__omni_f64_to_f32");
+            ctx.store_ssa32(asm, dst, 0);
+        }
+        "zext" | "ptrtoint" => {
             if src_ty.is_64bit_scalar() {
                 ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
             } else {
@@ -1363,7 +1687,7 @@ fn lower_cast(
                 ctx.store_ssa32(asm, dst, 0);
             }
         }
-        "sext" | "sitofp" => {
+        "sext" => {
             if src_ty.is_64bit_scalar() {
                 ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
             } else {
@@ -1386,12 +1710,12 @@ fn lower_cast(
             }
         }
         _ => {
-            // `trunc`, `inttoptr`, `bitcast`, `fptosi`, etc.
+            // `trunc`, `inttoptr`, `bitcast`
             if src_ty.is_64bit_scalar() && dst_ty.is_64bit_scalar() {
                 ctx.load_op64(asm, src_op, &src_ty, 0, 1)?;
                 ctx.store_ssa64(asm, dst, 0, 1);
             } else {
-                ctx.load_op32(asm, src_op, 0)?;
+                ctx.load_op32_typed(asm, src_op, &src_ty, 0)?;
                 match dst_ty {
                     LowerType::Int(1) => {
                         asm.emit_movs_imm8(1, 1);
@@ -1478,7 +1802,7 @@ fn lower_call(
                 reg_loads.push((word_idx as u8, None, aty, aval.to_string()));
             } else {
                 let stk_off = (word_idx - 4) * 4;
-                ctx.load_op32(asm, aval, 0)?;
+                ctx.load_op32_typed(asm, aval, &aty, 0)?;
                 asm.emit_str_sp(0, stk_off);
             }
             word_idx += 1;
@@ -1494,19 +1818,13 @@ fn lower_call(
         asm.emit_orrs(4, 5);
     }
 
-    // Pass 2: Load register arguments `r0..r3` in reverse order (or via `r5`/`r6` scratch) so `r0..r3` don't clobber each other!
-    // Wait: `load_op32` / `load_op64` only uses the target `rd` (and `r6`/`r7` if `slot > 1020`, or `r2`/`r3` for inline GEP).
-    // Loading in reverse (`r2:r3` first, then `r0:r1`) guarantees inline GEP's `r2`/`r3` scratch for `arg0`?
-    // Wait: if `arg0` uses inline GEP, `eval_inline_const_gep` with `const_add == 0` (`c"...\00", 0, 0`) uses ZERO scratch registers!
-    // Even safer: stage register args into `r0..r3` via stack or load into `r5`/`r6` and move:
-    // Actually, pushing each register arg or loading via `r5` (`r5` is saved in prologue and free!) is 100% clobber-proof!
     for (r_lo, r_hi_opt, aty, aval) in reg_loads.into_iter().rev() {
         if let Some(r_hi) = r_hi_opt {
             ctx.load_op64(asm, &aval, &aty, 5, 6)?;
             asm.emit_movs_reg(r_lo, 5);
             asm.emit_movs_reg(r_hi, 6);
         } else {
-            ctx.load_op32(asm, &aval, 5)?;
+            ctx.load_op32_typed(asm, &aval, &aty, 5)?;
             asm.emit_movs_reg(r_lo, 5);
         }
     }
@@ -1517,7 +1835,12 @@ fn lower_call(
     } else {
         let sym = callee_tok.trim_start_matches('@');
         let mapped_sym = match sym {
-            "llvm.pow.f64" => "__omni_ipow64",
+            "llvm.pow.f64" | "__omni_fpow64" => "__omni_fpow64",
+            "pow" if matches!(ret_ty, LowerType::Float64) => "__omni_fpow64",
+            "llvm.sqrt.f64" | "__omni_fsqrt64" => "__omni_fsqrt64",
+            "sqrt" if matches!(ret_ty, LowerType::Float64) => "__omni_fsqrt64",
+            "llvm.fabs.f64" | "__omni_fabs64" => "__omni_fabs64",
+            "fabs" if matches!(ret_ty, LowerType::Float64) => "__omni_fabs64",
             other => other,
         };
         asm.emit_bl_sym(mapped_sym);
@@ -2193,6 +2516,45 @@ fn strip_const_cast_wrapper(s: &str) -> Option<&str> {
         }
     }
     None
+}
+
+fn parse_ir_const_f64_bits(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    match s {
+        "false" | "null" | "zeroinitializer" | "undef" | "poison" => return Ok(0),
+        "true" => return Ok(1.0f64.to_bits()),
+        _ => {}
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16)
+            .map_err(|_| format!("invalid f64 hex literal '{}'", s));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(f.to_bits());
+    }
+    Err(format!("unsupported f64 IR operand '{}'", s))
+}
+
+fn parse_ir_const_f32_bits(raw: &str) -> Result<u32, String> {
+    let s = raw.trim();
+    match s {
+        "false" | "null" | "zeroinitializer" | "undef" | "poison" => return Ok(0),
+        "true" => return Ok(1.0f32.to_bits()),
+        _ => {}
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.len() <= 8 {
+            return u32::from_str_radix(hex, 16)
+                .map_err(|_| format!("invalid f32 hex literal '{}'", s));
+        }
+        let u = u64::from_str_radix(hex, 16)
+            .map_err(|_| format!("invalid f32 double-hex literal '{}'", s))?;
+        return Ok((f64::from_bits(u) as f32).to_bits());
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok((f as f32).to_bits());
+    }
+    Err(format!("unsupported f32 IR operand '{}'", s))
 }
 
 fn parse_ir_const64(raw: &str) -> Result<i64, String> {
