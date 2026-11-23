@@ -1,0 +1,110 @@
+// Bare-Metal Raspberry Pi Pico 2 W — Raw TCP Socket Server (Port 4242) + ICMP Ping
+// Compile: omnic build --platform pico2w examples/pico2w_tcp_server/tcp_pico2w.omni
+//
+// Zero lwIP, Zero cyw43_arch: Direct OmniScript TCP socket intrinsics (`tcp_listen`,
+// `tcp_poll`, `tcp_send`, `tcp_is_open`, `tcp_close`).
+// Prompts for Wi-Fi SSID & WPA2 passphrase over USB CDC (`/dev/ttyACM0`) at boot
+// so credentials stay in volatile SRAM only and never live in Flash or source code.
+//
+// Test from host:
+//   ping <pico_ip>
+//   printf "ping\n" | nc -N <pico_ip> 4242
+
+import "pico";
+import "csharp" System;
+
+fn main() -> int {
+    gpio_init(15);
+    gpio_set_dir(15, 1);
+    gpio_put(15, 0);
+    sleep_ms(1500);
+
+    print("OmniScript Pico 2 W — Raw TCP Socket Server (:4242) + ICMP Ping");
+    uart_puts("Wi-Fi SSID: ");
+    String ssid = Console.ReadLine();
+    uart_puts("Wi-Fi Password: ");
+    let pass = Console.ReadLine();
+
+    uart_puts("Joining Wi-Fi '");
+    uart_puts(ssid);
+    print("'...");
+
+    let ip_num = wifi_connect(ssid, pass);
+    while ip_num < 0 {
+        uart_puts("Wi-Fi / DHCP retry, code=");
+        print(ip_num);
+        sleep_ms(1000);
+        ip_num = wifi_connect(ssid, pass);
+    }
+
+    let my_ip = wifi_ip();
+    uart_puts("Connected! IPv4: ");
+    print(my_ip);
+
+    tcp_listen(4242);
+    uart_puts("TCP socket server listening on ");
+    uart_puts(my_ip);
+    print(":4242 (try: `ping <ip>` or `printf 'ping\\n' | nc -N <ip> 4242`)");
+
+    let led_state = 1;
+    cyw43_led_put(1);
+    gpio_put(15, 1);
+    let rx_count = 0;
+
+    while 1 {
+        let ch = usb_cdc_getc();
+        if ch == 105 || ch == 63 || ch == 13 || ch == 10 {
+            uart_puts("[ttyACM0] ip=");
+            uart_puts(my_ip);
+            uart_puts(" tcp_port=4242 open=");
+            uart_puts(str(tcp_is_open()));
+            uart_puts(" led=");
+            print(led_state);
+        }
+
+        let msg = tcp_poll();
+        if strlen(msg) > 0 {
+            rx_count = rx_count + 1;
+            uart_puts("[TCP RX] ");
+            print(msg);
+
+            if msg == "ping" || msg == "ping\n" || msg == "ping\r\n" {
+                tcp_send("pong\n");
+            } else {
+            if msg == "led:on" || msg == "led:on\n" || msg == "led:on\r\n" {
+                led_state = 1;
+                cyw43_led_put(1);
+                gpio_put(15, 1);
+                tcp_send("ok led=1\n");
+            } else {
+            if msg == "led:off" || msg == "led:off\n" || msg == "led:off\r\n" {
+                led_state = 0;
+                cyw43_led_put(0);
+                gpio_put(15, 0);
+                tcp_send("ok led=0\n");
+            } else {
+            if msg == "led:toggle" || msg == "led:toggle\n" || msg == "led:toggle\r\n" {
+                led_state = 1 - led_state;
+                cyw43_led_put(led_state);
+                gpio_put(15, led_state);
+                tcp_send("ok led=" + str(led_state) + "\n");
+            } else {
+            if msg == "status" || msg == "status\n" || msg == "status\r\n" {
+                tcp_send("pico2w ip=" + my_ip + " port=4242 led=" + str(led_state) + " rx=" + str(rx_count) + "\n");
+            } else {
+            if msg == "quit" || msg == "quit\n" || msg == "quit\r\n" {
+                tcp_send("bye\n");
+                tcp_close();
+            } else {
+                tcp_send("echo: " + msg);
+            }
+            }
+            }
+            }
+            }
+            }
+        }
+        sleep_us(500);
+    }
+    return 0;
+}

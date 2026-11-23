@@ -39,8 +39,13 @@ pub fn emit_boot_header(asm: &mut ThumbAssembler, chip: &RpChipProfile) {
             asm.symbols.insert("__vector_table".to_string(), asm.pos());
             asm.emit32_le(chip.sram_top_msp);
             emit_vector_entry(asm, "Reset_Handler");
-            for _ in 2..48 {
-                emit_vector_entry(asm, "Default_ISR");
+            let usb_vec_idx = (16 + chip.usbctrl_irq_num) as usize;
+            for i in 2..48 {
+                if i == usb_vec_idx {
+                    emit_vector_entry(asm, "USBCTRL_ISR");
+                } else {
+                    emit_vector_entry(asm, "Default_ISR");
+                }
             }
         }
         RpChipKind::Rp2350 => {
@@ -48,8 +53,13 @@ pub fn emit_boot_header(asm: &mut ThumbAssembler, chip: &RpChipProfile) {
             asm.symbols.insert("__vector_table".to_string(), asm.pos());
             asm.emit32_le(chip.sram_top_msp);
             emit_vector_entry(asm, "Reset_Handler");
-            for _ in 2..68 {
-                emit_vector_entry(asm, "Default_ISR");
+            let usb_vec_idx = (16 + chip.usbctrl_irq_num) as usize;
+            for i in 2..68 {
+                if i == usb_vec_idx {
+                    emit_vector_entry(asm, "USBCTRL_ISR");
+                } else {
+                    emit_vector_entry(asm, "Default_ISR");
+                }
             }
 
             // 0x0110..0x0124: Mandatory 5-word RP2350 `PICOBIN` `IMAGE_DEF` block (within first 4 KB)
@@ -100,13 +110,20 @@ pub fn emit_bare_metal_runtime(
     // -------------------------------------------------------------------------
     asm.begin_function("Reset_Handler");
     {
-        // A) Enable 12 MHz XOSC (`STARTUP = 47`, `CTRL = 0x00FABAA0`), poll `STATUS` bit 31 (bounded timeout)
+        // A0) Explicitly anchor `SCB->VTOR` (`0xE000_ED08`) to our Flash `__vector_table` so hardware IRQs
+        //     (`USBCTRL_ISR`, etc.) vector reliably across cold boot, `picotool load -vx`, and debugger entry.
+        asm.emit_load_sym_addr(0, "__vector_table", false, 0);
+        asm.emit_load_u32(1, 0xE000_ED08);
+        asm.emit_str_imm(0, 1, 0x00);
+
+        // A) Enable 12 MHz XOSC (`STARTUP = 188` ~4 ms cold-boot crystal settle, `CTRL = 0x00FABAA0`),
+        //    poll `STATUS` bit 31 (generous bounded timeout for cold VBUS power-on ramp)
         asm.emit_load_u32(0, chip.xosc_base);
-        asm.emit_movs_imm8(1, 47);
+        asm.emit_movs_imm8(1, 188);
         asm.emit_str_imm(1, 0, 0x0C);
         asm.emit_load_u32(1, 0x00FA_BAA0);
         asm.emit_str_imm(1, 0, 0x00);
-        asm.emit_load_u32(3, 0x0001_0000);
+        asm.emit_load_u32(3, 0x0002_0000);
         let xosc_wait = asm.new_label();
         let xosc_done = asm.new_label();
         asm.bind_label(xosc_wait);
@@ -117,11 +134,25 @@ pub fn emit_bare_metal_runtime(
         asm.emit_bcond_label_short(Cond::Ne, xosc_wait);
         asm.bind_label(xosc_done);
 
-        // B) Glitchless park `CLK_REF` -> `XOSC` (2), `CLK_SYS` -> `CLK_REF` (0) + poll `CLK_SYS_SELECTED` (`+0x44`),
+        // B) Glitchless park `CLK_REF` -> `XOSC` (2) + poll `CLK_REF_SELECTED` (`+0x38`),
+        //    `CLK_SYS` -> `CLK_REF` (0) + poll `CLK_SYS_SELECTED` (`+0x44`), disable `CLK_USB` before PLL reconfig,
         //    `CLK_SYS_DIV` = 1.0, `CLK_PERI` -> `ENABLE | XOSC` (`0x0880` = 12 MHz fixed reference for UART0 115200 baud)
         asm.emit_load_u32(0, chip.clocks_base);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_str_imm(1, 0, chip.clk_usb_ctrl_off); // Disable CLK_USB cleanly before resetting PLL_USB
         asm.emit_movs_imm8(1, 2);
-        asm.emit_str_imm(1, 0, 0x30); // CLK_REF_CTRL = XOSC
+        asm.emit_str_imm(1, 0, 0x30); // CLK_REF_CTRL = XOSC (2)
+        asm.emit_movs_imm8(2, 4);     // CLK_REF_SELECTED bit 2 (1 << 2)
+        asm.emit_load_u32(3, 0x0001_0000);
+        let clk_ref_wait = asm.new_label();
+        let clk_ref_done = asm.new_label();
+        asm.bind_label(clk_ref_wait);
+        asm.emit_ldr_imm(1, 0, 0x38); // CLK_REF_SELECTED
+        asm.emit_tst_reg(1, 2);
+        asm.emit_bcond_label_short(Cond::Ne, clk_ref_done);
+        asm.emit_subs_imm8(3, 1);
+        asm.emit_bcond_label_short(Cond::Ne, clk_ref_wait);
+        asm.bind_label(clk_ref_done);
         asm.emit_ldr_imm(1, 0, 0x3C);
         asm.emit_movs_imm8(2, 1);
         asm.emit_bics(1, 2);
@@ -161,14 +192,18 @@ pub fn emit_bare_metal_runtime(
             }
         }
 
-        // D) Pulse reset on `PLL_SYS` (`RESETS + 0x2000`), then unreset `PLL_SYS` + IO_BANK0, PADS_BANK0,
-        //    PIO0..2, TIMER, UART0 via Atomic Clear (`RESETS + 0x3000`) and poll `RESET_DONE` (bounded)
+        // D) Pulse reset on `PLL_SYS | PLL_USB | USBCTRL` (`RESETS + 0x2000`), then unreset all core
+        //    peripherals EXCEPT `USBCTRL` (`USBCTRL` requires 48 MHz `CLK_USB` to be running before unreset,
+        //    matching Pico SDK `runtime_init_early_resets` -> `runtime_init_post_clock_resets` on cold POR!)
         asm.emit_load_u32(0, chip.resets_base + 0x2000);
-        asm.emit_load_u32(1, chip.resets_pll_sys_mask);
+        asm.emit_load_u32(
+            1,
+            chip.resets_pll_sys_mask | chip.resets_pll_usb_mask | chip.resets_usbctrl_mask,
+        );
         asm.emit_str_imm(1, 0, 0x00);
 
         asm.emit_load_u32(0, chip.resets_base + 0x3000);
-        asm.emit_load_u32(2, chip.resets_unreset_mask);
+        asm.emit_load_u32(2, chip.resets_unreset_mask & !chip.resets_usbctrl_mask);
         asm.emit_str_imm(2, 0, 0x00);
         asm.emit_load_u32(0, chip.resets_base);
         asm.emit_load_u32(3, 0x0001_0000);
@@ -194,7 +229,7 @@ pub fn emit_bare_metal_runtime(
         asm.emit_str_imm(1, 0, 0x04); // PWR = POSTDIVPD | DSMPD
         // Poll `CS.LOCK` (bit 31) with bounded timeout, tracking `r4 = r_locked`
         asm.emit_movs_imm8(4, 0); // r_locked = 0
-        asm.emit_load_u32(3, 0x0001_0000);
+        asm.emit_load_u32(3, 0x0002_0000);
         let pll_wait = asm.new_label();
         let pll_got_lock = asm.new_label();
         let pll_after_wait = asm.new_label();
@@ -236,12 +271,65 @@ pub fn emit_bare_metal_runtime(
         asm.emit_bcond_label_short(Cond::Ne, sys_sel_wait);
         asm.bind_label(sys_sel_done);
 
-        // E) Initialize SRAM bump heap pointer & runtime globals at `0x2000_0000`
+        // D3) Configure & Lock `PLL_USB` (`48.000 MHz`: 12 MHz * 100 = 1200 MHz VCO, / 5 / 5 = 48 MHz)
+        //     and enable `CLK_USB` (`AUXSRC = 0 = PLL_USB`, `ENABLE = 0x0800`, `DIV = 1.0`)
+        asm.emit_load_u32(0, chip.pll_usb_base);
+        asm.emit_movs_imm8(1, 1);
+        asm.emit_str_imm(1, 0, 0x00); // CS: REFDIV = 1
+        asm.emit_movs_imm8(1, 100);
+        asm.emit_str_imm(1, 0, 0x08); // FBDIV_INT = 100 (1200 MHz VCO)
+        asm.emit_movs_imm8(1, 0x0C);
+        asm.emit_str_imm(1, 0, 0x04); // PWR = POSTDIVPD | DSMPD
+        asm.emit_load_u32(3, 0x0002_0000);
+        let usb_pll_wait = asm.new_label();
+        let usb_pll_done = asm.new_label();
+        asm.bind_label(usb_pll_wait);
+        asm.emit_ldr_imm(1, 0, 0x00); // CS
+        asm.emit_cmp_imm8(1, 0);
+        asm.emit_bcond_label_short(Cond::Mi, usb_pll_done); // bit 31 == 1 -> LOCKED
+        asm.emit_subs_imm8(3, 1);
+        asm.emit_bcond_label_short(Cond::Ne, usb_pll_wait);
+        asm.bind_label(usb_pll_done);
+        asm.emit_load_u32(1, (5 << 16) | (5 << 12)); // PRIM: POSTDIV1 = 5, POSTDIV2 = 5
+        asm.emit_str_imm(1, 0, 0x0C);
+        asm.emit_movs_imm8(1, 0x04);
+        asm.emit_str_imm(1, 0, 0x04); // PWR: clear POSTDIVPD
+
+        asm.emit_load_u32(0, chip.clocks_base);
+        asm.emit_load_u32(1, chip.clk_sys_div_1);
+        asm.emit_str_imm(1, 0, chip.clk_usb_div_off);  // CLK_USB_DIV = 1.0
+        asm.emit_load_u32(1, 0x0000_0800);
+        asm.emit_str_imm(1, 0, chip.clk_usb_ctrl_off); // CLK_USB_CTRL = ENABLE | AUXSRC_PLL_USB
+
+        // D4) Post-clock unreset of `USBCTRL` now that 48.000 MHz `CLK_USB` is active, polling `RESET_DONE`
+        asm.emit_load_u32(0, chip.resets_base + 0x3000);
+        asm.emit_load_u32(2, chip.resets_usbctrl_mask);
+        asm.emit_str_imm(2, 0, 0x00);
+        asm.emit_load_u32(0, chip.resets_base);
+        asm.emit_load_u32(3, 0x0001_0000);
+        let usb_rst_wait = asm.new_label();
+        let usb_rst_done = asm.new_label();
+        asm.bind_label(usb_rst_wait);
+        asm.emit_ldr_imm(1, 0, 0x08); // RESET_DONE
+        asm.emit_ands(1, 2);
+        asm.emit_cmp_reg(1, 2);
+        asm.emit_bcond_label_short(Cond::Eq, usb_rst_done);
+        asm.emit_subs_imm8(3, 1);
+        asm.emit_bcond_label_short(Cond::Ne, usb_rst_wait);
+        asm.bind_label(usb_rst_done);
+
+        // E) Initialize SRAM bump heap pointer, runtime globals & zero reserved scratch (`0x2000_000C..0x2000_001F`)
+        //    so cold power-on SRAM garbage never leaves stale non-zero pointers (e.g. `net_ctx_ptr` at `+0x1C`)!
         asm.emit_load_u32(0, chip.sram_base);
         asm.emit_load_u32(1, chip.heap_start);
         asm.emit_str_imm(1, 0, SRAM_G_HEAP_PTR_OFF);
         asm.emit_movs_imm8(1, 0);
         asm.emit_str_imm(1, 0, SRAM_G_RET_PTR_OFF);
+        asm.emit_str_imm(1, 0, 0x0C);
+        asm.emit_str_imm(1, 0, 0x10);
+        asm.emit_str_imm(1, 0, 0x14);
+        asm.emit_str_imm(1, 0, 0x18);
+        asm.emit_str_imm(1, 0, 0x1C);
         asm.emit_load_u32(1, 0x6D2B_79F5);
         asm.emit_str_imm(1, 0, SRAM_G_RNG_STATE_OFF);
 
@@ -275,6 +363,10 @@ pub fn emit_bare_metal_runtime(
         asm.emit_str_imm(1, 0, 0x2C); // UARTLCR_H
         asm.emit_load_u32(1, 0x0301); // RXE (1<<9) | TXE (1<<8) | UARTEN (1)
         asm.emit_str_imm(1, 0, 0x30); // UARTCR
+
+        // F2) Initialize bare-metal USB 2.0 CDC-ACM (`/dev/ttyACM0`, `2e8a:000a`) & unmask IRQs (`cpsie i`)
+        asm.emit_bl_sym("__omni_usb_cdc_init");
+        asm.emit16(0xB662); // cpsie i
 
         // G) Invoke `@main(0, null)` and halt cleanly in low-power WFI loop on return
         asm.emit_movs_imm8(0, 0);
@@ -813,10 +905,12 @@ pub fn emit_bare_metal_runtime(
     }
 
     // -------------------------------------------------------------------------
-    // 5. UART0 Serial Output (`uart_putc`, `uart_puts`, `__omni_print_*`, `printf`)
+    // 5. Dual Hardware UART0 + USB CDC-ACM (`/dev/ttyACM0`) Serial Output
     // -------------------------------------------------------------------------
     for putc_name in ["uart_putc", "putchar"] {
         asm.begin_function(putc_name);
+        asm.emit_push(1 << 4, true); // 8-byte aligned frame preserving r4 + lr
+        asm.emit_uxtb(4, 0);
         asm.emit_load_u32(2, chip.uart0_base);
         asm.emit_movs_imm8(3, 0x20); // UARTFR_TXFF (bit 5)
         let wait = asm.new_label();
@@ -824,10 +918,15 @@ pub fn emit_bare_metal_runtime(
         asm.emit_ldr_imm(1, 2, 0x18); // UARTFR
         asm.emit_tst_reg(1, 3);
         asm.emit_bcond_label_short(Cond::Ne, wait);
-        asm.emit_uxtb(0, 0);
-        asm.emit_str_imm(0, 2, 0x00); // UARTDR
+        asm.emit_str_imm(4, 2, 0x00); // UARTDR = byte
+
+        // Tee every byte to freestanding USB CDC-ACM (`/dev/ttyACM0`) TX ring + EP2_IN!
+        asm.emit_movs_reg(0, 4);
         asm.emit_movs_imm8(1, 0);
-        asm.emit_bx(14);
+        asm.emit_bl_sym("__omni_usb_putc");
+        asm.emit_movs_reg(0, 4);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop(1 << 4, true);
         asm.end_function(base_vma)?;
     }
 
@@ -868,6 +967,110 @@ pub fn emit_bare_metal_runtime(
         asm.emit_pop(0, true);
         asm.end_function(base_vma)?;
     }
+
+    // `getchar() -> i32`: blocking read from EITHER USB CDC-ACM (`/dev/ttyACM0`) OR hardware UART0 RX
+    asm.begin_function("getchar");
+    {
+        asm.emit_push(1 << 4, true); // 8-byte aligned frame
+        let poll = asm.new_label();
+        let got = asm.new_label();
+        asm.bind_label(poll);
+        asm.emit_bl_sym("usb_cdc_getc");
+        asm.emit_cmp_imm8(0, 0);
+        asm.emit_bcond_label_short(Cond::Pl, got);
+        asm.emit_load_u32(2, chip.uart0_base);
+        asm.emit_ldr_imm(1, 2, 0x18); // UARTFR
+        asm.emit_movs_imm8(3, 0x10);  // RXFE (bit 4)
+        asm.emit_tst_reg(1, 3);
+        asm.emit_bcond_label_short(Cond::Ne, poll);
+        asm.emit_ldr_imm(0, 2, 0x00); // UARTDR
+        asm.emit_uxtb(0, 0);
+        asm.bind_label(got);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop(1 << 4, true);
+    }
+    asm.end_function(base_vma)?;
+
+    // `__omni_input(i8* prompt = r0) -> i8*`: Universal console line reader over USB CDC + UART0
+    asm.begin_function("__omni_input");
+    {
+        asm.emit_push((1 << 4) | (1 << 5) | (1 << 6), true);
+        let no_prompt = asm.new_label();
+        asm.emit_cmp_imm8(0, 0);
+        asm.emit_bcond_label_short(Cond::Eq, no_prompt);
+        asm.emit_bl_sym("uart_puts");
+        asm.bind_label(no_prompt);
+
+        asm.emit_load_u32(0, 256);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_bl_sym("malloc");
+        asm.emit_movs_reg(4, 0); // r4 = buf
+        asm.emit_movs_imm8(5, 0); // r5 = len
+
+        let rd_lp = asm.new_label();
+        let chk_bs = asm.new_label();
+        let chk_print = asm.new_label();
+        let do_bs = asm.new_label();
+        let finish = asm.new_label();
+
+        asm.bind_label(rd_lp);
+        asm.emit_bl_sym("getchar");
+        asm.emit_movs_reg(6, 0);
+
+        asm.emit_cmp_imm8(6, 13);
+        let is_eol = asm.new_label();
+        asm.emit_bcond_label_short(Cond::Eq, is_eol);
+        asm.emit_cmp_imm8(6, 10);
+        asm.emit_bcond_label_short(Cond::Ne, chk_bs);
+        asm.bind_label(is_eol);
+        asm.emit_cmp_imm8(5, 0);
+        asm.emit_bcond_label_short(Cond::Eq, rd_lp);
+        asm.emit_b_label_short(finish);
+
+        asm.bind_label(chk_bs);
+        asm.emit_cmp_imm8(6, 8);
+        asm.emit_bcond_label_short(Cond::Eq, do_bs);
+        asm.emit_cmp_imm8(6, 127);
+        asm.emit_bcond_label_short(Cond::Ne, chk_print);
+        asm.bind_label(do_bs);
+        asm.emit_cmp_imm8(5, 0);
+        asm.emit_bcond_label_short(Cond::Eq, rd_lp);
+        asm.emit_subs_imm8(5, 1);
+        asm.emit_movs_imm8(0, 8);
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_movs_imm8(0, b' ');
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_movs_imm8(0, 8);
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_b_label_short(rd_lp);
+
+        asm.bind_label(chk_print);
+        asm.emit_cmp_imm8(6, 32);
+        asm.emit_bcond_label_short(Cond::Cc, rd_lp);
+        asm.emit_cmp_imm8(6, 127);
+        asm.emit_bcond_label_short(Cond::Cs, rd_lp);
+        asm.emit_cmp_imm8(5, 255);
+        asm.emit_bcond_label_short(Cond::Cs, rd_lp);
+        asm.emit_adds_reg(0, 4, 5);
+        asm.emit_strb_imm(6, 0, 0);
+        asm.emit_adds_imm8(5, 1);
+        asm.emit_movs_reg(0, 6);
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_b_label_short(rd_lp);
+
+        asm.bind_label(finish);
+        asm.emit_adds_reg(1, 4, 5);
+        asm.emit_movs_imm8(0, 0);
+        asm.emit_strb_imm(0, 1, 0);
+        asm.emit_movs_imm8(0, b'\r');
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_movs_imm8(0, b'\n');
+        asm.emit_bl_sym("uart_putc");
+        asm.emit_movs_reg(0, 4);
+        asm.emit_movs_imm8(1, 0);
+        asm.emit_pop((1 << 4) | (1 << 5) | (1 << 6), true);
+    }
+    asm.end_function(base_vma)?;
 
     // `__omni_print_int(i64 val = r0:r1)`
     asm.begin_function("__omni_print_int");
@@ -3374,6 +3577,21 @@ fn emit_hardware_peripherals(
     asm.emit_bx(14);
     asm.end_function(base_vma)?;
 
+    // `mem_read8(i64 addr = r0:r1) -> i64`
+    asm.begin_function("mem_read8");
+    asm.emit_ldrb_imm(0, 0, 0);
+    asm.emit_movs_imm8(1, 0);
+    asm.emit_bx(14);
+    asm.end_function(base_vma)?;
+
+    // `mem_write8(i64 addr = r0:r1, i64 val = r2:r3) -> i64`
+    asm.begin_function("mem_write8");
+    asm.emit_strb_imm(2, 0, 0);
+    asm.emit_movs_imm8(0, 0);
+    asm.emit_movs_imm8(1, 0);
+    asm.emit_bx(14);
+    asm.end_function(base_vma)?;
+
     // `time_us` / `time_us_64` -> `r0 = TIMERAWL, r1 = TIMERAWH`
     for tf in ["time_us", "time_us_64"] {
         asm.begin_function(tf);
@@ -4864,7 +5082,6 @@ fn emit_collections_and_arenas(
         "__omni_fiber_yield",
         "__omni_fiber_destroy",
         "__omni_fiber_run_on_main_stack",
-        "__omni_input",
         "__omni_str_slice_step",
         "__omni_str_contains",
         "__omni_str_starts_with",

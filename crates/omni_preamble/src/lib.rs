@@ -4303,6 +4303,138 @@ pub fn static_infer_dialect(source_context: &str, candidate_import: &str) -> Opt
     None
 }
 
+/// Freestanding RP2040 / RP2350 base HAL syscall ABI (`--platform pico` / `pico2`, `import "pico"`).
+pub const PICO_HAL_BASE_PRELUDE: &str = r#"
+extern fn mmio_read32(addr: int) -> int;
+extern fn mmio_write32(addr: int, val: int) -> int;
+extern fn mem_read8(addr: int) -> int;
+extern fn mem_write8(addr: int, val: int) -> int;
+extern fn gpio_init(pin: int) -> int;
+extern fn gpio_set_dir(pin: int, out: int) -> int;
+extern fn gpio_put(pin: int, val: int) -> int;
+extern fn gpio_toggle(pin: int) -> int;
+extern fn gpio_get(pin: int) -> int;
+extern fn sleep_ms(ms: int) -> int;
+extern fn sleep_us(us: int) -> int;
+extern fn time_us() -> int;
+extern fn time_us_64() -> int;
+extern fn pio_instr_write(pio_idx: int, slot: int, instr: int) -> int;
+extern fn pio_sm_config_and_enable(pio_idx: int, sm: int, wrap_bottom: int, wrap_top: int, sideset_pin: int, out_pin: int, clkdiv_int: int) -> int;
+extern fn pio_sm_put(pio_idx: int, sm: int, word: int) -> int;
+extern fn pio_sm_get(pio_idx: int, sm: int) -> int;
+extern fn pio_sm_exec(pio_idx: int, sm: int, instr: int) -> int;
+extern fn uart_putc(ch: int) -> int;
+extern fn uart_puts(s: str) -> int;
+extern fn usb_cdc_getc() -> int;
+"#;
+
+/// Freestanding RP2040 / RP2350 + CYW43439 wireless/WebSocket HAL syscall ABI (`--platform pico2w` / `picow`, `import "pico"` / `"pico/net"` / `"pico2w"`).
+pub const PICO_HAL_FULL_PRELUDE: &str = r#"
+extern fn mmio_read32(addr: int) -> int;
+extern fn mmio_write32(addr: int, val: int) -> int;
+extern fn mem_read8(addr: int) -> int;
+extern fn mem_write8(addr: int, val: int) -> int;
+extern fn gpio_init(pin: int) -> int;
+extern fn gpio_set_dir(pin: int, out: int) -> int;
+extern fn gpio_put(pin: int, val: int) -> int;
+extern fn gpio_toggle(pin: int) -> int;
+extern fn gpio_get(pin: int) -> int;
+extern fn sleep_ms(ms: int) -> int;
+extern fn sleep_us(us: int) -> int;
+extern fn time_us() -> int;
+extern fn time_us_64() -> int;
+extern fn pio_instr_write(pio_idx: int, slot: int, instr: int) -> int;
+extern fn pio_sm_config_and_enable(pio_idx: int, sm: int, wrap_bottom: int, wrap_top: int, sideset_pin: int, out_pin: int, clkdiv_int: int) -> int;
+extern fn pio_sm_put(pio_idx: int, sm: int, word: int) -> int;
+extern fn pio_sm_get(pio_idx: int, sm: int) -> int;
+extern fn pio_sm_exec(pio_idx: int, sm: int, instr: int) -> int;
+extern fn uart_putc(ch: int) -> int;
+extern fn uart_puts(s: str) -> int;
+extern fn usb_cdc_getc() -> int;
+extern fn cyw43_init() -> int;
+extern fn cyw43_gpio_put(wl_pin: int, val: int) -> int;
+extern fn cyw43_led_init() -> int;
+extern fn cyw43_led_put(val: int) -> int;
+extern fn wifi_connect(ssid: str, password: str) -> int;
+extern fn wifi_ip() -> str;
+extern fn ws_listen(port: int) -> int;
+extern fn ws_poll() -> str;
+extern fn ws_send(msg: str) -> int;
+extern fn ws_is_open() -> int;
+extern fn tcp_listen(port: int) -> int;
+extern fn tcp_poll() -> str;
+extern fn tcp_send(msg: str) -> int;
+extern fn tcp_is_open() -> int;
+extern fn tcp_close() -> int;
+"#;
+
+pub fn is_builtin_hal_module(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "pico" | "pico/net" | "picow" | "pico-w" | "pico2" | "pico-2" | "pico2w" | "pico-2-w" | "rp2040" | "rp2350"
+    )
+}
+
+pub fn extract_builtin_hal_import(imp: &ImportDirective) -> Option<(&str, Option<&str>)> {
+    match imp {
+        ImportDirective::DirectoryAlias { path, alias }
+        | ImportDirective::FileAlias { path, alias } => {
+            let s = path.to_str()?;
+            if is_builtin_hal_module(s) {
+                Some((s, alias.as_deref()))
+            } else {
+                None
+            }
+        }
+        ImportDirective::Ecosystem { module, alias, .. } => {
+            if is_builtin_hal_module(module) {
+                Some((module.as_str(), alias.as_deref()))
+            } else {
+                None
+            }
+        }
+        ImportDirective::FromDirectory { dir_path, .. } => {
+            let s = dir_path.to_str()?;
+            if is_builtin_hal_module(s) {
+                Some((s, None))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn builtin_hal_prelude_for_import(mod_name: &str) -> Option<&'static str> {
+    match mod_name.trim().to_ascii_lowercase().as_str() {
+        "pico" | "pico/net" | "picow" | "pico-w" | "pico2w" | "pico-2-w" => {
+            Some(PICO_HAL_FULL_PRELUDE)
+        }
+        "pico2" | "pico-2" | "rp2040" | "rp2350" => Some(PICO_HAL_BASE_PRELUDE),
+        _ => None,
+    }
+}
+
+pub fn builtin_hal_prelude_for_platform(platform: &TargetPlatform) -> Option<&'static str> {
+    if !platform.is_rp_mcu() {
+        return None;
+    }
+    if matches!(platform.slug.as_str(), "picow" | "pico2w") {
+        Some(PICO_HAL_FULL_PRELUDE)
+    } else {
+        Some(PICO_HAL_BASE_PRELUDE)
+    }
+}
+
+pub fn infer_platform_from_hal_import(mod_name: &str) -> Option<TargetPlatform> {
+    match mod_name.trim().to_ascii_lowercase().as_str() {
+        "pico2w" | "pico-2-w" => Some(TargetPlatform::rp2350(true)),
+        "pico2" | "pico-2" | "rp2350" => Some(TargetPlatform::rp2350(false)),
+        "picow" | "pico-w" | "pico/net" => Some(TargetPlatform::rp2040(true)),
+        "pico" | "rp2040" => Some(TargetPlatform::rp2040(false)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

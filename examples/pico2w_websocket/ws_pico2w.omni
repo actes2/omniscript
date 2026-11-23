@@ -1,0 +1,93 @@
+// Bare-Metal Raspberry Pi Pico 2 W — Wi-Fi + RFC 6455 WebSocket Server (Port 1424)
+// Compile: omnic build --platform pico2w examples/pico2w_websocket/ws_pico2w.omni
+//
+// Zero lwIP, Zero cyw43_arch: Direct OmniScript wireless & WebSocket intrinsics.
+// Also broadcasts a UDP discovery beacon on port 1425 ("OMNI_PICO2W ip=... ws_port=1424")
+// so LAN clients can auto-discover the Pico 2 W's DHCP IPv4 address immediately.
+
+import "pico";
+
+fn main() -> int {
+    gpio_init(15);
+    gpio_set_dir(15, 1);
+    gpio_put(15, 0);
+    sleep_ms(300);
+
+    // Replace with your local Wi-Fi SSID & WPA2 passphrase before flashing
+    let ssid = "YOUR_WIFI_SSID";
+    let pass = "YOUR_WIFI_PASSWORD";
+
+    print("OmniScript Pico 2 W: Joining Wi-Fi...");
+    let ip_num = wifi_connect(ssid, pass);
+    while ip_num < 0 {
+        uart_puts("Wi-Fi / DHCP retry, last code=");
+        print(ip_num);
+        sleep_ms(1000);
+        ip_num = wifi_connect(ssid, pass);
+    }
+
+    let my_ip = wifi_ip();
+    uart_puts("Connected! IPv4: ");
+    print(my_ip);
+
+    ws_listen(1424);
+    uart_puts("WebSocket server listening on ws://");
+    uart_puts(my_ip);
+    print(":1424/ (USB CDC /dev/ttyACM0 active: press 'i' for status, 't' to toggle LED)");
+
+    let led_state = 1;
+    let msg_count = 0;
+
+    while 1 {
+        let ch = usb_cdc_getc();
+        if ch == 105 || ch == 63 || ch == 13 || ch == 10 {
+            uart_puts("[ttyACM0] ip=");
+            uart_puts(my_ip);
+            uart_puts(" ws_port=1424 led=");
+            print(led_state);
+        } else {
+        if ch == 116 {
+            led_state = 1 - led_state;
+            cyw43_led_put(led_state);
+            gpio_put(15, led_state);
+            uart_puts("[ttyACM0] toggled led=");
+            print(led_state);
+        }
+        }
+
+        let msg = ws_poll();
+        if strlen(msg) > 0 {
+            msg_count = msg_count + 1;
+            uart_puts("[WS RX] ");
+            print(msg);
+            if msg == "led:on" {
+                led_state = 1;
+                cyw43_led_put(1);
+                gpio_put(15, 1);
+                ws_send("{\"ok\":true,\"led\":1,\"ip\":\"" + my_ip + "\"}");
+            } else {
+            if msg == "led:off" {
+                led_state = 0;
+                cyw43_led_put(0);
+                gpio_put(15, 0);
+                ws_send("{\"ok\":true,\"led\":0,\"ip\":\"" + my_ip + "\"}");
+            } else {
+            if msg == "led:toggle" {
+                led_state = 1 - led_state;
+                cyw43_led_put(led_state);
+                gpio_put(15, led_state);
+                ws_send("{\"ok\":true,\"led\":" + str(led_state) + ",\"ip\":\"" + my_ip + "\"}");
+            } else {
+            if msg == "status" || msg == "ping" {
+                ws_send("{\"device\":\"pico2w\",\"ip\":\"" + my_ip + "\",\"port\":1424,\"led\":" + str(led_state) + ",\"rx_count\":" + str(msg_count) + "}");
+            } else {
+                ws_send("pico2w[" + my_ip + ":1424] echo: " + msg);
+            }
+            }
+            }
+            }
+        }
+        sleep_us(500);
+    }
+    return 0;
+}

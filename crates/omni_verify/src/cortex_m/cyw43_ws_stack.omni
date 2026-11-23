@@ -1,0 +1,1905 @@
+// Bare-Metal OmniNet Stack for Raspberry Pi Pico W / Pico 2 W (CYW43439)
+// Zero lwIP, Zero cyw43_arch: Direct gSPI -> SDPCM/BDC -> ARP/IPv4/ICMP/DHCPv4/UDP/TCP/RFC6455 WebSocket
+
+import "pico";
+
+extern "C" {
+    fn cyw_ll_clm_ptr() -> int;
+    fn cyw_ll_sram_scratch() -> int;
+    fn cyw_ll_pack_cmd(write: int, incr: int, func: int, addr: int, len: int) -> int;
+    fn cyw_ll_read_reg(func: int, addr: int, len: int) -> int;
+    fn cyw_ll_write_reg(func: int, addr: int, val: int, len: int) -> int;
+    fn cyw_ll_write_bp(addr: int, val: int, len: int) -> int;
+    fn cyw_ll_gspi_write_u32(val: int) -> int;
+    fn cyw_ll_gspi_write_bytes(ptr: int, len: int) -> int;
+    fn cyw_ll_gspi_read_bytes(ptr: int, len: int) -> int;
+}
+
+fn r8(p: int) -> int {
+    return mem_read8(p) & 0xFF;
+}
+
+fn w8(p: int, v: int) -> int {
+    mem_write8(p, v & 0xFF);
+    return 0;
+}
+
+fn r16_be(p: int) -> int {
+    return ((r8(p) << 8) | r8(p + 1)) & 0xFFFF;
+}
+
+fn w16_be(p: int, v: int) -> int {
+    w8(p, (v >> 8) & 0xFF);
+    w8(p + 1, v & 0xFF);
+    return 0;
+}
+
+fn r16_le(p: int) -> int {
+    return (r8(p) | (r8(p + 1) << 8)) & 0xFFFF;
+}
+
+fn w16_le(p: int, v: int) -> int {
+    w8(p, v & 0xFF);
+    w8(p + 1, (v >> 8) & 0xFF);
+    return 0;
+}
+
+fn r32_be(p: int) -> int {
+    let b0 = r8(p) << 24;
+    let b1 = r8(p + 1) << 16;
+    let b2 = r8(p + 2) << 8;
+    let b3 = r8(p + 3);
+    return (b0 | b1 | b2 | b3) & 0xFFFFFFFF;
+}
+
+fn w32_be(p: int, v: int) -> int {
+    w8(p, (v >> 24) & 0xFF);
+    w8(p + 1, (v >> 16) & 0xFF);
+    w8(p + 2, (v >> 8) & 0xFF);
+    w8(p + 3, v & 0xFF);
+    return 0;
+}
+
+fn r32_le(p: int) -> int {
+    let b0 = r8(p);
+    let b1 = r8(p + 1) << 8;
+    let b2 = r8(p + 2) << 16;
+    let b3 = r8(p + 3) << 24;
+    return (b0 | b1 | b2 | b3) & 0xFFFFFFFF;
+}
+
+fn w32_le(p: int, v: int) -> int {
+    w8(p, v & 0xFF);
+    w8(p + 1, (v >> 8) & 0xFF);
+    w8(p + 2, (v >> 16) & 0xFF);
+    w8(p + 3, (v >> 24) & 0xFF);
+    return 0;
+}
+
+fn bzero(p: int, n: int) -> int {
+    let i = 0;
+    while i < n {
+        w8(p + i, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bcopy(dst: int, src: int, n: int) -> int {
+    let i = 0;
+    while i < n {
+        w8(dst + i, r8(src + i));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn cstr_len(p: int) -> int {
+    if p == 0 {
+        return 0;
+    }
+    let n = 0;
+    while n < 1024 {
+        if r8(p + n) == 0 {
+            return n;
+        }
+        n = n + 1;
+    }
+    return n;
+}
+
+fn put_ascii(dst: int, s: int) -> int {
+    let n = cstr_len(s);
+    bcopy(dst, s, n);
+    return n;
+}
+
+fn now_ms() -> int {
+    let us = time_us() & 0xFFFFFFFF;
+    return (us / 1000) & 0x7FFFFFFF;
+}
+
+fn get_net_ctx() -> int {
+    let scr = cyw_ll_sram_scratch();
+    let ptr = mmio_read32(scr + 16);
+    if ptr != 0 {
+        return ptr;
+    }
+    let mem = calloc(1, 9216);
+    mmio_write32(scr + 16, mem);
+    // Default WS port = 1424, IP ID = 1, DHCP XID = 0x4F4D4E49
+    mmio_write32(mem + 16, 1424);
+    mmio_write32(mem + 20, 1);
+    mmio_write32(mem + 24, 0x4F4D4E49);
+    // Default IP string "0.0.0.0"
+    w8(mem + 128, 48);
+    w8(mem + 129, 46);
+    w8(mem + 130, 48);
+    w8(mem + 131, 46);
+    w8(mem + 132, 48);
+    w8(mem + 133, 46);
+    w8(mem + 134, 48);
+    w8(mem + 135, 0);
+    return mem;
+}
+
+fn mac_eq(a: int, b: int) -> int {
+    let i = 0;
+    while i < 6 {
+        if r8(a + i) != r8(b + i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn mac_is_bcast(a: int) -> int {
+    let m = r8(a) & r8(a + 1) & r8(a + 2) & r8(a + 3) & r8(a + 4) & r8(a + 5);
+    if m == 0xFF {
+        return 1;
+    }
+    return 0;
+}
+
+fn ip_eq(a: int, b: int) -> int {
+    if r8(a) == r8(b) && r8(a + 1) == r8(b + 1) && r8(a + 2) == r8(b + 2) && r8(a + 3) == r8(b + 3) {
+        return 1;
+    }
+    return 0;
+}
+
+fn ip_is_bcast(a: int) -> int {
+    if (r8(a) & r8(a + 1) & r8(a + 2) & r8(a + 3)) == 0xFF {
+        return 1;
+    }
+    return 0;
+}
+
+fn ip_is_zero(a: int) -> int {
+    if (r8(a) | r8(a + 1) | r8(a + 2) | r8(a + 3)) == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn write_u8_dec(dst: int, val: int) -> int {
+    let v = val & 0xFF;
+    let pos = 0;
+    if v >= 100 {
+        let d2 = v / 100;
+        w8(dst + pos, 48 + d2);
+        pos = pos + 1;
+        let rem = v - d2 * 100;
+        let d1 = rem / 10;
+        w8(dst + pos, 48 + d1);
+        pos = pos + 1;
+        w8(dst + pos, 48 + (rem - d1 * 10));
+        return pos + 1;
+    }
+    if v >= 10 {
+        let d1 = v / 10;
+        w8(dst + pos, 48 + d1);
+        pos = pos + 1;
+        w8(dst + pos, 48 + (v - d1 * 10));
+        return pos + 1;
+    }
+    w8(dst, 48 + v);
+    return 1;
+}
+
+fn write_u16_dec(dst: int, val: int) -> int {
+    let v = val & 0xFFFF;
+    if v == 0 {
+        w8(dst, 48);
+        return 1;
+    }
+    let tmp0 = 0;
+    let digits = 0;
+    // Write digits into temporary reverse positions at dst + 8..13
+    let cur = v;
+    while cur > 0 {
+        let q = cur / 10;
+        let r = cur - q * 10;
+        w8(dst + 8 + digits, 48 + r);
+        digits = digits + 1;
+        cur = q;
+    }
+    while tmp0 < digits {
+        w8(dst + tmp0, r8(dst + 8 + (digits - 1 - tmp0)));
+        tmp0 = tmp0 + 1;
+    }
+    return digits;
+}
+
+fn format_ip_str(ip_ptr: int, out_ptr: int) -> int {
+    let pos = 0;
+    pos = pos + write_u8_dec(out_ptr + pos, r8(ip_ptr));
+    w8(out_ptr + pos, 46);
+    pos = pos + 1;
+    pos = pos + write_u8_dec(out_ptr + pos, r8(ip_ptr + 1));
+    w8(out_ptr + pos, 46);
+    pos = pos + 1;
+    pos = pos + write_u8_dec(out_ptr + pos, r8(ip_ptr + 2));
+    w8(out_ptr + pos, 46);
+    pos = pos + 1;
+    pos = pos + write_u8_dec(out_ptr + pos, r8(ip_ptr + 3));
+    w8(out_ptr + pos, 0);
+    return pos;
+}
+
+// =============================================================================
+// RFC 1071 Checksum Helpers (IPv4 / ICMP / UDP / TCP)
+// =============================================================================
+
+fn inet_csum_acc(sum_in: int, ptr: int, len: int) -> int {
+    let sum = sum_in;
+    let i = 0;
+    while i + 1 < len {
+        sum = sum + r16_be(ptr + i);
+        i = i + 2;
+    }
+    if i < len {
+        sum = sum + (r8(ptr + i) << 8);
+    }
+    return sum;
+}
+
+fn inet_csum_finish(sum_in: int) -> int {
+    let s = sum_in;
+    while (s >> 16) != 0 {
+        s = (s & 0xFFFF) + (s >> 16);
+    }
+    return (s ^ 0xFFFF) & 0xFFFF;
+}
+
+fn l4_checksum(sip: int, dip: int, proto: int, l4_ptr: int, l4_len: int) -> int {
+    let sum = r16_be(sip) + r16_be(sip + 2) + r16_be(dip) + r16_be(dip + 2) + (proto & 0xFF) + (l4_len & 0xFFFF);
+    sum = inet_csum_acc(sum, l4_ptr, l4_len);
+    return inet_csum_finish(sum);
+}
+
+// =============================================================================
+// RFC 3174 SHA-1 + RFC 4648 Base64 for RFC 6455 Sec-WebSocket-Accept
+// =============================================================================
+
+fn rotl32(x: int, n: int) -> int {
+    let u = x & 0xFFFFFFFF;
+    let hi = (u << n) & 0xFFFFFFFF;
+    let lo = u >> (32 - n);
+    return (hi | lo) & 0xFFFFFFFF;
+}
+
+fn b64_char(idx: int) -> int {
+    let v = idx & 63;
+    if v < 26 {
+        return 65 + v; // 'A'..'Z'
+    }
+    if v < 52 {
+        return 97 + (v - 26); // 'a'..'z'
+    }
+    if v < 62 {
+        return 48 + (v - 52); // '0'..'9'
+    }
+    if v == 62 {
+        return 43; // '+'
+    }
+    return 47; // '/'
+}
+
+fn cyw_ws_compute_accept(ctx: int, key_ptr: int, key_len: int, out_b64: int) -> int {
+    let sha = ctx + 2272;
+    let msg = sha;         // 128 bytes
+    let wbuf = sha + 128;  // 80 * 4 = 320 bytes
+    let dig = sha + 448;   // 20 bytes
+
+    bzero(msg, 128);
+    let kl = key_len;
+    if kl > 60 {
+        kl = 60;
+    }
+    bcopy(msg, key_ptr, kl);
+    // Append RFC 6455 GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" (36 bytes)
+    let glen = put_ascii(msg + kl, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let total = kl + glen;
+    w8(msg + total, 0x80);
+
+    let nblocks = 1;
+    if total + 9 > 64 {
+        nblocks = 2;
+    }
+    let bit_len = total * 8;
+    w32_be(msg + nblocks * 64 - 8, 0);
+    w32_be(msg + nblocks * 64 - 4, bit_len);
+
+    let h0 = 0x67452301;
+    let h1 = 0xEFCDAB89;
+    let h2 = 0x98BADCFE;
+    let h3 = 0x10325476;
+    let h4 = 0xC3D2E1F0;
+
+    let blk = 0;
+    while blk < nblocks {
+        let bp = msg + blk * 64;
+        let t = 0;
+        while t < 16 {
+            w32_le(wbuf + t * 4, r32_be(bp + t * 4));
+            t = t + 1;
+        }
+        while t < 80 {
+            let xw = r32_le(wbuf + (t - 3) * 4) ^ r32_le(wbuf + (t - 8) * 4) ^ r32_le(wbuf + (t - 14) * 4) ^ r32_le(wbuf + (t - 16) * 4);
+            w32_le(wbuf + t * 4, rotl32(xw, 1));
+            t = t + 1;
+        }
+
+        let a = h0;
+        let b = h1;
+        let cc = h2;
+        let d = h3;
+        let e = h4;
+
+        t = 0;
+        while t < 80 {
+            let f = 0;
+            let k = 0;
+            if t < 20 {
+                f = ((b & cc) | ((b ^ 0xFFFFFFFF) & d)) & 0xFFFFFFFF;
+                k = 0x5A827999;
+            } else {
+            if t < 40 {
+                f = (b ^ cc ^ d) & 0xFFFFFFFF;
+                k = 0x6ED9EBA1;
+            } else {
+            if t < 60 {
+                f = ((b & cc) | (b & d) | (cc & d)) & 0xFFFFFFFF;
+                k = 0x8F1BBCDC;
+            } else {
+                f = (b ^ cc ^ d) & 0xFFFFFFFF;
+                k = 0xCA62C1D6;
+            }
+            }
+            }
+            let wt = r32_le(wbuf + t * 4);
+            let tmp = (rotl32(a, 5) + f + e + k + wt) & 0xFFFFFFFF;
+            e = d;
+            d = cc;
+            cc = rotl32(b, 30);
+            b = a;
+            a = tmp;
+            t = t + 1;
+        }
+
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + cc) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        blk = blk + 1;
+    }
+
+    w32_be(dig + 0, h0);
+    w32_be(dig + 4, h1);
+    w32_be(dig + 8, h2);
+    w32_be(dig + 12, h3);
+    w32_be(dig + 16, h4);
+
+    // Base64 encode 20-byte digest -> 28 chars + NUL
+    let gi = 0;
+    let op = 0;
+    while gi < 18 {
+        let v24 = (r8(dig + gi) << 16) | (r8(dig + gi + 1) << 8) | r8(dig + gi + 2);
+        w8(out_b64 + op, b64_char(v24 >> 18));
+        w8(out_b64 + op + 1, b64_char(v24 >> 12));
+        w8(out_b64 + op + 2, b64_char(v24 >> 6));
+        w8(out_b64 + op + 3, b64_char(v24));
+        gi = gi + 3;
+        op = op + 4;
+    }
+    let tail16 = (r8(dig + 18) << 16) | (r8(dig + 19) << 8);
+    w8(out_b64 + 24, b64_char(tail16 >> 18));
+    w8(out_b64 + 25, b64_char(tail16 >> 12));
+    w8(out_b64 + 26, b64_char(tail16 >> 6));
+    w8(out_b64 + 27, 61); // '='
+    w8(out_b64 + 28, 0);
+    return 28;
+}
+
+// =============================================================================
+// CYW43439 Function 2 SDPCM / IOCTL / BDC Multiplexer
+// =============================================================================
+
+fn sdpcm_next_seq() -> int {
+    let scr = cyw_ll_sram_scratch();
+    let s = mmio_read32(scr + 4) & 0xFF;
+    mmio_write32(scr + 4, (s + 1) & 0xFF);
+    return s;
+}
+
+fn sdpcm_next_reqid() -> int {
+    let scr = cyw_ll_sram_scratch();
+    let r = mmio_read32(scr + 8) & 0xFFFF;
+    let nxt = (r + 1) & 0xFFFF;
+    if nxt == 0 {
+        nxt = 1;
+    }
+    mmio_write32(scr + 8, nxt);
+    return r;
+}
+
+fn cyw_f2_write(buf_ptr: int, byte_len: int) -> int {
+    let tries = 0;
+    while tries < 40 {
+        let st = cyw_ll_read_reg(0, 8, 4);
+        if (st & 0x20) != 0 {
+            break;
+        }
+        sleep_us(250);
+        tries = tries + 1;
+    }
+    let aligned = (byte_len + 3) & 0xFFFC;
+    let i = byte_len;
+    while i < aligned {
+        w8(buf_ptr + i, 0);
+        i = i + 1;
+    }
+    let cmd = cyw_ll_pack_cmd(1, 1, 2, 0, aligned);
+    gpio_put(25, 0);
+    cyw_ll_gspi_write_u32(cmd);
+    cyw_ll_gspi_write_bytes(buf_ptr, aligned);
+    gpio_put(25, 1);
+    return aligned;
+}
+
+fn cyw_tx_eth(ctx: int, eth_ptr: int, eth_len: int) -> int {
+    let tx = ctx + 4672;
+    let sdpcm_len = 18 + eth_len;
+    if eth_ptr != tx + 18 {
+        bcopy(tx + 18, eth_ptr, eth_len);
+    }
+    w16_le(tx + 0, sdpcm_len);
+    w16_le(tx + 2, (sdpcm_len ^ 0xFFFF) & 0xFFFF);
+    w8(tx + 4, sdpcm_next_seq());
+    w8(tx + 5, 2);  // SDPCM_CHAN_DATA = 2
+    w8(tx + 6, 0);
+    w8(tx + 7, 14); // sizeof(SDPCM_HDR) + 2 pad bytes
+    w32_le(tx + 8, 0);
+    w16_le(tx + 12, 0); // 2-byte alignment pad
+    w8(tx + 14, 0x20);  // BDC version 2 << 4
+    w8(tx + 15, 0);
+    w8(tx + 16, 0);     // STA interface 0
+    w8(tx + 17, 0);     // data_offset = 0
+    return cyw_f2_write(tx, sdpcm_len);
+}
+
+// =============================================================================
+// Ethernet / ARP / IPv4 / ICMP / DHCPv4 / UDP Discovery / TCP / WebSocket
+// =============================================================================
+
+fn build_eth_hdr(buf: int, dmac: int, smac: int, etype: int) -> int {
+    bcopy(buf, dmac, 6);
+    bcopy(buf + 6, smac, 6);
+    w16_be(buf + 12, etype);
+    return 14;
+}
+
+fn build_ipv4_hdr(ctx: int, buf: int, sip: int, dip: int, proto: int, payload_len: int) -> int {
+    let ip_id = (mmio_read32(ctx + 20) + 1) & 0xFFFF;
+    mmio_write32(ctx + 20, ip_id);
+    w8(buf + 0, 0x45);
+    w8(buf + 1, 0);
+    w16_be(buf + 2, 20 + payload_len);
+    w16_be(buf + 4, ip_id);
+    w16_be(buf + 6, 0);
+    w8(buf + 8, 64);
+    w8(buf + 9, proto & 0xFF);
+    w16_be(buf + 10, 0);
+    bcopy(buf + 12, sip, 4);
+    bcopy(buf + 16, dip, 4);
+    let csum = inet_csum_finish(inet_csum_acc(0, buf, 20));
+    w16_be(buf + 10, csum);
+    return 20;
+}
+
+fn send_arp_pkt(ctx: int, dst_mac: int, target_ip: int, op: int) -> int {
+    let pkt = ctx + 4672 + 18;
+    let my_mac = ctx + 32;
+    let my_ip = ctx + 40;
+    bcopy(pkt, dst_mac, 6);
+    bcopy(pkt + 6, my_mac, 6);
+    w16_be(pkt + 12, 0x0806);
+    w16_be(pkt + 14, 1);      // Ethernet
+    w16_be(pkt + 16, 0x0800); // IPv4
+    w8(pkt + 18, 6);
+    w8(pkt + 19, 4);
+    w16_be(pkt + 20, op);
+    bcopy(pkt + 22, my_mac, 6);
+    bcopy(pkt + 28, my_ip, 4);
+    if op == 1 {
+        bzero(pkt + 32, 6);
+    } else {
+        bcopy(pkt + 32, dst_mac, 6);
+    }
+    bcopy(pkt + 38, target_ip, 4);
+    return cyw_tx_eth(ctx, pkt, 42);
+}
+
+fn send_udp_pkt(ctx: int, dmac: int, sip: int, dip: int, sport: int, dport: int, payload_ptr: int, payload_len: int) -> int {
+    let pkt = ctx + 4672 + 18;
+    let my_mac = ctx + 32;
+    if payload_ptr != 0 && payload_ptr != pkt + 42 {
+        bcopy(pkt + 42, payload_ptr, payload_len);
+    }
+    build_eth_hdr(pkt, dmac, my_mac, 0x0800);
+    build_ipv4_hdr(ctx, pkt + 14, sip, dip, 17, 8 + payload_len);
+    let udp = pkt + 34;
+    w16_be(udp + 0, sport);
+    w16_be(udp + 2, dport);
+    w16_be(udp + 4, 8 + payload_len);
+    w16_be(udp + 6, 0);
+    let csum = l4_checksum(sip, dip, 17, udp, 8 + payload_len);
+    if csum == 0 {
+        csum = 0xFFFF;
+    }
+    w16_be(udp + 6, csum);
+    return cyw_tx_eth(ctx, pkt, 42 + payload_len);
+}
+
+fn send_discovery_beacon(ctx: int, dmac: int, dip: int, dport: int) -> int {
+    let my_ip = ctx + 40;
+    if ip_is_zero(my_ip) != 0 {
+        return 0;
+    }
+    let pay = ctx + 4672 + 18 + 42;
+    let pos = 0;
+    pos = pos + put_ascii(pay + pos, "OMNI_PICO2W ip=");
+    let ip_s = ctx + 128;
+    let il = cstr_len(ip_s);
+    bcopy(pay + pos, ip_s, il);
+    pos = pos + il;
+    pos = pos + put_ascii(pay + pos, " ws_port=");
+    pos = pos + write_u16_dec(pay + pos, mmio_read32(ctx + 16));
+    w8(pay + pos, 10); // '\n'
+    pos = pos + 1;
+    return send_udp_pkt(ctx, dmac, my_ip, dip, 1425, dport, 0, pos);
+}
+
+fn broadcast_discovery(ctx: int) -> int {
+    let scratch = ctx + 8000;
+    let bmac = scratch;
+    let bip = scratch + 8;
+    let sub_bip = scratch + 16;
+    let i = 0;
+    while i < 6 {
+        w8(bmac + i, 0xFF);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 4 {
+        w8(bip + i, 0xFF);
+        let ipb = r8(ctx + 40 + i);
+        let msk = r8(ctx + 44 + i);
+        if msk == 0 {
+            msk = 255;
+            if i == 3 {
+                msk = 0;
+            }
+        }
+        w8(sub_bip + i, (ipb | (msk ^ 0xFF)) & 0xFF);
+        i = i + 1;
+    }
+    send_discovery_beacon(ctx, bmac, sub_bip, 1425);
+    send_discovery_beacon(ctx, bmac, bip, 1425);
+    return 0;
+}
+
+fn dhcp_send(ctx: int, msg_type: int) -> int {
+    let pay = ctx + 4672 + 18 + 42;
+    bzero(pay, 284);
+    w8(pay + 0, 1); // BOOTREQUEST
+    w8(pay + 1, 1); // Ethernet
+    w8(pay + 2, 6);
+    w32_be(pay + 4, mmio_read32(ctx + 24));
+    w16_be(pay + 10, 0x8000); // Broadcast flag
+    bcopy(pay + 28, ctx + 32, 6); // chaddr = my_mac
+    // Magic cookie 99.130.83.99
+    w8(pay + 236, 99);
+    w8(pay + 237, 130);
+    w8(pay + 238, 83);
+    w8(pay + 239, 99);
+
+    let op = 240;
+    // Option 53: DHCP Message Type
+    w8(pay + op, 53);
+    w8(pay + op + 1, 1);
+    w8(pay + op + 2, msg_type);
+    op = op + 3;
+
+    if msg_type == 3 {
+        // Option 50: Requested IP
+        w8(pay + op, 50);
+        w8(pay + op + 1, 4);
+        bcopy(pay + op + 2, ctx + 52, 4);
+        op = op + 6;
+        // Option 54: Server Identifier (critical for dnsmasq/home routers!)
+        if mmio_read32(ctx + 60) != 0 {
+            w8(pay + op, 54);
+            w8(pay + op + 1, 4);
+            bcopy(pay + op + 2, ctx + 56, 4);
+            op = op + 6;
+        }
+    }
+
+    // Option 12: Hostname "omni-pico2w"
+    w8(pay + op, 12);
+    w8(pay + op + 1, 11);
+    let hl = put_ascii(pay + op + 2, "omni-pico2w");
+    op = op + 2 + hl;
+
+    // Option 55: Parameter Request List (Subnet=1, Router=3, DNS=6)
+    w8(pay + op, 55);
+    w8(pay + op + 1, 3);
+    w8(pay + op + 2, 1);
+    w8(pay + op + 3, 3);
+    w8(pay + op + 4, 6);
+    op = op + 5;
+
+    w8(pay + op, 255); // End
+    op = op + 1;
+    while (op & 3) != 0 {
+        w8(pay + op, 0);
+        op = op + 1;
+    }
+
+    let scratch = ctx + 8000;
+    let bmac = scratch;
+    let zip = scratch + 8;
+    let bip = scratch + 16;
+    let i = 0;
+    while i < 6 {
+        w8(bmac + i, 0xFF);
+        i = i + 1;
+    }
+    bzero(zip, 4);
+    i = 0;
+    while i < 4 {
+        w8(bip + i, 0xFF);
+        i = i + 1;
+    }
+    return send_udp_pkt(ctx, bmac, zip, bip, 68, 67, 0, op);
+}
+
+fn dhcp_rx_handle(ctx: int, eth: int, dhcp: int, dhcp_len: int) -> int {
+    if dhcp_len < 240 {
+        return 0;
+    }
+    if r8(dhcp) != 2 {
+        return 0; // Must be BOOTREPLY
+    }
+    if r32_be(dhcp + 4) != mmio_read32(ctx + 24) {
+        return 0;
+    }
+    if mac_eq(dhcp + 28, ctx + 32) == 0 {
+        return 0;
+    }
+    if r8(dhcp + 236) != 99 || r8(dhcp + 237) != 130 || r8(dhcp + 238) != 83 || r8(dhcp + 239) != 99 {
+        return 0;
+    }
+
+    let msg_type = 0;
+    let has_srv = 0;
+    let srv_tmp = ctx + 8000 + 64;
+    let sub_tmp = ctx + 8000 + 68;
+    let rtr_tmp = ctx + 8000 + 72;
+    bzero(sub_tmp, 8);
+
+    let pos = 240;
+    while pos < dhcp_len {
+        let opt = r8(dhcp + pos);
+        if opt == 255 {
+            break;
+        }
+        if opt == 0 {
+            pos = pos + 1;
+        } else {
+            if pos + 1 >= dhcp_len {
+                break;
+            }
+            let olen = r8(dhcp + pos + 1);
+            let odata = dhcp + pos + 2;
+            if pos + 2 + olen > dhcp_len {
+                break;
+            }
+            if opt == 53 && olen >= 1 {
+                msg_type = r8(odata);
+            } else {
+            if opt == 54 && olen >= 4 {
+                bcopy(srv_tmp, odata, 4);
+                has_srv = 1;
+            } else {
+            if opt == 1 && olen >= 4 {
+                bcopy(sub_tmp, odata, 4);
+            } else {
+            if opt == 3 && olen >= 4 {
+                bcopy(rtr_tmp, odata, 4);
+            }
+            }
+            }
+            }
+            pos = pos + 2 + olen;
+        }
+    }
+
+    let st = mmio_read32(ctx + 8);
+    if msg_type == 2 && (st == 1 || st == 0) {
+        bcopy(ctx + 52, dhcp + 16, 4); // yiaddr -> offered_ip
+        bcopy(ctx + 64, eth + 6, 6);
+        if has_srv != 0 {
+            bcopy(ctx + 56, srv_tmp, 4);
+            mmio_write32(ctx + 60, 1);
+        }
+        mmio_write32(ctx + 8, 2); // OFFER_RCVD
+        return 1;
+    }
+    if msg_type == 5 && (st == 3 || st == 2 || st == 1) {
+        bcopy(ctx + 40, dhcp + 16, 4); // yiaddr -> my_ip
+        if ip_is_zero(sub_tmp) == 0 {
+            bcopy(ctx + 44, sub_tmp, 4);
+        }
+        if ip_is_zero(rtr_tmp) == 0 {
+            bcopy(ctx + 48, rtr_tmp, 4);
+        }
+        format_ip_str(ctx + 40, ctx + 128);
+        mmio_write32(ctx + 8, 4); // BOUND
+        return 1;
+    }
+    return 0;
+}
+
+// =============================================================================
+// Bare-Metal TCP + RFC 6455 WebSocket Server Engine
+// =============================================================================
+
+fn tcp_send_segment(ctx: int, dmac: int, dip: int, dport: int, sport: int, seq: int, ack: int, flags: int, data_ptr: int, data_len: int) -> int {
+    let pkt = ctx + 4672 + 18;
+    let my_mac = ctx + 32;
+    let my_ip = ctx + 40;
+    let tcp = pkt + 34;
+    let hlen = 20;
+    if (flags & 0x02) != 0 {
+        // MSS option = 1400 (0x0578)
+        w8(tcp + 20, 2);
+        w8(tcp + 21, 4);
+        w16_be(tcp + 22, 1400);
+        hlen = 24;
+    }
+    if data_len > 0 && data_ptr != 0 && data_ptr != tcp + hlen {
+        bcopy(tcp + hlen, data_ptr, data_len);
+    }
+    build_eth_hdr(pkt, dmac, my_mac, 0x0800);
+    build_ipv4_hdr(ctx, pkt + 14, my_ip, dip, 6, hlen + data_len);
+
+    w16_be(tcp + 0, sport);
+    w16_be(tcp + 2, dport);
+    w32_be(tcp + 4, seq);
+    w32_be(tcp + 8, ack);
+    w8(tcp + 12, (hlen / 4) << 4);
+    w8(tcp + 13, flags & 0x3F);
+    w16_be(tcp + 14, 4096); // Receive window
+    w16_be(tcp + 16, 0);
+    w16_be(tcp + 18, 0);
+    let csum = l4_checksum(my_ip, dip, 6, tcp, hlen + data_len);
+    w16_be(tcp + 16, csum);
+    return cyw_tx_eth(ctx, pkt, 34 + hlen + data_len);
+}
+
+fn tcp_send_tracked(ctx: int, flags: int, data_ptr: int, data_len: int) -> int {
+    let seq = mmio_read32(ctx + 88);
+    let ack = mmio_read32(ctx + 92);
+    let retx = ctx + 6464;
+    if data_len > 0 && data_ptr != retx {
+        bcopy(retx, data_ptr, data_len);
+    }
+    mmio_write32(ctx + 96, seq);
+    mmio_write32(ctx + 100, data_len);
+    mmio_write32(ctx + 104, flags);
+    mmio_write32(ctx + 108, now_ms());
+    mmio_write32(ctx + 112, 0);
+
+    let adv = data_len;
+    if (flags & 0x03) != 0 {
+        // SYN or FIN consumes 1 sequence number
+        if adv == 0 {
+            adv = 1;
+        }
+    }
+    mmio_write32(ctx + 88, (seq + adv) & 0xFFFFFFFF);
+
+    return tcp_send_segment(
+        ctx,
+        ctx + 72,
+        ctx + 80,
+        mmio_read32(ctx + 84),
+        mmio_read32(ctx + 16),
+        seq,
+        ack,
+        flags,
+        retx,
+        data_len
+    );
+}
+
+fn tcp_send_pure_ack(ctx: int) -> int {
+    return tcp_send_segment(
+        ctx,
+        ctx + 72,
+        ctx + 80,
+        mmio_read32(ctx + 84),
+        mmio_read32(ctx + 16),
+        mmio_read32(ctx + 88),
+        mmio_read32(ctx + 92),
+        0x10,
+        0,
+        0
+    );
+}
+
+fn ws_send_raw_frame(ctx: int, opcode: int, payload_ptr: int, payload_len: int) -> int {
+    if mmio_read32(ctx + 12) != 4 {
+        return -1;
+    }
+    let retx = ctx + 6464;
+    let plen = payload_len;
+    if plen > 1380 {
+        plen = 1380;
+    }
+    w8(retx + 0, 0x80 | (opcode & 0x0F));
+    let hdr = 2;
+    if plen <= 125 {
+        w8(retx + 1, plen);
+        hdr = 2;
+    } else {
+        w8(retx + 1, 126);
+        w16_be(retx + 2, plen);
+        hdr = 4;
+    }
+    if plen > 0 && payload_ptr != 0 {
+        bcopy(retx + hdr, payload_ptr, plen);
+    }
+    tcp_send_tracked(ctx, 0x18, retx, hdr + plen);
+    return plen;
+}
+
+fn ascii_lower(ch: int) -> int {
+    if ch >= 65 && ch <= 90 {
+        return ch + 32;
+    }
+    return ch;
+}
+
+fn http_find_header_end(buf: int, len: int) -> int {
+    let i = 0;
+    while i + 3 < len {
+        if r8(buf + i) == 13 && r8(buf + i + 1) == 10 && r8(buf + i + 2) == 13 && r8(buf + i + 3) == 10 {
+            return i + 4;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn http_extract_ws_key(ctx: int, buf: int, len: int, out_key: int) -> int {
+    let pat = ctx + 8000 + 128;
+    let plen = put_ascii(pat, "sec-websocket-key:");
+    let i = 0;
+    while i + plen < len {
+        let m = 1;
+        let k = 0;
+        while k < plen {
+            if ascii_lower(r8(buf + i + k)) != r8(pat + k) {
+                m = 0;
+                break;
+            }
+            k = k + 1;
+        }
+        if m != 0 {
+            let p = i + plen;
+            while p < len && (r8(buf + p) == 32 || r8(buf + p) == 9) {
+                p = p + 1;
+            }
+            let kl = 0;
+            while p + kl < len && kl < 60 {
+                let c = r8(buf + p + kl);
+                if c == 13 || c == 10 || c == 32 || c == 9 {
+                    break;
+                }
+                w8(out_key + kl, c);
+                kl = kl + 1;
+            }
+            return kl;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ws_handle_frames(ctx: int, buf: int, len: int) -> int {
+    let pos = 0;
+    while pos + 2 <= len {
+        let b0 = r8(buf + pos);
+        let b1 = r8(buf + pos + 1);
+        let opcode = b0 & 0x0F;
+        let masked = (b1 >> 7) & 1;
+        let plen = b1 & 0x7F;
+        let hdr = 2;
+        if plen == 126 {
+            if pos + 4 > len {
+                break;
+            }
+            plen = r16_be(buf + pos + 2);
+            hdr = 4;
+        } else {
+        if plen == 127 {
+            break;
+        }
+        }
+        let moff = pos + hdr;
+        if masked != 0 {
+            hdr = hdr + 4;
+        }
+        if pos + hdr + plen > len {
+            break;
+        }
+
+        let dst = ctx + 1184;
+        let copy_n = plen;
+        if copy_n > 1024 {
+            copy_n = 1024;
+        }
+        let i = 0;
+        while i < copy_n {
+            let v = r8(buf + pos + hdr + i);
+            if masked != 0 {
+                v = v ^ r8(buf + moff + (i & 3));
+            }
+            w8(dst + i, v);
+            i = i + 1;
+        }
+        w8(dst + copy_n, 0);
+
+        if opcode == 9 {
+            // Ping -> Pong
+            ws_send_raw_frame(ctx, 10, dst, copy_n);
+        } else {
+        if opcode == 8 {
+            // Close -> echo Close + FIN|ACK and reset back to LISTEN
+            ws_send_raw_frame(ctx, 8, 0, 0);
+            tcp_send_tracked(ctx, 0x11, 0, 0);
+            mmio_write32(ctx + 12, 1);
+            mmio_write32(ctx + 100, 0);
+            return 0;
+        } else {
+        if opcode == 1 || opcode == 2 || opcode == 0 {
+            mmio_write32(ctx + 120, 1);
+        }
+        }
+        }
+        pos = pos + hdr + plen;
+    }
+    return 0;
+}
+
+fn tcp_ws_rx(ctx: int, eth: int, ip: int, ihl: int, ip_tot_len: int) -> int {
+    let tcp = ip + ihl;
+    let tcp_seg_len = ip_tot_len - ihl;
+    if tcp_seg_len < 20 {
+        return 0;
+    }
+    let sport = r16_be(tcp + 0);
+    let dport = r16_be(tcp + 2);
+    let ws_port = mmio_read32(ctx + 16);
+    if dport != ws_port {
+        return 0;
+    }
+
+    let rx_seq = r32_be(tcp + 4);
+    let rx_ack = r32_be(tcp + 8);
+    let thlen = ((r8(tcp + 12) >> 4) & 0x0F) * 4;
+    if thlen < 20 || thlen > tcp_seg_len {
+        return 0;
+    }
+    let flags = r8(tcp + 13);
+    let data_ptr = tcp + thlen;
+    let data_len = tcp_seg_len - thlen;
+    let state = mmio_read32(ctx + 12);
+    if state == 0 {
+        return 0;
+    }
+
+    // Handle RST from active peer
+    if (flags & 0x04) != 0 {
+        if state >= 2 && sport == mmio_read32(ctx + 84) && ip_eq(ip + 12, ctx + 80) != 0 {
+            mmio_write32(ctx + 12, 1);
+            mmio_write32(ctx + 100, 0);
+            mmio_write32(ctx + 116, 0);
+        }
+        return 0;
+    }
+
+    // Accept fresh SYN in LISTEN (or supersede half-dead connection on new SYN!)
+    if (flags & 0x02) != 0 && (flags & 0x10) == 0 {
+        bcopy(ctx + 72, eth + 6, 6);
+        bcopy(ctx + 80, ip + 12, 4);
+        mmio_write32(ctx + 84, sport);
+        let isn = ((time_us() & 0x3FFFFFFF) + 0x10203040) & 0xFFFFFFFF;
+        mmio_write32(ctx + 88, isn);
+        mmio_write32(ctx + 92, (rx_seq + 1) & 0xFFFFFFFF);
+        mmio_write32(ctx + 116, 0);
+        mmio_write32(ctx + 120, 0);
+        mmio_write32(ctx + 12, 2); // SYN_RCVD
+        tcp_send_tracked(ctx, 0x12, 0, 0); // SYN|ACK
+        return 1;
+    }
+
+    // Match active peer
+    if state < 2 || sport != mmio_read32(ctx + 84) || ip_eq(ip + 12, ctx + 80) == 0 {
+        if (flags & 0x04) == 0 {
+            tcp_send_segment(ctx, eth + 6, ip + 12, sport, ws_port, rx_ack, (rx_seq + data_len) & 0xFFFFFFFF, 0x14, 0, 0);
+        }
+        return 0;
+    }
+
+    // Clear retransmit buffer when our latest seq is ACKed
+    if (flags & 0x10) != 0 {
+        if rx_ack == mmio_read32(ctx + 88) {
+            mmio_write32(ctx + 100, 0);
+            mmio_write32(ctx + 112, 0);
+            if state == 2 {
+                if mmio_read32(ctx + 124) != 0 {
+                    state = 4; // RAW_TCP_ESTABLISHED (skip HTTP WebSocket upgrade)
+                    mmio_write32(ctx + 12, 4);
+                } else {
+                    state = 3; // HTTP_UPGRADE
+                    mmio_write32(ctx + 12, 3);
+                }
+            }
+        }
+    }
+
+    if data_len > 0 {
+        let exp_ack = mmio_read32(ctx + 92);
+        if rx_seq != exp_ack {
+            // Duplicate / out-of-order segment -> re-ACK immediately
+            tcp_send_pure_ack(ctx);
+            return 1;
+        }
+        mmio_write32(ctx + 92, (exp_ack + data_len) & 0xFFFFFFFF);
+
+        if state == 3 {
+            let hlen = mmio_read32(ctx + 116);
+            let hbuf = ctx + 160;
+            let room = 1020 - hlen;
+            let cp = data_len;
+            if cp > room {
+                cp = room;
+            }
+            if cp > 0 {
+                bcopy(hbuf + hlen, data_ptr, cp);
+                hlen = hlen + cp;
+                mmio_write32(ctx + 116, hlen);
+            }
+            let hend = http_find_header_end(hbuf, hlen);
+            if hend == 0 {
+                tcp_send_pure_ack(ctx);
+            } else {
+                let key_tmp = ctx + 8000 + 200;
+                let acc_tmp = ctx + 8000 + 264;
+                let klen = http_extract_ws_key(ctx, hbuf, hend, key_tmp);
+                if klen > 0 {
+                    cyw_ws_compute_accept(ctx, key_tmp, klen, acc_tmp);
+                    let resp = ctx + 6464;
+                    let rp = 0;
+                    rp = rp + put_ascii(resp + rp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+                    bcopy(resp + rp, acc_tmp, 28);
+                    rp = rp + 28;
+                    rp = rp + put_ascii(resp + rp, "\r\n\r\n");
+                    mmio_write32(ctx + 12, 4); // WS_OPEN!
+                    state = 4;
+                    tcp_send_tracked(ctx, 0x18, resp, rp);
+                    if hlen > hend {
+                        ws_handle_frames(ctx, hbuf + hend, hlen - hend);
+                    }
+                } else {
+                    tcp_send_tracked(ctx, 0x11, 0, 0);
+                    mmio_write32(ctx + 12, 1);
+                }
+            }
+        } else {
+        if state == 4 {
+            tcp_send_pure_ack(ctx);
+            if mmio_read32(ctx + 124) != 0 {
+                // Raw TCP socket mode: deliver payload directly to ctx+1184 (null-terminated)
+                let cp = data_len;
+                if cp > 1020 {
+                    cp = 1020;
+                }
+                bcopy(ctx + 1184, data_ptr, cp);
+                w8(ctx + 1184 + cp, 0);
+                mmio_write32(ctx + 120, 1);
+            } else {
+                ws_handle_frames(ctx, data_ptr, data_len);
+            }
+        }
+        }
+    }
+
+    if (flags & 0x01) != 0 {
+        // Remote FIN
+        let cur_ack = mmio_read32(ctx + 92);
+        mmio_write32(ctx + 92, (cur_ack + 1) & 0xFFFFFFFF);
+        tcp_send_segment(
+            ctx,
+            ctx + 72,
+            ctx + 80,
+            sport,
+            ws_port,
+            mmio_read32(ctx + 88),
+            mmio_read32(ctx + 92),
+            0x11,
+            0,
+            0
+        );
+        mmio_write32(ctx + 88, (mmio_read32(ctx + 88) + 1) & 0xFFFFFFFF);
+        mmio_write32(ctx + 12, 1); // Return immediately to LISTEN for next client!
+        mmio_write32(ctx + 100, 0);
+    }
+    return 1;
+}
+
+fn eth_rx_dispatch(ctx: int, eth: int, eth_len: int) -> int {
+    if eth_len < 14 {
+        return 0;
+    }
+    let my_mac = ctx + 32;
+    let my_ip = ctx + 40;
+    if mac_is_bcast(eth) == 0 && mac_eq(eth, my_mac) == 0 {
+        return 0;
+    }
+    let etype = r16_be(eth + 12);
+
+    // 1. ARP (0x0806)
+    if etype == 0x0806 && eth_len >= 42 {
+        let op = r16_be(eth + 20);
+        if op == 1 && ip_is_zero(my_ip) == 0 && ip_eq(eth + 38, my_ip) != 0 {
+            send_arp_pkt(ctx, eth + 6, eth + 28, 2);
+            return 1;
+        }
+        return 0;
+    }
+
+    // 2. IPv4 (0x0800)
+    if etype != 0x0800 || eth_len < 34 {
+        return 0;
+    }
+    let ip = eth + 14;
+    if (r8(ip) >> 4) != 4 {
+        return 0;
+    }
+    let ihl = (r8(ip) & 0x0F) * 4;
+    let tot_len = r16_be(ip + 2);
+    if ihl < 20 || tot_len < ihl || 14 + tot_len > eth_len {
+        return 0;
+    }
+    let proto = r8(ip + 9);
+
+    // ICMP Echo Reply (ping)
+    if proto == 1 && ip_is_zero(my_ip) == 0 && ip_eq(ip + 16, my_ip) != 0 {
+        let icmp = ip + ihl;
+        let icmp_len = tot_len - ihl;
+        if icmp_len >= 8 && r8(icmp) == 8 {
+            let reply = ctx + 4672 + 18;
+            build_eth_hdr(reply, eth + 6, my_mac, 0x0800);
+            build_ipv4_hdr(ctx, reply + 14, my_ip, ip + 12, 1, icmp_len);
+            bcopy(reply + 34, icmp, icmp_len);
+            w8(reply + 34, 0); // Echo Reply
+            w16_be(reply + 36, 0);
+            let ics = inet_csum_finish(inet_csum_acc(0, reply + 34, icmp_len));
+            w16_be(reply + 36, ics);
+            cyw_tx_eth(ctx, reply, 34 + icmp_len);
+            return 1;
+        }
+        return 0;
+    }
+
+    // UDP (DHCP client :68 + Discovery responder :1425)
+    if proto == 17 && tot_len >= ihl + 8 {
+        let udp = ip + ihl;
+        let sport = r16_be(udp + 0);
+        let dport = r16_be(udp + 2);
+        let ulen = r16_be(udp + 4);
+        if ulen < 8 || ihl + ulen > tot_len {
+            return 0;
+        }
+        if dport == 68 {
+            return dhcp_rx_handle(ctx, eth, udp + 8, ulen - 8);
+        }
+        if dport == 1425 && ip_is_zero(my_ip) == 0 {
+            send_discovery_beacon(ctx, eth + 6, ip + 12, sport);
+            return 1;
+        }
+        return 0;
+    }
+
+    // TCP (WebSocket server)
+    if proto == 6 && ip_is_zero(my_ip) == 0 && ip_eq(ip + 16, my_ip) != 0 {
+        return tcp_ws_rx(ctx, eth, ip, ihl, tot_len);
+    }
+
+    return 0;
+}
+
+fn cyw_poll_one_pkt(ctx: int, want_reqid: int, ioctl_out: int, ioctl_max: int) -> int {
+    let st = cyw_ll_read_reg(0, 8, 4);
+    if st == 0xFFFFFFFF || (st & 0x100) == 0 {
+        return 0;
+    }
+    let plen = (st >> 9) & 0x7FF;
+    if plen == 0 {
+        cyw_ll_write_reg(1, 0x1000D, 1, 1);
+        let ir = cyw_ll_read_reg(0, 4, 2);
+        if ir != 0 {
+            cyw_ll_write_reg(0, 4, ir, 2);
+        }
+        return 0;
+    }
+
+    let aligned = (plen + 3) & 0x7FC;
+    let rx = ctx + 2880;
+    let read_n = aligned;
+    if read_n > 1760 {
+        read_n = 1760;
+    }
+    let cmd = cyw_ll_pack_cmd(0, 1, 2, 0, aligned);
+    gpio_put(25, 0);
+    cyw_ll_gspi_write_u32(cmd);
+    cyw_ll_gspi_read_bytes(rx, read_n);
+    if aligned > read_n {
+        let extra = aligned - read_n;
+        let dump = ctx + 8000 + 400;
+        while extra > 0 {
+            let step = extra;
+            if step > 64 {
+                step = 64;
+            }
+            cyw_ll_gspi_read_bytes(dump, step);
+            extra = extra - step;
+        }
+    }
+    gpio_put(25, 1);
+
+    let s_len = r16_le(rx + 0);
+    let s_not = r16_le(rx + 2);
+    if (s_len ^ s_not) != 0xFFFF || s_len < 12 || s_len > read_n {
+        return 1;
+    }
+    let chan = r8(rx + 5) & 0x0F;
+    let hdrlen = r8(rx + 7);
+    if hdrlen < 12 || hdrlen > s_len {
+        return 1;
+    }
+
+    if chan == 0 {
+        if hdrlen + 16 > s_len {
+            return 1;
+        }
+        let io = rx + hdrlen;
+        let flags = r32_le(io + 8);
+        let status = r32_le(io + 12);
+        let rx_id = (flags >> 16) & 0xFFFF;
+        if want_reqid != 0 && rx_id == want_reqid {
+            let pay = io + 16;
+            let avail = s_len - (hdrlen + 16);
+            if ioctl_out != 0 && ioctl_max > 0 && avail > 0 {
+                let cp = avail;
+                if cp > ioctl_max {
+                    cp = ioctl_max;
+                }
+                bcopy(ioctl_out, pay, cp);
+            }
+            if status == 0 && (flags & 1) == 0 {
+                return 100;
+            }
+            return 101;
+        }
+        return 1;
+    }
+
+    if chan == 1 {
+        if hdrlen + 4 > s_len {
+            return 2;
+        }
+        let bdc = rx + hdrlen;
+        let doff = r8(bdc + 3);
+        let eth = bdc + 4 + doff * 4;
+        let eth_len = (rx + s_len) - eth;
+        if eth_len >= 40 {
+            let ev_flags = r16_be(eth + 26);
+            let ev_type = r32_be(eth + 28);
+            let ev_status = r32_be(eth + 32);
+            let jf = mmio_read32(ctx + 4);
+            if ev_type == 16 && ev_status == 0 {
+                if (ev_flags & 1) != 0 {
+                    jf = jf | 1;
+                } else {
+                    jf = jf & 2;
+                }
+            } else {
+            if ev_type == 46 {
+                if ev_status == 6 {
+                    jf = jf | 2;
+                }
+            } else {
+            if ev_type == 0 && ev_status == 3 {
+                jf = jf | 4;
+            } else {
+            if ev_type == 12 {
+                jf = jf & 4;
+            }
+            }
+            }
+            }
+            mmio_write32(ctx + 4, jf);
+        }
+        return 2;
+    }
+
+    if chan == 2 {
+        if hdrlen + 4 > s_len {
+            return 3;
+        }
+        let bdc = rx + hdrlen;
+        let doff = r8(bdc + 3);
+        let eth = bdc + 4 + doff * 4;
+        let eth_len = (rx + s_len) - eth;
+        if eth_len >= 14 {
+            eth_rx_dispatch(ctx, eth, eth_len);
+        }
+        return 3;
+    }
+
+    return 1;
+}
+
+fn cyw_do_ioctl(ctx: int, is_set: int, cmd: int, data_ptr: int, data_len: int) -> int {
+    let tx = ctx + 4672;
+    let outlen = (data_len + 3) & 0xFFFC;
+    let txlen = 28 + outlen;
+    let reqid = sdpcm_next_reqid();
+    bzero(tx, 28 + outlen);
+    w16_le(tx + 0, txlen);
+    w16_le(tx + 2, (txlen ^ 0xFFFF) & 0xFFFF);
+    w8(tx + 4, sdpcm_next_seq());
+    w8(tx + 5, 0);  // SDPCM_CHAN_CTRL
+    w8(tx + 7, 12); // sizeof(SDPCM_HDR)
+    w32_le(tx + 12, cmd);
+    w16_le(tx + 16, outlen);
+    w16_le(tx + 18, 0);
+    let flg = (reqid << 16);
+    if is_set != 0 {
+        flg = flg | 2;
+    }
+    w32_le(tx + 20, flg);
+    w32_le(tx + 24, 0);
+    if data_len > 0 && data_ptr != 0 {
+        bcopy(tx + 28, data_ptr, data_len);
+    }
+    cyw_f2_write(tx, txlen);
+
+    let waited = 0;
+    while waited < 300 {
+        let rc = cyw_poll_one_pkt(ctx, reqid, data_ptr, data_len);
+        if rc == 100 {
+            return 0;
+        }
+        if rc == 101 {
+            return -1;
+        }
+        if rc == 0 {
+            sleep_ms(1);
+            waited = waited + 1;
+        }
+    }
+    return -2;
+}
+
+fn ioctl_set_u32(ctx: int, cmd: int, val: int) -> int {
+    let io = ctx + 8000;
+    w32_le(io, val);
+    return cyw_do_ioctl(ctx, 1, cmd, io, 4);
+}
+
+fn iovar_set_u32(ctx: int, name: str, val: int) -> int {
+    let io = ctx + 8000;
+    let nl = put_ascii(io, name);
+    w8(io + nl, 0);
+    w32_le(io + nl + 1, val);
+    return cyw_do_ioctl(ctx, 1, 263, io, nl + 5);
+}
+
+fn iovar_set_u32x2(ctx: int, name: str, v0: int, v1: int) -> int {
+    let io = ctx + 8000;
+    let nl = put_ascii(io, name);
+    w8(io + nl, 0);
+    w32_le(io + nl + 1, v0);
+    w32_le(io + nl + 5, v1);
+    return cyw_do_ioctl(ctx, 1, 263, io, nl + 9);
+}
+
+fn cyw_net_gpio_put(pin: int, on: int) -> int {
+    let ctx = get_net_ctx();
+    let p = pin & 7;
+    let mask = 1 << p;
+    let vbit = 0;
+    if on != 0 {
+        vbit = mask;
+    }
+    let scr = cyw_ll_sram_scratch();
+    let pk_old = mmio_read32(scr + 12);
+    let out_old = pk_old & 0xFF;
+    let en_old = (pk_old >> 8) & 0xFF;
+    let out_new = (out_old & (mask ^ 0xFF)) | vbit;
+    let en_new = en_old | mask;
+    mmio_write32(scr + 12, out_new | (en_new << 8));
+
+    iovar_set_u32x2(ctx, "gpioout", mask, vbit);
+    cyw_ll_write_bp(402653288, en_new, 4);
+    cyw_ll_write_bp(402653284, out_new, 4);
+    return 0;
+}
+
+fn cyw_load_clm(ctx: int) -> int {
+    let clm_ptr = cyw_ll_clm_ptr();
+    let clm_len = 984;
+    let off = 0;
+    let io = ctx + 8000;
+    while off < clm_len {
+        let chunk = clm_len - off;
+        let flag = 0x1000;
+        if off == 0 {
+            flag = flag | 2;
+        }
+        if chunk > 512 {
+            chunk = 512;
+        } else {
+            flag = flag | 4;
+        }
+        bzero(io, 560);
+        let nl = put_ascii(io, "clmload");
+        w8(io + nl, 0); // 8 bytes
+        w16_le(io + 8, flag);
+        w16_le(io + 10, 2);
+        w32_le(io + 12, chunk);
+        w32_le(io + 16, 0);
+        bcopy(io + 20, clm_ptr + off, chunk);
+        let send_len = (20 + chunk + 7) & 0xFFF8;
+        cyw_do_ioctl(ctx, 1, 263, io, send_len);
+        off = off + chunk;
+    }
+    return 0;
+}
+
+// =============================================================================
+// Public OmniNet API Entrypoints
+// =============================================================================
+
+fn cyw_wifi_connect(ssid_ptr: int, pass_ptr: int) -> int {
+    let ctx = get_net_ctx();
+    let io = ctx + 8000;
+
+    if mmio_read32(ctx + 0) == 0 {
+        let rc = cyw43_init();
+        if rc != 0 {
+            return rc;
+        }
+        cyw_load_clm(ctx);
+
+        // Set country = "XX" worldwide (-1 rev)
+        bzero(io, 32);
+        let cl = put_ascii(io, "country");
+        w8(io + cl, 0);
+        w8(io + 8, 88);  // 'X'
+        w8(io + 9, 88);  // 'X'
+        w32_le(io + 12, 0xFFFFFFFF);
+        w8(io + 16, 88); // 'X'
+        w8(io + 17, 88); // 'X'
+        cyw_do_ioctl(ctx, 1, 263, io, 28);
+        sleep_ms(50);
+
+        ioctl_set_u32(ctx, 64, 0); // WLC_SET_ANTDIV = 0
+        iovar_set_u32(ctx, "bus:txglom", 0);
+        iovar_set_u32(ctx, "apsta", 1);
+        iovar_set_u32(ctx, "ampdu_ba_wsize", 8);
+        iovar_set_u32(ctx, "ampdu_mpdu", 4);
+        iovar_set_u32(ctx, "ampdu_rx_factor", 0);
+        sleep_ms(120);
+
+        // Enable async join events ("bsscfg:event_msgs\0" + u32(0) + 19B mask)
+        bzero(io, 48);
+        let el = put_ascii(io, "bsscfg:event_msgs");
+        w8(io + el, 0); // 18 bytes
+        w32_le(io + 18, 0);
+        let mi = 0;
+        while mi < 19 {
+            w8(io + 22 + mi, 0xFF);
+            mi = mi + 1;
+        }
+        // Mask noisy roam/probe events (19, 20, 40, 44, 54, 71)
+        w8(io + 22 + 2, 0xE7);
+        w8(io + 22 + 5, 0xEE);
+        w8(io + 22 + 6, 0xBF);
+        w8(io + 22 + 8, 0x7F);
+        cyw_do_ioctl(ctx, 1, 263, io, 41);
+        sleep_ms(40);
+
+        // WLC_UP (2)
+        cyw_do_ioctl(ctx, 1, 2, 0, 0);
+        sleep_ms(50);
+
+        // Read hardware MAC ("cur_etheraddr")
+        bzero(io, 32);
+        let ml = put_ascii(io, "cur_etheraddr");
+        w8(io + ml, 0);
+        if cyw_do_ioctl(ctx, 0, 262, io, 20) == 0 {
+            bcopy(ctx + 32, io, 6);
+        }
+        if (r8(ctx + 32) | r8(ctx + 33) | r8(ctx + 34) | r8(ctx + 35) | r8(ctx + 36) | r8(ctx + 37)) == 0 {
+            w8(ctx + 32, 0x02);
+            w8(ctx + 33, 0x4F);
+            w8(ctx + 34, 0x4D);
+            w8(ctx + 35, 0x4E);
+            w8(ctx + 36, 0x49);
+            w8(ctx + 37, 0x01);
+        }
+        mmio_write32(ctx + 0, 1);
+    }
+
+    let ssid_len = cstr_len(ssid_ptr);
+    if ssid_len > 32 {
+        ssid_len = 32;
+    }
+    let pass_len = cstr_len(pass_ptr);
+    if pass_len > 64 {
+        pass_len = 64;
+    }
+
+    // Attempt WPA2 join (up to 3 attempts, toggling LED rapidly while associating)
+    let attempt = 0;
+    let joined = 0;
+    let led = 1;
+    while attempt < 3 && joined == 0 {
+        mmio_write32(ctx + 4, 0);
+        ioctl_set_u32(ctx, 110, 1); // WLC_SET_GMODE = Auto
+        ioctl_set_u32(ctx, 142, 0); // WLC_SET_BAND = Any
+        iovar_set_u32(ctx, "pm2_sleep_ret", 200);
+        iovar_set_u32(ctx, "bcn_li_bcn", 1);
+        iovar_set_u32(ctx, "bcn_li_dtim", 1);
+        iovar_set_u32(ctx, "assoc_listen", 10);
+
+        if pass_len > 0 {
+            // WLC_SET_WSEC (134) = 6 (TKIP | AES) on attempt 0/2, or 4 (AES-only) on attempt 1
+            let wsec = 6;
+            if attempt == 1 {
+                wsec = 4;
+            }
+            ioctl_set_u32(ctx, 134, wsec);
+            iovar_set_u32x2(ctx, "bsscfg:sup_wpa", 0, 1);
+            iovar_set_u32x2(ctx, "bsscfg:sup_wpa2_eapver", 0, 0xFFFFFFFF);
+            iovar_set_u32x2(ctx, "bsscfg:sup_wpa_tmo", 0, 2500);
+            sleep_ms(5);
+
+            // WLC_SET_WSEC_PMK (268): 68-byte wsec_pmk_t
+            bzero(io, 72);
+            w16_le(io + 0, pass_len);
+            w16_le(io + 2, 1);
+            bcopy(io + 4, pass_ptr, pass_len);
+            cyw_do_ioctl(ctx, 1, 268, io, 68);
+
+            ioctl_set_u32(ctx, 20, 1); // WLC_SET_INFRA = 1
+            ioctl_set_u32(ctx, 22, 0); // WLC_SET_AUTH = Open
+            let mfp_val = 1;
+            if attempt == 2 {
+                mfp_val = 0;
+            }
+            iovar_set_u32(ctx, "mfp", mfp_val);
+            ioctl_set_u32(ctx, 165, 0x80); // WLC_SET_WPA_AUTH = WPA2_AUTH_PSK
+        } else {
+            ioctl_set_u32(ctx, 134, 0);
+            ioctl_set_u32(ctx, 20, 1);
+            ioctl_set_u32(ctx, 22, 0);
+            ioctl_set_u32(ctx, 165, 0);
+        }
+
+        // WLC_SET_SSID (26): 36-byte wlc_ssid_t
+        bzero(io, 40);
+        w32_le(io, ssid_len);
+        bcopy(io + 4, ssid_ptr, ssid_len);
+        cyw_do_ioctl(ctx, 1, 26, io, 36);
+
+        let wait_ms = 0;
+        while wait_ms < 9000 {
+            let drain_k = 0;
+            while drain_k < 8 {
+                if cyw_poll_one_pkt(ctx, 0, 0, 0) == 0 {
+                    break;
+                }
+                drain_k = drain_k + 1;
+            }
+            let jf = mmio_read32(ctx + 4);
+            if pass_len > 0 {
+                if (jf & 3) == 3 {
+                    joined = 1;
+                    break;
+                }
+            } else {
+                if (jf & 1) == 1 {
+                    joined = 1;
+                    break;
+                }
+            }
+            if (jf & 4) != 0 && wait_ms > 2000 {
+                break;
+            }
+            if (wait_ms & 127) == 0 {
+                cyw_net_gpio_put(0, led);
+                led = 1 - led;
+            }
+            sleep_ms(4);
+            wait_ms = wait_ms + 4;
+        }
+
+        if joined == 0 {
+            // WLC_DOWN (3) -> WLC_UP (2) before retry
+            cyw_do_ioctl(ctx, 1, 3, 0, 0);
+            sleep_ms(150);
+            cyw_do_ioctl(ctx, 1, 2, 0, 0);
+            sleep_ms(100);
+        }
+        attempt = attempt + 1;
+    }
+
+    if joined == 0 {
+        cyw_net_gpio_put(0, 0);
+        return -10;
+    }
+
+    // Run DHCPv4 DISCOVER -> OFFER -> REQUEST -> ACK
+    mmio_write32(ctx + 8, 0);
+    mmio_write32(ctx + 60, 0);
+    mmio_write32(ctx + 24, (mmio_read32(ctx + 24) + 1) & 0xFFFFFFFF);
+    let dhcp_ms = 0;
+    let next_tx_ms = 0;
+    while dhcp_ms < 12000 {
+        let dk = 0;
+        while dk < 8 {
+            if cyw_poll_one_pkt(ctx, 0, 0, 0) == 0 {
+                break;
+            }
+            dk = dk + 1;
+        }
+        let dst = mmio_read32(ctx + 8);
+        if dst == 4 {
+            break;
+        }
+        if dst == 2 {
+            dhcp_send(ctx, 3); // DHCP REQUEST
+            mmio_write32(ctx + 8, 3);
+            next_tx_ms = dhcp_ms + 1500;
+        } else {
+        if dhcp_ms >= next_tx_ms {
+            if dst == 3 {
+                dhcp_send(ctx, 3);
+            } else {
+                dhcp_send(ctx, 1); // DHCP DISCOVER
+                mmio_write32(ctx + 8, 1);
+            }
+            next_tx_ms = dhcp_ms + 1500;
+        }
+        }
+        if (dhcp_ms & 63) == 0 {
+            cyw_net_gpio_put(0, led);
+            led = 1 - led;
+        }
+        sleep_ms(4);
+        dhcp_ms = dhcp_ms + 4;
+    }
+
+    if mmio_read32(ctx + 8) != 4 {
+        cyw_net_gpio_put(0, 0);
+        return -11;
+    }
+
+    // Solid LED + Gratuitous ARP + 3 UDP Broadcast Discovery Beacons on :1425!
+    cyw_net_gpio_put(0, 1);
+    let bmac = ctx + 8000;
+    let bi = 0;
+    while bi < 6 {
+        w8(bmac + bi, 0xFF);
+        bi = bi + 1;
+    }
+    send_arp_pkt(ctx, bmac, ctx + 40, 1);
+    broadcast_discovery(ctx);
+    sleep_ms(30);
+    broadcast_discovery(ctx);
+    mmio_write32(ctx + 28, now_ms());
+
+    return r32_be(ctx + 40);
+}
+
+fn cyw_wifi_ip_ptr() -> int {
+    let ctx = get_net_ctx();
+    return ctx + 128;
+}
+
+fn cyw_ws_listen(port: int) -> int {
+    let ctx = get_net_ctx();
+    mmio_write32(ctx + 124, 0); // WebSocket mode
+    mmio_write32(ctx + 16, port & 0xFFFF);
+    mmio_write32(ctx + 12, 1); // LISTEN
+    mmio_write32(ctx + 100, 0);
+    mmio_write32(ctx + 116, 0);
+    mmio_write32(ctx + 120, 0);
+    broadcast_discovery(ctx);
+    return 0;
+}
+
+fn cyw_tcp_listen(port: int) -> int {
+    let ctx = get_net_ctx();
+    mmio_write32(ctx + 124, 1); // Raw TCP socket mode
+    mmio_write32(ctx + 16, port & 0xFFFF);
+    mmio_write32(ctx + 12, 1); // LISTEN
+    mmio_write32(ctx + 100, 0);
+    mmio_write32(ctx + 116, 0);
+    mmio_write32(ctx + 120, 0);
+    broadcast_discovery(ctx);
+    return 0;
+}
+
+fn cyw_tcp_is_open() -> int {
+    let ctx = get_net_ctx();
+    if mmio_read32(ctx + 12) == 4 {
+        return 1;
+    }
+    return 0;
+}
+
+fn cyw_tcp_send(msg_ptr: int) -> int {
+    let ctx = get_net_ctx();
+    if mmio_read32(ctx + 12) != 4 {
+        return -1;
+    }
+    let n = cstr_len(msg_ptr);
+    if n <= 0 {
+        return 0;
+    }
+    if n > 1020 {
+        n = 1020;
+    }
+    tcp_send_tracked(ctx, 0x18, msg_ptr, n); // PSH|ACK
+    return n;
+}
+
+fn cyw_tcp_poll_ptr() -> int {
+    return cyw_ws_poll_ptr();
+}
+
+fn cyw_tcp_close() -> int {
+    let ctx = get_net_ctx();
+    if mmio_read32(ctx + 12) >= 2 {
+        tcp_send_tracked(ctx, 0x11, 0, 0); // FIN|ACK
+        mmio_write32(ctx + 12, 1); // Return to LISTEN
+        mmio_write32(ctx + 100, 0);
+        mmio_write32(ctx + 116, 0);
+        mmio_write32(ctx + 120, 0);
+    }
+    return 0;
+}
+
+fn cyw_ws_is_open() -> int {
+    let ctx = get_net_ctx();
+    if mmio_read32(ctx + 12) == 4 {
+        return 1;
+    }
+    return 0;
+}
+
+fn cyw_ws_send(msg_ptr: int) -> int {
+    let ctx = get_net_ctx();
+    if mmio_read32(ctx + 12) != 4 {
+        return -1;
+    }
+    let n = cstr_len(msg_ptr);
+    return ws_send_raw_frame(ctx, 1, msg_ptr, n);
+}
+
+fn cyw_ws_poll_ptr() -> int {
+    let ctx = get_net_ctx();
+    mmio_write32(ctx + 120, 0);
+
+    let loops = 0;
+    while loops < 6 {
+        if cyw_poll_one_pkt(ctx, 0, 0, 0) == 0 {
+            break;
+        }
+        if mmio_read32(ctx + 120) != 0 {
+            mmio_write32(ctx + 120, 0);
+            return ctx + 1184;
+        }
+        loops = loops + 1;
+    }
+
+    let cur_ms = now_ms();
+
+    // TCP un-ACKed segment retransmission (300 ms RTO, max 8 retries)
+    let unack_len = mmio_read32(ctx + 100);
+    let unack_flags = mmio_read32(ctx + 104);
+    if mmio_read32(ctx + 12) >= 2 && (unack_len > 0 || (unack_flags & 0x03) != 0) {
+        let dt = (cur_ms - mmio_read32(ctx + 108)) & 0x7FFFFFFF;
+        if dt >= 300 {
+            let retries = mmio_read32(ctx + 112) + 1;
+            if retries > 8 {
+                mmio_write32(ctx + 12, 1); // Reset back to LISTEN
+                mmio_write32(ctx + 100, 0);
+                mmio_write32(ctx + 104, 0);
+            } else {
+                mmio_write32(ctx + 112, retries);
+                mmio_write32(ctx + 108, cur_ms);
+                tcp_send_segment(
+                    ctx,
+                    ctx + 72,
+                    ctx + 80,
+                    mmio_read32(ctx + 84),
+                    mmio_read32(ctx + 16),
+                    mmio_read32(ctx + 96),
+                    mmio_read32(ctx + 92),
+                    unack_flags,
+                    ctx + 6464,
+                    unack_len
+                );
+            }
+        }
+    }
+
+    // Periodic 2-second UDP discovery broadcast on :1425 so host always finds Pico 2 W IP!
+    if mmio_read32(ctx + 8) == 4 {
+        let bdt = (cur_ms - mmio_read32(ctx + 28)) & 0x7FFFFFFF;
+        if bdt >= 2000 {
+            mmio_write32(ctx + 28, cur_ms);
+            broadcast_discovery(ctx);
+        }
+    }
+
+    return ctx + 156; // empty string "\0"
+}
+
+fn main() -> int {
+    return 0;
+}

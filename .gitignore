@@ -14,6 +14,8 @@ oenv/
 **/.oenv/
 *_bin
 *.exe
+*.uf2
+*.elf
 a.out
 result
 models/*.gguf

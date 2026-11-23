@@ -1,8 +1,10 @@
 pub mod chip;
+pub mod cyw43_fw;
 pub mod elf_uf2;
 pub mod ir_lower;
 pub mod runtime_fw;
 pub mod thumb_enc;
+pub mod usb_cdc_fw;
 
 use std::fs;
 use std::path::Path;
@@ -157,12 +159,17 @@ entry:
         chip: RpChipProfile,
         flash: Vec<u8>,
         sram: Vec<u8>,
+        usb_dpram: Vec<u8>,
         r: [u32; 16],
         n: bool,
         z: bool,
         c: bool,
         v: bool,
         simulate_hw_locks: bool,
+        sim_timer_us: std::cell::Cell<u64>,
+        sio_out: u32,
+        sio_oe: u32,
+        cyw43_slave: Option<SimCyw43439>,
         mmio_regs: HashMap<u32, u32>,
         mmio_write_log: Vec<(u32, u32)>,
         uart_tx: Vec<u8>,
@@ -177,12 +184,17 @@ entry:
                 chip,
                 flash,
                 sram: vec![0u8; sram_len],
+                usb_dpram: vec![0u8; 4096],
                 r,
                 n: false,
                 z: false,
                 c: false,
                 v: false,
                 simulate_hw_locks,
+                sim_timer_us: std::cell::Cell::new(1_000),
+                sio_out: 0,
+                sio_oe: 0,
+                cyw43_slave: None,
                 mmio_regs: HashMap::new(),
                 mmio_write_log: Vec::new(),
                 uart_tx: Vec::new(),
@@ -195,6 +207,9 @@ entry:
         }
 
         fn read8(&self, addr: u32) -> u8 {
+            if addr >= self.chip.usb_dpram_base && addr < self.chip.usb_dpram_base + 0x1000 {
+                return self.usb_dpram[(addr - self.chip.usb_dpram_base) as usize];
+            }
             if addr >= self.chip.flash_base {
                 let off = (addr - self.chip.flash_base) as usize;
                 if off < self.flash.len() {
@@ -217,7 +232,9 @@ entry:
 
         fn read32(&self, addr: u32) -> u32 {
             assert_eq!(addr & 3, 0, "unaligned read32 at 0x{:08X} (PC=0x{:08X})", addr, self.r[15]);
-            if addr >= 0x4000_0000 {
+            let is_usb_dpram =
+                addr >= self.chip.usb_dpram_base && addr < self.chip.usb_dpram_base + 0x1000;
+            if addr >= 0x4000_0000 && !is_usb_dpram {
                 if self.simulate_hw_locks {
                     if addr == self.chip.xosc_base + 0x04 {
                         return 0x8000_0000; // XOSC.STATUS.STABLE
@@ -226,18 +243,36 @@ entry:
                         let rst = self.mmio_regs.get(&self.chip.resets_base).copied().unwrap_or(0xFFFF_FFFF);
                         return !rst;
                     }
-                    if addr == self.chip.pll_sys_base {
+                    if addr == self.chip.pll_sys_base || addr == self.chip.pll_usb_base {
                         let cs = self.mmio_regs.get(&addr).copied().unwrap_or(1);
-                        let pwr = self.mmio_regs.get(&(self.chip.pll_sys_base + 0x04)).copied().unwrap_or(0x2D);
+                        let pwr = self.mmio_regs.get(&(addr + 0x04)).copied().unwrap_or(0x2D);
                         if (pwr & 0x21) == 0 {
                             return cs | 0x8000_0000; // CS.LOCK
                         }
                         return cs;
                     }
+                    if addr == self.chip.clocks_base + 0x38 {
+                        let ctrl = self.mmio_regs.get(&(self.chip.clocks_base + 0x30)).copied().unwrap_or(0);
+                        return 1 << (ctrl & 3); // CLK_REF_SELECTED
+                    }
                     if addr == self.chip.clocks_base + 0x44 {
                         let ctrl = self.mmio_regs.get(&(self.chip.clocks_base + 0x3C)).copied().unwrap_or(0);
                         return 1 << (ctrl & 1); // CLK_SYS_SELECTED
                     }
+                    if addr == self.chip.timer_base + 0x28 {
+                        let next = self.sim_timer_us.get().wrapping_add(50_000);
+                        self.sim_timer_us.set(next);
+                        return next as u32;
+                    }
+                    if addr == self.chip.timer_base + 0x24 {
+                        return (self.sim_timer_us.get() >> 32) as u32;
+                    }
+                }
+                if addr == self.chip.sio_base + self.chip.sio_gpio_in {
+                    if let Some(ref cyw) = self.cyw43_slave {
+                        return cyw.gpio_in_word(self.sio_out, self.sio_oe);
+                    }
+                    return self.sio_out & self.sio_oe;
                 }
                 if addr == self.chip.uart0_base + 0x18 {
                     return 0; // UARTFR: TXFF == 0 (ready)
@@ -251,6 +286,10 @@ entry:
         }
 
         fn write8(&mut self, addr: u32, val: u8) {
+            if addr >= self.chip.usb_dpram_base && addr < self.chip.usb_dpram_base + 0x1000 {
+                self.usb_dpram[(addr - self.chip.usb_dpram_base) as usize] = val;
+                return;
+            }
             if addr >= self.chip.sram_base {
                 let off = (addr - self.chip.sram_base) as usize;
                 if off < self.sram.len() {
@@ -269,13 +308,39 @@ entry:
 
         fn write32(&mut self, addr: u32, val: u32) {
             assert_eq!(addr & 3, 0, "unaligned write32 at 0x{:08X}", addr);
-            if addr >= 0x4000_0000 {
+            let is_usb_dpram =
+                addr >= self.chip.usb_dpram_base && addr < self.chip.usb_dpram_base + 0x1000;
+            if addr >= 0x4000_0000 && !is_usb_dpram {
+                if addr >= self.chip.sio_base && addr < self.chip.sio_base + 0x100 {
+                    let prev_out = self.sio_out;
+                    let prev_oe = self.sio_oe;
+                    let off = addr - self.chip.sio_base;
+                    if off == self.chip.sio_gpio_out {
+                        self.sio_out = val;
+                    } else if off == self.chip.sio_gpio_out_set {
+                        self.sio_out |= val;
+                    } else if off == self.chip.sio_gpio_out_clr {
+                        self.sio_out &= !val;
+                    } else if off == self.chip.sio_gpio_out_xor {
+                        self.sio_out ^= val;
+                    } else if off == self.chip.sio_gpio_oe_set {
+                        self.sio_oe |= val;
+                    } else if off == self.chip.sio_gpio_oe_clr {
+                        self.sio_oe &= !val;
+                    }
+                    if let Some(ref mut cyw) = self.cyw43_slave {
+                        cyw.on_sio_transition(prev_out, prev_oe, self.sio_out, self.sio_oe);
+                    } else {
+                        self.mmio_write_log.push((addr, val));
+                    }
+                    return;
+                }
                 self.mmio_write_log.push((addr, val));
                 if addr == self.chip.uart0_base {
                     self.uart_tx.push((val & 0xFF) as u8);
                     return;
                 }
-                // Handle RP2040/RP2350 Atomic Set (+0x2000) / Clear (+0x3000) aliases on RESETS
+                // Handle RP2040/RP2350 Atomic Set (+0x2000) / Clear (+0x3000) aliases on RESETS & USBCTRL_REGS
                 if addr == self.chip.resets_base + 0x2000 {
                     let cur = self.mmio_regs.get(&self.chip.resets_base).copied().unwrap_or(0xFFFF_FFFF);
                     self.mmio_regs.insert(self.chip.resets_base, cur | val);
@@ -284,6 +349,18 @@ entry:
                 if addr == self.chip.resets_base + 0x3000 {
                     let cur = self.mmio_regs.get(&self.chip.resets_base).copied().unwrap_or(0xFFFF_FFFF);
                     self.mmio_regs.insert(self.chip.resets_base, cur & !val);
+                    return;
+                }
+                if addr >= self.chip.usb_regs_base + 0x2000 && addr < self.chip.usb_regs_base + 0x2100 {
+                    let base = addr - 0x2000;
+                    let cur = self.mmio_regs.get(&base).copied().unwrap_or(0);
+                    self.mmio_regs.insert(base, cur | val);
+                    return;
+                }
+                if addr >= self.chip.usb_regs_base + 0x3000 && addr < self.chip.usb_regs_base + 0x3100 {
+                    let base = addr - 0x3000;
+                    let cur = self.mmio_regs.get(&base).copied().unwrap_or(0);
+                    self.mmio_regs.insert(base, cur & !val);
                     return;
                 }
                 self.mmio_regs.insert(addr, val);
@@ -798,6 +875,9 @@ entry:
                                 self.r[13] = addr;
                                 self.r[15] = pc + 2;
                             }
+                        } else if (hw1 & 0xFFE0) == 0xB660 {
+                            // CPSIE / CPSID (`0xB662` / `0xB672`)
+                            self.r[15] = pc + 2;
                         } else {
                             panic!("unhandled misc 0xBxxx instruction 0x{:04X} at 0x{:08X}", hw1, pc);
                         }
@@ -1090,10 +1170,28 @@ entry:
             assert_eq!(hw_emu.mmio_regs.get(&(chip.clocks_base + 0x3C)), Some(&1));
             assert_eq!(hw_emu.mmio_regs.get(&(chip.clocks_base + 0x48)), Some(&0x0880));
 
+            // Verify USBCTRL is ONLY unreset AFTER 48 MHz CLK_USB is enabled (required on cold POR!)
+            let clk_usb_en_idx = hw_emu
+                .mmio_write_log
+                .iter()
+                .position(|&(a, v)| a == chip.clocks_base + chip.clk_usb_ctrl_off && v == 0x0800)
+                .expect("CLK_USB_CTRL must be enabled (0x0800)");
+            let usb_unrst_idx = hw_emu
+                .mmio_write_log
+                .iter()
+                .position(|&(a, v)| {
+                    a == chip.resets_base + 0x3000 && (v & chip.resets_usbctrl_mask) != 0
+                })
+                .expect("USBCTRL must be unreset via RESETS+0x3000");
+            assert!(
+                clk_usb_en_idx < usb_unrst_idx,
+                "CLK_USB (48 MHz) must be enabled BEFORE unresetting USBCTRL for cold power-on boot"
+            );
+
             // B) QEMU / unmodeled-MMIO mode (`CS.LOCK == 0` forever): bounded timeout must NEVER hang
             //    AND must keep `CLK_SYS_CTRL` safely on `CLK_REF` (`0`) rather than switching to an unlocked PLL!
             let mut qemu_emu = ThumbCpuEmu::new(chip, flash, false);
-            qemu_emu.call_fn(&asm, "Reset_Handler", [0; 4], 2_000_000);
+            qemu_emu.call_fn(&asm, "Reset_Handler", [0; 4], 5_000_000);
             assert_eq!(qemu_emu.read32(chip.sram_base + SRAM_G_HEAP_PTR_OFF), chip.heap_start);
             assert_eq!(qemu_emu.mmio_regs.get(&(chip.clocks_base + 0x3C)), Some(&0));
         }
@@ -1515,5 +1613,1189 @@ entry:
             let got = emu.call_fn(&asm, "exercise_map_and_obj", [0; 4], 400_000) as i64;
             assert_eq!(got, 5407);
         }
+    }
+
+    // =========================================================================
+    // Wire-Accurate CYW43439 3-Wire gSPI + Backplane + Firmware/LED Slave Model
+    // =========================================================================
+    struct SimCyw43439 {
+        powered: bool,
+        gspi_strapped: bool,
+        bus_swapped: bool,
+        bus_ctrl: u32,
+        f1_resp_delay: usize,
+        spi_int: u16,
+        spi_int_en: u16,
+        backplane_window: u32,
+        clock_csr: u8,
+        sleep_csr: u8,
+        pull_up: u8,
+        f2_watermark: u8,
+        socram_ioctrl: u8,
+        socram_resetctrl: u8,
+        arm_ioctrl: u8,
+        arm_resetctrl: u8,
+        sram_bankx_idx: u32,
+        sram_bankx_pda: u32,
+        socsram: Vec<u8>,
+        cc_gpiocontrol: u32,
+        cc_gpioouten: u32,
+        cc_gpioout: u32,
+        cc_gpioout_history: Vec<u32>,
+        f2_gpio_history: Vec<(u32, u32)>,
+        f2_rx_packets: std::collections::VecDeque<Vec<u8>>,
+        tx_eth_frames: Vec<Vec<u8>>,
+        clm_received: Vec<u8>,
+        joined_ssid: String,
+        joined_psk: String,
+        rx_bits: Vec<u8>,
+        tx_bits: Vec<u8>,
+        tx_pos: usize,
+        cur_miso_bit: u8,
+        cmd_parsed: bool,
+        cur_cmd_wr: bool,
+        cur_cmd_fn: u32,
+        cur_cmd_addr: u32,
+        cur_cmd_sz: usize,
+    }
+
+    impl SimCyw43439 {
+        fn new() -> Self {
+            Self {
+                powered: false,
+                gspi_strapped: false,
+                bus_swapped: true,
+                bus_ctrl: 0,
+                f1_resp_delay: 0,
+                spi_int: 0x0001, // DATA_UNAVAILABLE at POR
+                spi_int_en: 0,
+                backplane_window: 0x1800_0000,
+                clock_csr: 0,
+                sleep_csr: 0,
+                pull_up: 0x0F,
+                f2_watermark: 0,
+                socram_ioctrl: 0,
+                socram_resetctrl: 1,
+                arm_ioctrl: 0,
+                arm_resetctrl: 0, // force host to exercise put-in-reset path too!
+                sram_bankx_idx: 0,
+                sram_bankx_pda: 0xFFFF_FFFF,
+                socsram: vec![0u8; 512 * 1024],
+                cc_gpiocontrol: 0xFFFF_FFFF,
+                cc_gpioouten: 0,
+                cc_gpioout: 0,
+                cc_gpioout_history: Vec::new(),
+                f2_gpio_history: Vec::new(),
+                f2_rx_packets: std::collections::VecDeque::new(),
+                tx_eth_frames: Vec::new(),
+                clm_received: Vec::new(),
+                joined_ssid: String::new(),
+                joined_psk: String::new(),
+                rx_bits: Vec::new(),
+                tx_bits: Vec::new(),
+                tx_pos: 0,
+                cur_miso_bit: 0,
+                cmd_parsed: false,
+                cur_cmd_wr: false,
+                cur_cmd_fn: 0,
+                cur_cmd_addr: 0,
+                cur_cmd_sz: 0,
+            }
+        }
+
+        fn swap16x2(x: u32) -> u32 {
+            ((x >> 8) & 0x00FF_00FF) | ((x & 0x00FF_00FF) << 8)
+        }
+
+        fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(bits.len() / 8);
+            for chunk in bits.chunks_exact(8) {
+                let mut b = 0u8;
+                for &bit in chunk {
+                    b = (b << 1) | (bit & 1);
+                }
+                out.push(b);
+            }
+            out
+        }
+
+        fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(bytes.len() * 8);
+            for &b in bytes {
+                for k in (0..8).rev() {
+                    out.push((b >> k) & 1);
+                }
+            }
+            out
+        }
+
+        fn gpio_in_word(&self, sio_out: u32, sio_oe: u32) -> u32 {
+            let mut w = sio_out & sio_oe;
+            if (sio_oe & (1 << 24)) == 0 {
+                if self.powered && self.gspi_strapped && self.cur_miso_bit != 0 {
+                    w |= 1 << 24;
+                } else {
+                    w &= !(1 << 24);
+                }
+            }
+            w
+        }
+
+        fn build_read_payload(&mut self, fn_num: u32, addr: u32, sz: usize) -> Vec<u8> {
+            let aligned = (sz + 3) & !3;
+            let mut resp = Vec::new();
+            if fn_num == 1 && !self.bus_swapped {
+                resp.resize(self.f1_resp_delay, 0u8);
+            }
+            match fn_num {
+                0 => {
+                    let val: u32 = match addr {
+                        0x0000 => self.bus_ctrl,
+                        0x0004 => self.spi_int as u32,
+                        0x0006 => self.spi_int_en as u32,
+                        0x0008 => {
+                            let mut st = 0u32;
+                            if self.arm_resetctrl == 0 && (self.arm_ioctrl & 1) != 0 {
+                                st |= 0x0000_0020; // STATUS_F2_RX_READY
+                            }
+                            if let Some(front) = self.f2_rx_packets.front() {
+                                let plen = (front.len() as u32) & 0x7FF;
+                                st |= 0x0000_0100 | (plen << 9); // STATUS_F2_PKT_AVAILABLE
+                            }
+                            st
+                        }
+                        0x0014 => 0xFEED_BEAD,
+                        _ => 0,
+                    };
+                    let word = if self.bus_swapped {
+                        Self::swap16x2(val)
+                    } else {
+                        val
+                    };
+                    resp.extend_from_slice(&word.to_le_bytes());
+                }
+                1 => {
+                    if addr >= 0x10000 {
+                        let b: u8 = match addr {
+                            0x10008 => self.f2_watermark,
+                            0x1000A => ((self.backplane_window >> 8) & 0xFF) as u8,
+                            0x1000B => ((self.backplane_window >> 16) & 0xFF) as u8,
+                            0x1000C => ((self.backplane_window >> 24) & 0xFF) as u8,
+                            0x1000E => {
+                                let mut c = self.clock_csr;
+                                if (c & 0x08) != 0 {
+                                    c |= 0x40; // SBSDIO_ALP_AVAIL
+                                }
+                                if self.arm_resetctrl == 0 && (self.arm_ioctrl & 1) != 0 {
+                                    c |= 0x80; // SBSDIO_HT_AVAIL
+                                }
+                                c
+                            }
+                            0x1000F => self.pull_up,
+                            0x1001F => self.sleep_csr,
+                            _ => 0,
+                        };
+                        resp.extend_from_slice(&(b as u32).to_le_bytes());
+                    } else {
+                        let full = self.backplane_window | (addr & 0x7FFF);
+                        let val: u32 = match full {
+                            0x1800_0000 => 0xA9AF, // CYW43439 chip ID (43439 = 0xA9AF)
+                            0x1800_0064 => self.cc_gpioout,
+                            0x1800_0068 => self.cc_gpioouten,
+                            0x1800_006C => self.cc_gpiocontrol,
+                            0x1810_3408 => self.arm_ioctrl as u32,
+                            0x1810_3800 => self.arm_resetctrl as u32,
+                            0x1810_4408 => self.socram_ioctrl as u32,
+                            0x1810_4800 => self.socram_resetctrl as u32,
+                            _ => 0,
+                        };
+                        resp.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+                2 => {
+                    let mut drain = vec![0u8; aligned.max(4)];
+                    if let Some(pkt) = self.f2_rx_packets.pop_front() {
+                        let n = drain.len().min(pkt.len());
+                        drain[..n].copy_from_slice(&pkt[..n]);
+                    }
+                    resp.extend_from_slice(&drain);
+                }
+                _ => {
+                    resp.resize(resp.len() + aligned.max(4), 0);
+                }
+            }
+            resp
+        }
+
+        fn commit_write(&mut self) {
+            if self.rx_bits.len() < 32 {
+                return;
+            }
+            let payload_bytes = Self::bits_to_bytes(&self.rx_bits[32..]);
+            if payload_bytes.is_empty() {
+                return;
+            }
+            match self.cur_cmd_fn {
+                0 => {
+                    if payload_bytes.len() >= 4 {
+                        let raw = u32::from_le_bytes(payload_bytes[0..4].try_into().unwrap());
+                        let val = if self.bus_swapped {
+                            Self::swap16x2(raw)
+                        } else {
+                            raw
+                        };
+                        match self.cur_cmd_addr {
+                            0x0000 => {
+                                self.bus_ctrl = val;
+                                if (val & 0x03) == 0x03 {
+                                    self.bus_swapped = false;
+                                }
+                            }
+                            0x0004 => {
+                                self.spi_int &= !(val as u16);
+                            }
+                            0x0006 => {
+                                self.spi_int_en = val as u16;
+                            }
+                            0x001D => {
+                                self.f1_resp_delay = (val & 0xFF) as usize;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                1 => {
+                    if self.cur_cmd_addr >= 0x10000 {
+                        let b = payload_bytes[0];
+                        match self.cur_cmd_addr {
+                            0x10008 => self.f2_watermark = b,
+                            0x1000A => {
+                                self.backplane_window =
+                                    (self.backplane_window & !0x0000_FF00) | ((b as u32) << 8);
+                            }
+                            0x1000B => {
+                                self.backplane_window =
+                                    (self.backplane_window & !0x00FF_0000) | ((b as u32) << 16);
+                            }
+                            0x1000C => {
+                                self.backplane_window =
+                                    (self.backplane_window & !0xFF00_0000) | ((b as u32) << 24);
+                            }
+                            0x1000E => self.clock_csr = b,
+                            0x1000F => self.pull_up = b,
+                            0x1001F => self.sleep_csr = b,
+                            _ => {}
+                        }
+                    } else {
+                        let full = self.backplane_window | (self.cur_cmd_addr & 0x7FFF);
+                        if full < (self.socsram.len() as u32) {
+                            let n = self.cur_cmd_sz.min(payload_bytes.len());
+                            let start = full as usize;
+                            self.socsram[start..start + n].copy_from_slice(&payload_bytes[..n]);
+                        } else if payload_bytes.len() >= 4 {
+                            let v32 = u32::from_le_bytes(payload_bytes[0..4].try_into().unwrap());
+                            let v8 = payload_bytes[0];
+                            match full {
+                                0x1800_0064 => {
+                                    self.cc_gpioout = v32;
+                                    self.cc_gpioout_history.push(v32);
+                                }
+                                0x1800_0068 => self.cc_gpioouten = v32,
+                                0x1800_006C => self.cc_gpiocontrol = v32,
+                                0x1800_4010 => self.sram_bankx_idx = v32,
+                                0x1800_4044 => self.sram_bankx_pda = v32,
+                                0x1810_3408 => self.arm_ioctrl = v8,
+                                0x1810_3800 => self.arm_resetctrl = v8,
+                                0x1810_4408 => self.socram_ioctrl = v8,
+                                0x1810_4800 => self.socram_resetctrl = v8,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                2 => {
+                    if payload_bytes.len() >= 12 {
+                        let s_len = u16::from_le_bytes([payload_bytes[0], payload_bytes[1]]) as usize;
+                        let s_not = u16::from_le_bytes([payload_bytes[2], payload_bytes[3]]);
+                        assert_eq!((s_len as u16) ^ s_not, 0xFFFF);
+                        let chan = payload_bytes[5] & 0x0F;
+                        let hdrlen = payload_bytes[7] as usize;
+                        if chan == 0 && payload_bytes.len() >= hdrlen + 16 {
+                            let cmd = u32::from_le_bytes(
+                                payload_bytes[hdrlen..hdrlen + 4].try_into().unwrap(),
+                            );
+                            let outlen = u16::from_le_bytes([
+                                payload_bytes[hdrlen + 4],
+                                payload_bytes[hdrlen + 5],
+                            ]) as usize;
+                            let flags = u32::from_le_bytes(
+                                payload_bytes[hdrlen + 8..hdrlen + 12].try_into().unwrap(),
+                            );
+                            let req_id_hi = flags & 0xFFFF_0000;
+                            let io_pay = &payload_bytes[hdrlen + 16..s_len.min(payload_bytes.len())];
+                            let mut resp_pay = vec![0u8; outlen];
+
+                            if cmd == 263 && io_pay.starts_with(b"gpioout\0") && io_pay.len() >= 16 {
+                                let mask = u32::from_le_bytes(io_pay[8..12].try_into().unwrap());
+                                let val = u32::from_le_bytes(io_pay[12..16].try_into().unwrap());
+                                self.f2_gpio_history.push((mask, val));
+                            } else if cmd == 263 && io_pay.starts_with(b"clmload\0") && io_pay.len() >= 20 {
+                                let clen = u32::from_le_bytes(io_pay[12..16].try_into().unwrap()) as usize;
+                                self.clm_received.extend_from_slice(&io_pay[20..20 + clen]);
+                            } else if cmd == 262 && io_pay.starts_with(b"cur_etheraddr\0") {
+                                resp_pay[0..6].copy_from_slice(&[0x28, 0xCD, 0xC1, 0x11, 0x22, 0x33]);
+                            } else if cmd == 268 && io_pay.len() >= 68 {
+                                let klen = u16::from_le_bytes([io_pay[0], io_pay[1]]) as usize;
+                                self.joined_psk = String::from_utf8_lossy(&io_pay[4..4 + klen]).to_string();
+                            } else if cmd == 26 && io_pay.len() >= 36 {
+                                let slen = u32::from_le_bytes(io_pay[0..4].try_into().unwrap()) as usize;
+                                self.joined_ssid = String::from_utf8_lossy(&io_pay[4..4 + slen]).to_string();
+                            }
+
+                            // Queue SDPCM CONTROL response with matching req_id!
+                            let ack_len = 28 + resp_pay.len();
+                            let mut ack = vec![0u8; ack_len];
+                            ack[0..2].copy_from_slice(&(ack_len as u16).to_le_bytes());
+                            ack[2..4].copy_from_slice(&(!(ack_len as u16)).to_le_bytes());
+                            ack[5] = 0; // CONTROL
+                            ack[7] = 12;
+                            ack[12..16].copy_from_slice(&cmd.to_le_bytes());
+                            ack[16..18].copy_from_slice(&(resp_pay.len() as u16).to_le_bytes());
+                            ack[20..24].copy_from_slice(&req_id_hi.to_le_bytes());
+                            ack[28..].copy_from_slice(&resp_pay);
+                            self.f2_rx_packets.push_back(ack);
+
+                            // If WLC_SET_SSID (26) just ran, queue WLC_E_LINK (16) + WLC_E_PSK_SUP (46, status=6)!
+                            if cmd == 26 {
+                                self.push_async_event(16, 1, 0); // EV_LINK (flags=1 LINK_UP)
+                                self.push_async_event(46, 0, 6); // EV_PSK_SUP (status=6 KEYED)
+                            }
+                        } else if chan == 2 && s_len >= hdrlen + 4 {
+                            let doff = payload_bytes[hdrlen + 3] as usize;
+                            let eth_off = hdrlen + 4 + doff * 4;
+                            if s_len > eth_off && s_len <= payload_bytes.len() {
+                                let eth = payload_bytes[eth_off..s_len].to_vec();
+                                self.on_eth_tx_from_mcu(&eth);
+                                self.tx_eth_frames.push(eth);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn on_sio_transition(&mut self, prev_out: u32, _prev_oe: u32, new_out: u32, new_oe: u32) {
+            let prev_on = (prev_out >> 23) & 1;
+            let new_on = (new_out >> 23) & 1;
+            if prev_on == 0 && new_on == 1 {
+                self.powered = true;
+                // CYW43439 straps into gSPI mode ONLY if WL_DIO (GP24) is LOW when WL_REG_ON rises!
+                let dio_high = (new_oe & (1 << 24)) != 0 && (new_out & (1 << 24)) != 0;
+                self.gspi_strapped = !dio_high;
+                self.bus_swapped = true;
+            } else if new_on == 0 {
+                self.powered = false;
+            }
+
+            if !self.powered || !self.gspi_strapped {
+                return;
+            }
+
+            let prev_cs = (prev_out >> 25) & 1;
+            let new_cs = (new_out >> 25) & 1;
+            if prev_cs == 1 && new_cs == 0 {
+                self.rx_bits.clear();
+                self.tx_bits.clear();
+                self.tx_pos = 0;
+                self.cur_miso_bit = 0;
+                self.cmd_parsed = false;
+                return;
+            }
+            if prev_cs == 0 && new_cs == 1 {
+                if self.cmd_parsed && self.cur_cmd_wr {
+                    self.commit_write();
+                }
+                self.cur_miso_bit = 0;
+                return;
+            }
+
+            if new_cs == 0 {
+                let prev_clk = (prev_out >> 29) & 1;
+                let new_clk = (new_out >> 29) & 1;
+                // Rising edge: sample MOSI during command/write phase
+                if prev_clk == 0 && new_clk == 1 && self.tx_bits.is_empty() {
+                    assert_ne!(
+                        new_oe & (1 << 24),
+                        0,
+                        "GP24 (WL_DIO) must be output-enabled during gSPI write clock rising edge"
+                    );
+                    let mosi = ((new_out >> 24) & 1) as u8;
+                    self.rx_bits.push(mosi);
+                    if self.rx_bits.len() == 32 && !self.cmd_parsed {
+                        self.cmd_parsed = true;
+                        let cmd_bytes = Self::bits_to_bytes(&self.rx_bits);
+                        let raw_u32 = u32::from_le_bytes(cmd_bytes.try_into().unwrap());
+                        let cmd = if self.bus_swapped {
+                            Self::swap16x2(raw_u32)
+                        } else {
+                            raw_u32
+                        };
+                        self.cur_cmd_wr = ((cmd >> 31) & 1) != 0;
+                        self.cur_cmd_fn = (cmd >> 28) & 3;
+                        self.cur_cmd_addr = (cmd >> 11) & 0x1FFFF;
+                        self.cur_cmd_sz = (cmd & 0x7FF) as usize;
+                        if !self.cur_cmd_wr {
+                            let resp = self.build_read_payload(
+                                self.cur_cmd_fn,
+                                self.cur_cmd_addr,
+                                self.cur_cmd_sz,
+                            );
+                            self.tx_bits = Self::bytes_to_bits(&resp);
+                            self.tx_pos = 0;
+                        }
+                    }
+                }
+                // Falling edge: shift out MISO in normal-speed mode (starting on 32nd falling edge!)
+                if prev_clk == 1 && new_clk == 0 && !self.tx_bits.is_empty() {
+                    self.cur_miso_bit = self.tx_bits.get(self.tx_pos).copied().unwrap_or(0);
+                    self.tx_pos += 1;
+                }
+            }
+        }
+
+        fn push_async_event(&mut self, event_type: u32, flags: u16, status: u32) {
+            // 14B SDPCM+pad + 4B BDC + 48B ETHER+BCMETH+EVENT_HDR = 66 bytes (pad to 68)
+            let s_len = 66usize;
+            let mut pkt = vec![0u8; 68];
+            pkt[0..2].copy_from_slice(&(s_len as u16).to_le_bytes());
+            pkt[2..4].copy_from_slice(&(!(s_len as u16)).to_le_bytes());
+            pkt[5] = 1;  // ASYNCEVENT_HEADER
+            pkt[7] = 14; // hdrlen
+            pkt[14] = 0x20;
+            let eth = &mut pkt[18..];
+            eth[12..14].copy_from_slice(&0x886Cu16.to_be_bytes());
+            eth[26..28].copy_from_slice(&flags.to_be_bytes());
+            eth[28..32].copy_from_slice(&event_type.to_be_bytes());
+            eth[32..36].copy_from_slice(&status.to_be_bytes());
+            self.f2_rx_packets.push_back(pkt);
+        }
+
+        fn push_eth_rx_to_mcu(&mut self, eth_frame: &[u8]) {
+            let s_len = 18 + eth_frame.len();
+            let aligned = (s_len + 3) & !3;
+            let mut pkt = vec![0u8; aligned];
+            pkt[0..2].copy_from_slice(&(s_len as u16).to_le_bytes());
+            pkt[2..4].copy_from_slice(&(!(s_len as u16)).to_le_bytes());
+            pkt[5] = 2;  // DATA_HEADER
+            pkt[7] = 14; // hdrlen
+            pkt[14] = 0x20;
+            pkt[18..18 + eth_frame.len()].copy_from_slice(eth_frame);
+            self.f2_rx_packets.push_back(pkt);
+        }
+
+        fn on_eth_tx_from_mcu(&mut self, eth: &[u8]) {
+            // Auto-respond to DHCP DISCOVER (1) -> OFFER (2) and REQUEST (3) -> ACK (5)!
+            if eth.len() >= 42 + 240 && eth[12..14] == [0x08, 0x00] && eth[23] == 17 {
+                let sport = u16::from_be_bytes([eth[34], eth[35]]);
+                let dport = u16::from_be_bytes([eth[36], eth[37]]);
+                if sport == 68 && dport == 67 {
+                    let dhcp = &eth[42..];
+                    assert_eq!(&dhcp[236..240], &[99, 130, 83, 99]);
+                    let mut mtype = 0u8;
+                    let mut pos = 240usize;
+                    while pos < dhcp.len() && dhcp[pos] != 255 {
+                        if dhcp[pos] == 0 {
+                            pos += 1;
+                            continue;
+                        }
+                        let olen = dhcp[pos + 1] as usize;
+                        if dhcp[pos] == 53 && olen >= 1 {
+                            mtype = dhcp[pos + 2];
+                        }
+                        pos += 2 + olen;
+                    }
+                    let reply_type = if mtype == 1 {
+                        2u8 // DHCPOFFER
+                    } else if mtype == 3 {
+                        5u8 // DHCPACK
+                    } else {
+                        0u8
+                    };
+                    if reply_type != 0 {
+                        let mut rep = vec![0u8; 42 + 272];
+                        // Ethernet: router AA:BB:CC:DD:EE:01 -> MCU 28:CD:C1:11:22:33
+                        rep[0..6].copy_from_slice(&eth[6..12]);
+                        rep[6..12].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
+                        rep[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+                        // IPv4: 192.168.1.1 -> 192.168.1.222
+                        let ip = &mut rep[14..34];
+                        ip[0] = 0x45;
+                        ip[2..4].copy_from_slice(&((20 + 8 + 272) as u16).to_be_bytes());
+                        ip[8] = 64;
+                        ip[9] = 17;
+                        ip[12..16].copy_from_slice(&[192, 168, 1, 1]);
+                        ip[16..20].copy_from_slice(&[192, 168, 1, 222]);
+                        // UDP: 67 -> 68
+                        rep[34..36].copy_from_slice(&67u16.to_be_bytes());
+                        rep[36..38].copy_from_slice(&68u16.to_be_bytes());
+                        rep[38..40].copy_from_slice(&((8 + 272) as u16).to_be_bytes());
+                        // BOOTP / DHCP reply
+                        let d = &mut rep[42..];
+                        d[0] = 2; // BOOTREPLY
+                        d[1] = 1;
+                        d[2] = 6;
+                        d[4..8].copy_from_slice(&dhcp[4..8]); // xid
+                        d[16..20].copy_from_slice(&[192, 168, 1, 222]); // yiaddr
+                        d[28..34].copy_from_slice(&dhcp[28..34]); // chaddr
+                        d[236..240].copy_from_slice(&[99, 130, 83, 99]);
+                        let mut o = 240usize;
+                        d[o..o + 3].copy_from_slice(&[53, 1, reply_type]);
+                        o += 3;
+                        d[o..o + 6].copy_from_slice(&[54, 4, 192, 168, 1, 1]); // Server ID
+                        o += 6;
+                        d[o..o + 6].copy_from_slice(&[1, 4, 255, 255, 255, 0]); // Subnet
+                        o += 6;
+                        d[o..o + 6].copy_from_slice(&[3, 4, 192, 168, 1, 1]); // Router
+                        o += 6;
+                        d[o] = 255;
+                        self.push_eth_rx_to_mcu(&rep);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cyw43439_pico2w_gspi_fw_boot_and_led_blink() {
+        let ir = r#"
+target triple = "thumbv8m.main-none-eabihf"
+
+declare i64 @cyw43_led_init()
+declare i64 @cyw43_led_put(i64)
+
+define i64 @run_blink_cycle() {
+entry:
+  %rc = call i64 @cyw43_led_init()
+  %ok = icmp eq i64 %rc, 0
+  br i1 %ok, label %do_blink, label %fail
+
+fail:
+  ret i64 %rc
+
+do_blink:
+  %p1 = call i64 @cyw43_led_put(i64 1)
+  %p0 = call i64 @cyw43_led_put(i64 0)
+  %p2 = call i64 @cyw43_led_put(i64 1)
+  ret i64 42
+}
+
+define i32 @main(i32 %argc, i8** %argv) {
+entry:
+  ret i32 0
+}
+"#;
+        for chip in [RpChipProfile::rp2040(), RpChipProfile::rp2350()] {
+            let (flash, asm) = compile_llvm_ir_to_flash_image(ir, &chip)
+                .expect("failed to compile CYW43439 Pico W / Pico 2 W firmware");
+            assert!(
+                flash.len() > cyw43_fw::CYW43_43439_FW_BLOB.len(),
+                "CYW43439 firmware blob must be linked into Flash .rodata"
+            );
+
+            let mut emu = ThumbCpuEmu::new(chip, flash, true);
+            emu.init_heap_only();
+            emu.cyw43_slave = Some(SimCyw43439::new());
+
+            let ret = emu.call_fn(&asm, "run_blink_cycle", [0; 4], 80_000_000) as i64;
+            assert_eq!(ret, 42, "cyw43_led_init failed with error code {}", ret);
+
+            // Verify GP24 pad (`pads_bank0_base + 0x64`) was configured with pull-down (`0x76`), NOT pull-up (`0x7A`), and ISO=0!
+            let gp24_pad = emu.mmio_regs.get(&(chip.pads_bank0_base + 0x64)).copied().unwrap_or(0);
+            assert_eq!(gp24_pad, 0x76, "GP24 pad must be pull-down + 12mA + Schmitt + ISO=0");
+
+            let cyw = emu.cyw43_slave.as_ref().unwrap();
+            assert!(cyw.gspi_strapped);
+            assert!(!cyw.bus_swapped);
+            assert_eq!(cyw.f1_resp_delay, 4);
+            assert_eq!(cyw.sram_bankx_idx, 3);
+            assert_eq!(cyw.sram_bankx_pda, 0);
+            assert_eq!(cyw.arm_resetctrl, 0);
+            assert_eq!(cyw.arm_ioctrl, 1);
+
+            // Byte-for-byte verification of all 224,192 bytes of CYW43439 A0 firmware in SOCSRAM[0..224192]!
+            assert_eq!(
+                &cyw.socsram[0..cyw43_fw::CYW43_43439_FW_BLOB.len()],
+                cyw43_fw::CYW43_43439_FW_BLOB,
+                "SOCSRAM firmware image mismatch!"
+            );
+
+            // Byte-for-byte verification of all 744 bytes of NVRAM at 0x7FD14 + size token at 0x7FFFC!
+            let nv_len = cyw43_fw::CYW43_43439_NVRAM_BLOB.len();
+            let nv_base = 512 * 1024 - 4 - nv_len;
+            assert_eq!(
+                &cyw.socsram[nv_base..nv_base + nv_len],
+                cyw43_fw::CYW43_43439_NVRAM_BLOB,
+                "SOCSRAM NVRAM image mismatch!"
+            );
+            let tok = u32::from_le_bytes(cyw.socsram[0x7FFFC..0x80000].try_into().unwrap());
+            assert_eq!(tok, 0xFF45_00BA);
+
+            // Verify BOTH SDPCM/BCDC WLC_SET_VAR "gpioout" packets AND ChipCommon GPIOOUT registers toggled 1 -> 0 -> 1!
+            assert_eq!(cyw.f2_gpio_history, vec![(1, 1), (1, 0), (1, 1)]);
+            assert_eq!(cyw.cc_gpioouten, 1);
+            assert_eq!(cyw.cc_gpioout_history, vec![1, 0, 1]);
+            assert!(cyw.f2_rx_packets.is_empty(), "F2 RX ack queue must be drained");
+        }
+    }
+
+    fn build_host_tcp_frame(
+        mcu_mac: [u8; 6],
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 14 + 20 + 20 + payload.len()];
+        pkt[0..6].copy_from_slice(&mcu_mac);
+        pkt[6..12].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x95]);
+        pkt[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        pkt[14] = 0x45;
+        pkt[16..18].copy_from_slice(&((20 + 20 + payload.len()) as u16).to_be_bytes());
+        pkt[22] = 64;
+        pkt[23] = 6; // TCP
+        pkt[26..30].copy_from_slice(&[192, 168, 1, 149]);
+        pkt[30..34].copy_from_slice(&[192, 168, 1, 222]);
+        pkt[34..36].copy_from_slice(&sport.to_be_bytes());
+        pkt[36..38].copy_from_slice(&dport.to_be_bytes());
+        pkt[38..42].copy_from_slice(&seq.to_be_bytes());
+        pkt[42..46].copy_from_slice(&ack.to_be_bytes());
+        pkt[46] = 5 << 4;
+        pkt[47] = flags;
+        pkt[48..50].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[54..].copy_from_slice(payload);
+        pkt
+    }
+
+    fn verify_ones_complement_zero(bytes: &[u8], initial: u32) -> u16 {
+        let mut sum = initial;
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            sum += (bytes[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        (!sum) as u16
+    }
+
+    #[test]
+    fn test_cyw43439_wifi_dhcp_and_rfc6455_websocket_port_1424() {
+        let ir = r#"
+target triple = "thumbv8m.main-none-eabihf"
+
+@.ssid = private unnamed_addr constant [13 x i8] c"OmniTestSSID\00", align 1
+@.psk  = private unnamed_addr constant [17 x i8] c"OmniTestPass1234\00", align 1
+@.rep  = private unnamed_addr constant [10 x i8] c"PONG_1424\00", align 1
+
+declare i64 @wifi_connect(i64, i64)
+declare i8* @wifi_ip()
+declare i64 @ws_listen(i64)
+declare i8* @ws_poll()
+declare i64 @ws_send(i64)
+declare i64 @ws_is_open()
+
+define i64 @step_connect_and_listen() {
+entry:
+  %s0 = ptrtoint [13 x i8]* @.ssid to i64
+  %p0 = ptrtoint [17 x i8]* @.psk to i64
+  %ip = call i64 @wifi_connect(i64 %s0, i64 %p0)
+  %l = call i64 @ws_listen(i64 1424)
+  ret i64 %ip
+}
+
+define i8* @step_ip_str() {
+entry:
+  %p = call i8* @wifi_ip()
+  ret i8* %p
+}
+
+define i8* @step_poll() {
+entry:
+  %m = call i8* @ws_poll()
+  ret i8* %m
+}
+
+define i64 @step_send_pong() {
+entry:
+  %r = ptrtoint [10 x i8]* @.rep to i64
+  %n = call i64 @ws_send(i64 %r)
+  ret i64 %n
+}
+
+define i32 @main(i32 %argc, i8** %argv) {
+entry:
+  ret i32 0
+}
+"#;
+        let chip = RpChipProfile::rp2350();
+        let (flash, asm) = compile_llvm_ir_to_flash_image(ir, &chip)
+            .expect("failed to compile Pico 2 W WebSocket firmware");
+
+        let mut emu = ThumbCpuEmu::new(chip, flash, true);
+        emu.init_heap_only();
+        emu.cyw43_slave = Some(SimCyw43439::new());
+
+        // 1) Connect to "OmniTestSSID" + acquire DHCP IP 192.168.1.222 + listen on :1424!
+        let ip_u32 = emu.call_fn(&asm, "step_connect_and_listen", [0; 4], 120_000_000) as u32;
+        assert_eq!(ip_u32, 0xC0A8_01DE, "expected 192.168.1.222 (0xC0A801DE)");
+
+        let ip_ptr = emu.call_fn(&asm, "step_ip_str", [0; 4], 50_000) as u32;
+        assert_eq!(emu.read_cstr(ip_ptr), "192.168.1.222");
+
+        {
+            let cyw = emu.cyw43_slave.as_ref().unwrap();
+            assert_eq!(cyw.clm_received, cyw43_fw::CYW43_43439_CLM_BLOB);
+            assert_eq!(cyw.joined_ssid, "OmniTestSSID");
+            assert_eq!(cyw.joined_psk, "OmniTestPass1234");
+            let has_beacon = cyw.tx_eth_frames.iter().any(|f| {
+                f.len() > 42
+                    && String::from_utf8_lossy(&f[42..])
+                        .contains("OMNI_PICO2W ip=192.168.1.222 ws_port=1424")
+            });
+            assert!(has_beacon, "expected UDP :1425 discovery beacon");
+        }
+
+        // 2) TCP 3-way handshake on port 1424 + verify IPv4 & TCP checksums on MCU's SYN|ACK!
+        let mcu_mac = [0x28, 0xCD, 0xC1, 0x11, 0x22, 0x33];
+        let mut host_seq: u32 = 0x4000_1000;
+        let syn_pkt = build_host_tcp_frame(mcu_mac, 54321, 1424, host_seq, 0, 0x02, &[]);
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&syn_pkt);
+        let idle = emu.call_fn(&asm, "step_poll", [0; 4], 500_000) as u32;
+        assert_eq!(emu.read_cstr(idle), "");
+
+        let syn_ack = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .last()
+            .expect("expected SYN|ACK frame")
+            .clone();
+        assert_eq!(verify_ones_complement_zero(&syn_ack[14..34], 0), 0, "bad IPv4 checksum");
+        let tcp_len = syn_ack.len() - 34;
+        let pseudo = u16::from_be_bytes([syn_ack[26], syn_ack[27]]) as u32
+            + u16::from_be_bytes([syn_ack[28], syn_ack[29]]) as u32
+            + u16::from_be_bytes([syn_ack[30], syn_ack[31]]) as u32
+            + u16::from_be_bytes([syn_ack[32], syn_ack[33]]) as u32
+            + 6
+            + (tcp_len as u32);
+        assert_eq!(verify_ones_complement_zero(&syn_ack[34..], pseudo), 0, "bad TCP checksum");
+        assert_eq!(syn_ack[47], 0x12); // SYN|ACK
+        let mcu_isn = u32::from_be_bytes(syn_ack[38..42].try_into().unwrap());
+        let mut mcu_seq = mcu_isn.wrapping_add(1);
+        host_seq = host_seq.wrapping_add(1);
+
+        // 3) Send ACK + RFC 6455 HTTP Upgrade request (using official RFC 6455 test vector key!)
+        let ack_pkt = build_host_tcp_frame(mcu_mac, 54321, 1424, host_seq, mcu_seq, 0x10, &[]);
+        let http_req = b"GET / HTTP/1.1\r\nHost: 192.168.1.222:1424\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let upgrade_pkt = build_host_tcp_frame(mcu_mac, 54321, 1424, host_seq, mcu_seq, 0x18, http_req);
+        host_seq = host_seq.wrapping_add(http_req.len() as u32);
+
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&ack_pkt);
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&upgrade_pkt);
+        let _ = emu.call_fn(&asm, "step_poll", [0; 4], 2_000_000);
+
+        let http_101 = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .last()
+            .expect("expected HTTP 101 Switching Protocols")
+            .clone();
+        let http_101_str = String::from_utf8_lossy(&http_101[54..]);
+        assert!(
+            http_101_str.contains("HTTP/1.1 101 Switching Protocols\r\n"),
+            "missing 101 status: {}",
+            http_101_str
+        );
+        assert!(
+            http_101_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"),
+            "RFC 6455 SHA-1 Sec-WebSocket-Accept mismatch: {}",
+            http_101_str
+        );
+        mcu_seq = mcu_seq.wrapping_add((http_101.len() - 54) as u32);
+        assert_eq!(emu.call_fn(&asm, "ws_is_open", [0; 4], 50_000), 1);
+
+        // 4) Send masked RFC 6455 client Text frame ("status") and verify `ws_poll()` + `ws_send("PONG_1424")`!
+        let mask = [0x37u8, 0xFA, 0x21, 0x3D];
+        let plain = b"status";
+        let mut ws_frame = vec![0x81u8, 0x80 | (plain.len() as u8)];
+        ws_frame.extend_from_slice(&mask);
+        for (i, &b) in plain.iter().enumerate() {
+            ws_frame.push(b ^ mask[i & 3]);
+        }
+        let data_pkt = build_host_tcp_frame(mcu_mac, 54321, 1424, host_seq, mcu_seq, 0x18, &ws_frame);
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&data_pkt);
+
+        let rx_msg_ptr = emu.call_fn(&asm, "step_poll", [0; 4], 1_000_000) as u32;
+        assert_eq!(emu.read_cstr(rx_msg_ptr), "status");
+
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        let sent_n = emu.call_fn(&asm, "step_send_pong", [0; 4], 1_000_000);
+        assert_eq!(sent_n, 9);
+
+        let pong_eth = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .last()
+            .expect("expected server WebSocket Text frame")
+            .clone();
+        assert_eq!(verify_ones_complement_zero(&pong_eth[14..34], 0), 0);
+        assert_eq!(&pong_eth[54..56], &[0x81, 0x09]);
+        assert_eq!(&pong_eth[56..65], b"PONG_1424");
+    }
+
+    #[test]
+    fn test_usb_cdc_acm_enumeration_ttyacm_output_and_1200_baud_bootsel() {
+        let ir = r#"
+@.boot = private unnamed_addr constant [12 x i8] c"BOOT_LOG_OK\00", align 1
+@.live = private unnamed_addr constant [12 x i8] c"WS RX: ping\00", align 1
+
+declare void @__omni_print_str(i8*)
+declare i64 @usb_cdc_getc()
+
+define i64 @print_live() {
+entry:
+  call void @__omni_print_str(i8* getelementptr inbounds ([12 x i8], [12 x i8]* @.live, i64 0, i64 0))
+  ret i64 0
+}
+
+define i32 @main(i32 %argc, i8** %argv) {
+entry:
+  call void @__omni_print_str(i8* getelementptr inbounds ([12 x i8], [12 x i8]* @.boot, i64 0, i64 0))
+  ret i32 0
+}
+"#;
+        for chip in [RpChipProfile::rp2040(), RpChipProfile::rp2350()] {
+            let (flash, asm) = compile_llvm_ir_to_flash_image(ir, &chip).unwrap();
+            let mut emu = ThumbCpuEmu::new(chip, flash, true);
+
+            // Verify Vector Table slot `16 + usbctrl_irq_num` points to `USBCTRL_ISR | 1`!
+            let vt_off = *asm.symbols.get("__vector_table").unwrap() as u32;
+            let usb_isr_off = *asm.symbols.get("USBCTRL_ISR").unwrap() as u32;
+            let vec_word = emu.read32(chip.flash_base + vt_off + (16 + chip.usbctrl_irq_num) * 4);
+            assert_eq!(vec_word, (chip.flash_base + usb_isr_off) | 1);
+
+            // 1) Run full `Reset_Handler` -> `@main` (prints `"BOOT_LOG_OK\n"` BEFORE USB enumeration!)
+            emu.call_fn(&asm, "Reset_Handler", [0; 4], 500_000);
+            assert_eq!(
+                emu.mmio_regs.get(&0xE000_ED08).copied(),
+                Some(chip.flash_base + vt_off),
+                "SCB->VTOR must anchor to __vector_table"
+            );
+            assert_eq!(
+                emu.mmio_regs.get(&(chip.clocks_base + chip.clk_usb_ctrl_off)).copied(),
+                Some(0x0800),
+                "CLK_USB must be enabled on PLL_USB"
+            );
+            assert_eq!(
+                emu.mmio_regs.get(&(chip.usb_regs_base + 0x4C)).copied(),
+                Some(0x2001_0000),
+                "SIE_CTRL must assert EP0_INT_1BUF | PULLUP_EN"
+            );
+            assert_eq!(
+                emu.mmio_regs.get(&0xE000_E100).copied(),
+                Some(1u32 << chip.usbctrl_irq_num),
+                "NVIC_ISER0 must enable USBCTRL_IRQ"
+            );
+            assert_eq!(String::from_utf8_lossy(&emu.uart_tx), "BOOT_LOG_OK\n");
+            // Early boot output ("BOOT_LOG_OK\r\n" = 13 bytes) must already sit in USB DPRAM TX ring!
+            assert_eq!(emu.read32(0x5010_02B0), 13);
+            assert_eq!(emu.read32(0x5010_02B4), 0);
+
+            let fire_usb_isr = |emu: &mut ThumbCpuEmu, ints: u32| {
+                emu.mmio_regs.insert(0x5011_0098, ints);
+                emu.call_fn(&asm, "USBCTRL_ISR", [0; 4], 200_000);
+                emu.mmio_regs.insert(0x5011_0098, 0);
+            };
+            let send_setup = |emu: &mut ThumbCpuEmu, pkt: [u8; 8]| {
+                for (i, b) in pkt.into_iter().enumerate() {
+                    emu.write8(0x5010_0000 + (i as u32), b);
+                }
+                emu.mmio_regs.insert(0x5011_0050, 0x0002_0000); // SETUP_REC
+                fire_usb_isr(emu, 0x0001_0000); // USB_INTS_SETUP_REQ
+            };
+
+            // 2) Host sends BUS_RESET -> early boot `tx_head == 13` MUST be preserved!
+            emu.mmio_regs.insert(0x5011_0050, 0x0008_0000);
+            fire_usb_isr(&mut emu, 0x0000_1000);
+            assert_eq!(emu.read32(0x5010_02B0), 13);
+
+            // 3) Host sends GET_DESCRIPTOR(Device, wLength=64) -> verify 18-byte `2e8a:000a` descriptor!
+            send_setup(&mut emu, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 64, 0]);
+            let ep0_in_ctrl = emu.read32(0x5010_0080);
+            assert_eq!(ep0_in_ctrl, 0x8000 | 0x2000 | 0x0400 | 18);
+            assert_eq!(&emu.usb_dpram[0x100..0x112], &usb_cdc_fw::USB_DEV_DESC);
+            // Complete EP0_IN + Status ZLP OUT
+            emu.write32(0x5010_0080, 0);
+            emu.mmio_regs.insert(0x5011_0058, 3);
+            fire_usb_isr(&mut emu, 0x0000_0010);
+
+            // 4) Host sends SET_ADDRESS(5) -> deferred until Status ZLP IN finishes!
+            send_setup(&mut emu, [0x00, 0x05, 5, 0x00, 0x00, 0x00, 0, 0]);
+            assert_eq!(emu.mmio_regs.get(&0x5011_0000).copied().unwrap_or(0), 0);
+            emu.write32(0x5010_0080, 0);
+            emu.mmio_regs.insert(0x5011_0058, 1); // EP0_IN ZLP complete
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            assert_eq!(emu.mmio_regs.get(&0x5011_0000).copied(), Some(5));
+
+            // 5) Host sends GET_DESCRIPTOR(Configuration, wLength=255) -> 2 packets: 64B (DATA1) + 3B (DATA0)!
+            send_setup(&mut emu, [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 255, 0]);
+            assert_eq!(emu.read32(0x5010_0080), 0x8000 | 0x2000 | 0x0400 | 64);
+            let mut rx_cfg = Vec::new();
+            rx_cfg.extend_from_slice(&emu.usb_dpram[0x100..0x140]);
+            // Host consumes packet #1 -> ISR arms packet #2 (3 bytes, DATA0)
+            emu.write32(0x5010_0080, 0);
+            emu.mmio_regs.insert(0x5011_0058, 1);
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            assert_eq!(emu.read32(0x5010_0080), 0x8000 | 0x0000 | 0x0400 | 3);
+            rx_cfg.extend_from_slice(&emu.usb_dpram[0x100..0x103]);
+            assert_eq!(rx_cfg.as_slice(), &usb_cdc_fw::USB_CFG_DESC);
+            emu.write32(0x5010_0080, 0);
+            emu.mmio_regs.insert(0x5011_0058, 3);
+            fire_usb_isr(&mut emu, 0x0000_0010);
+
+            // 6) Host sends SET_CONFIGURATION(1) + opens `/dev/ttyACM0` via SET_CONTROL_LINE_STATE(DTR=1)!
+            send_setup(&mut emu, [0x00, 0x09, 1, 0x00, 0x00, 0x00, 0, 0]);
+            emu.write32(0x5010_0080, 0);
+            emu.mmio_regs.insert(0x5011_0058, 1);
+            fire_usb_isr(&mut emu, 0x0000_0010);
+
+            send_setup(&mut emu, [0x21, 0x22, 0x01, 0x00, 0x00, 0x00, 0, 0]);
+            // Early boot log `"BOOT_LOG_OK\r\n"` MUST immediately flush onto `EP2_IN` (`0x5010_0200`)!
+            let ep2_ctrl = emu.read32(0x5010_0090);
+            assert_eq!(ep2_ctrl, 0x8000 | 0x0000 | 0x0400 | 13);
+            assert_eq!(&emu.usb_dpram[0x200..0x20D], b"BOOT_LOG_OK\r\n");
+
+            // Host consumes `EP2_IN` packet #1
+            emu.write32(0x5010_0090, 0);
+            emu.mmio_regs.insert(0x5011_0058, 17); // EP0_IN ZLP + EP2_IN complete
+            fire_usb_isr(&mut emu, 0x0000_0010);
+
+            // 7) Live `print("WS RX: ping")`: 1st char `'W'` kicks idle `EP2_IN` immediately (`DATA1`, len 1),
+            //    while remaining 12 bytes `"S RX: ping\r\n"` coalesce in `tx_ring` and drain on `BUFF_STATUS` (`DATA0`, len 12)!
+            emu.call_fn(&asm, "print_live", [0; 4], 200_000);
+            assert_eq!(emu.read32(0x5010_0090), 0x8000 | 0x2000 | 0x0400 | 1);
+            assert_eq!(&emu.usb_dpram[0x200..0x201], b"W");
+            emu.write32(0x5010_0090, 0);
+            emu.mmio_regs.insert(0x5011_0058, 16); // EP2_IN complete -> ISR pumps coalesced 12 bytes!
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            assert_eq!(emu.read32(0x5010_0090), 0x8000 | 0x0000 | 0x0400 | 12);
+            assert_eq!(&emu.usb_dpram[0x200..0x20C], b"S RX: ping\r\n");
+
+            // 8) Host writes `"ok"` to `/dev/ttyACM0` (`EP2_OUT` at `0x5010_0240`) -> `usb_cdc_getc()` reads it!
+            emu.usb_dpram[0x240..0x242].copy_from_slice(b"ok");
+            emu.write32(0x5010_0094, 0x8000 | 2);
+            emu.mmio_regs.insert(0x5011_0058, 32); // EP2_OUT bit 5
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            assert_eq!(emu.call_fn(&asm, "usb_cdc_getc", [0; 4], 50_000), b'o' as u64);
+            assert_eq!(emu.call_fn(&asm, "usb_cdc_getc", [0; 4], 50_000), b'k' as u64);
+            assert_eq!(emu.call_fn(&asm, "usb_cdc_getc", [0; 4], 50_000) as i64, -1);
+
+            // 8b) Universal `@__omni_input(i8* null)` reads a line from USB CDC `EP2_OUT` (with BS editing + CRLF)
+            let typed = b"ab\x08cd\r\n";
+            emu.usb_dpram[0x240..0x240 + typed.len()].copy_from_slice(typed);
+            emu.write32(0x5010_0094, 0x8000 | (typed.len() as u32));
+            emu.mmio_regs.insert(0x5011_0058, 32);
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            let line_ptr = emu.call_fn(&asm, "__omni_input", [0; 4], 200_000) as u32;
+            assert_ne!(line_ptr, 0, "__omni_input must return a heap string pointer, not NULL");
+            assert_eq!(emu.read_cstr(line_ptr), "acd");
+
+            // 9) Host sets `1200` baud via `CDC_SET_LINE_CODING` -> arms hands-free `BOOTSEL` reboot!
+            send_setup(&mut emu, [0x21, 0x20, 0x00, 0x00, 0x00, 0x00, 7, 0]);
+            emu.usb_dpram[0x100..0x107].copy_from_slice(&[0xB0, 0x04, 0x00, 0x00, 0, 0, 8]); // 1200 8N1
+            emu.write32(0x5010_0084, 0x8000 | 7);
+            emu.mmio_regs.insert(0x5011_0058, 2); // EP0_OUT data stage complete
+            fire_usb_isr(&mut emu, 0x0000_0010);
+            assert_eq!(emu.read32(0x5010_02A4), 1, "1200-baud must arm BOOTSEL reboot");
+        }
+    }
+
+    #[test]
+    fn test_cyw43439_raw_tcp_socket_server_and_icmp_ping() {
+        let ir = r#"
+target triple = "thumbv8m.main-none-eabihf"
+
+@.ssid = private unnamed_addr constant [13 x i8] c"OmniTestSSID\00", align 1
+@.psk  = private unnamed_addr constant [17 x i8] c"OmniTestPass1234\00", align 1
+@.pong = private unnamed_addr constant [6 x i8] c"pong\0A\00", align 1
+
+declare i64 @wifi_connect(i64, i64)
+declare i64 @tcp_listen(i64)
+declare i8* @tcp_poll()
+declare i64 @tcp_send(i64)
+declare i64 @tcp_is_open()
+declare i64 @tcp_close()
+
+define i64 @step_connect_and_listen() {
+entry:
+  %s0 = ptrtoint [13 x i8]* @.ssid to i64
+  %p0 = ptrtoint [17 x i8]* @.psk to i64
+  %ip = call i64 @wifi_connect(i64 %s0, i64 %p0)
+  %l = call i64 @tcp_listen(i64 4242)
+  ret i64 %ip
+}
+
+define i8* @step_poll() {
+entry:
+  %m = call i8* @tcp_poll()
+  ret i8* %m
+}
+
+define i64 @step_is_open() {
+entry:
+  %o = call i64 @tcp_is_open()
+  ret i64 %o
+}
+
+define i64 @step_send_pong() {
+entry:
+  %r = ptrtoint [6 x i8]* @.pong to i64
+  %n = call i64 @tcp_send(i64 %r)
+  ret i64 %n
+}
+
+define i64 @step_close() {
+entry:
+  %c = call i64 @tcp_close()
+  ret i64 %c
+}
+
+define i32 @main(i32 %argc, i8** %argv) {
+entry:
+  ret i32 0
+}
+"#;
+        let chip = RpChipProfile::rp2350();
+        let (flash, asm) = compile_llvm_ir_to_flash_image(ir, &chip)
+            .expect("failed to compile Pico 2 W raw TCP socket server firmware");
+
+        let mut emu = ThumbCpuEmu::new(chip, flash, true);
+        emu.init_heap_only();
+        emu.cyw43_slave = Some(SimCyw43439::new());
+
+        // 1) Connect Wi-Fi + DHCP + listen on raw TCP :4242
+        let ip_u32 = emu.call_fn(&asm, "step_connect_and_listen", [0; 4], 120_000_000) as u32;
+        assert_eq!(ip_u32, 0xC0A8_01DE, "expected 192.168.1.222");
+        assert_eq!(emu.call_fn(&asm, "step_is_open", [0; 4], 50_000), 0);
+
+        let mcu_mac = [0x28, 0xCD, 0xC1, 0x11, 0x22, 0x33];
+
+        // 2) Send ICMP Echo Request (ping) -> verify Pico 2 W responds with ICMP Echo Reply!
+        let mut icmp_pkt = vec![0u8; 14 + 20 + 12];
+        icmp_pkt[0..6].copy_from_slice(&mcu_mac);
+        icmp_pkt[6..12].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
+        icmp_pkt[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        icmp_pkt[14] = 0x45;
+        icmp_pkt[16..18].copy_from_slice(&32u16.to_be_bytes());
+        icmp_pkt[22] = 64;
+        icmp_pkt[23] = 1; // ICMP
+        icmp_pkt[26..30].copy_from_slice(&[192, 168, 1, 10]);
+        icmp_pkt[30..34].copy_from_slice(&[192, 168, 1, 222]);
+        let ip_cs = verify_ones_complement_zero(&icmp_pkt[14..34], 0);
+        icmp_pkt[24..26].copy_from_slice(&ip_cs.to_be_bytes());
+        icmp_pkt[34] = 8; // Echo Request
+        icmp_pkt[38..40].copy_from_slice(&0x1234u16.to_be_bytes()); // id
+        icmp_pkt[40..42].copy_from_slice(&0x0001u16.to_be_bytes()); // seq
+        icmp_pkt[42..46].copy_from_slice(b"PING");
+        let icmp_cs = verify_ones_complement_zero(&icmp_pkt[34..], 0);
+        icmp_pkt[36..38].copy_from_slice(&icmp_cs.to_be_bytes());
+
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&icmp_pkt);
+        let _ = emu.call_fn(&asm, "step_poll", [0; 4], 500_000);
+        let icmp_rep = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .iter()
+            .find(|f| f.len() >= 46 && f[23] == 1 && f[34] == 0)
+            .expect("expected ICMP Echo Reply (type=0)")
+            .clone();
+        assert_eq!(&icmp_rep[42..46], b"PING", "ICMP echo payload mismatch");
+        assert_eq!(verify_ones_complement_zero(&icmp_rep[34..], 0), 0, "bad ICMP checksum");
+
+        // 3) Raw TCP 3-way handshake on port 4242 -> directly ESTABLISHED (no HTTP upgrade!)
+        let mut host_seq: u32 = 0x5000_2000;
+        let syn_pkt = build_host_tcp_frame(mcu_mac, 55123, 4242, host_seq, 0, 0x02, &[]);
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&syn_pkt);
+        let _ = emu.call_fn(&asm, "step_poll", [0; 4], 500_000);
+
+        let syn_ack = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .last()
+            .expect("expected SYN|ACK")
+            .clone();
+        assert_eq!(syn_ack[47], 0x12);
+        let mcu_seq = u32::from_be_bytes(syn_ack[38..42].try_into().unwrap()).wrapping_add(1);
+        host_seq = host_seq.wrapping_add(1);
+
+        let ack_pkt = build_host_tcp_frame(mcu_mac, 55123, 4242, host_seq, mcu_seq, 0x10, &[]);
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&ack_pkt);
+        let _ = emu.call_fn(&asm, "step_poll", [0; 4], 500_000);
+        assert_eq!(emu.call_fn(&asm, "step_is_open", [0; 4], 50_000), 1, "raw TCP socket must be ESTABLISHED");
+
+        // 4) Host sends raw TCP "ping\n" -> MCU reads via `tcp_poll()` and replies "pong\n" via `tcp_send()`!
+        let ping_pkt = build_host_tcp_frame(mcu_mac, 55123, 4242, host_seq, mcu_seq, 0x18, b"ping\n");
+        emu.cyw43_slave.as_mut().unwrap().tx_eth_frames.clear();
+        emu.cyw43_slave.as_mut().unwrap().push_eth_rx_to_mcu(&ping_pkt);
+        let rx_ptr = emu.call_fn(&asm, "step_poll", [0; 4], 500_000) as u32;
+        assert_eq!(emu.read_cstr(rx_ptr), "ping\n");
+
+        let sent = emu.call_fn(&asm, "step_send_pong", [0; 4], 500_000) as i64;
+        assert_eq!(sent, 5);
+        let pong_frame = emu
+            .cyw43_slave
+            .as_ref()
+            .unwrap()
+            .tx_eth_frames
+            .last()
+            .expect("expected raw TCP PSH|ACK pong frame")
+            .clone();
+        assert_eq!(pong_frame[47], 0x18); // PSH|ACK
+        assert_eq!(&pong_frame[54..], b"pong\n");
+        let tcp_len = pong_frame.len() - 34;
+        let pseudo = u16::from_be_bytes([pong_frame[26], pong_frame[27]]) as u32
+            + u16::from_be_bytes([pong_frame[28], pong_frame[29]]) as u32
+            + u16::from_be_bytes([pong_frame[30], pong_frame[31]]) as u32
+            + u16::from_be_bytes([pong_frame[32], pong_frame[33]]) as u32
+            + 6
+            + (tcp_len as u32);
+        assert_eq!(verify_ones_complement_zero(&pong_frame[34..], pseudo), 0, "bad TCP pong checksum");
+
+        // 5) `tcp_close()` sends FIN|ACK and returns to LISTEN
+        emu.call_fn(&asm, "step_close", [0; 4], 500_000);
+        assert_eq!(emu.call_fn(&asm, "step_is_open", [0; 4], 50_000), 0);
+        let fin_frame = emu.cyw43_slave.as_ref().unwrap().tx_eth_frames.last().unwrap();
+        assert_eq!(fin_frame[47], 0x11); // FIN|ACK
     }
 }

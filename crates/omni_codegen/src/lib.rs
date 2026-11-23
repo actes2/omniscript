@@ -105,17 +105,13 @@ const NATIVE_CALL_PATTERNS: &[&str] = &[
 // Self/class receiver keywords excluded from external foreign-module classification.
 const SELF_RECEIVERS: &[&str] = &["self", "this", "cls"];
 
-// Standard ISO C libc & bare-metal MCU hardware intrinsics invoked via direct FFI.
+// Standard ISO C libc functions invoked via direct FFI.
 const NATIVE_C_LIB_FNS: &[&str] = &[
     "abs", "labs", "atoi", "atol", "strlen", "strcpy", "strncpy", "strcat",
     "strncmp", "strchr", "strstr", "memcpy", "memmove", "memset", "memcmp",
     "calloc", "realloc", "fprintf", "sprintf", "snprintf", "puts", "putchar",
     "getchar", "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush",
     "remove", "rename", "getenv", "system", "abort", "time", "clock", "srand", "rand",
-    "gpio_init", "gpio_set_dir", "gpio_put", "gpio_toggle", "gpio_get",
-    "mmio_read32", "mmio_write32", "sleep_ms", "sleep_us", "time_us", "time_us_64",
-    "pio_instr_write", "pio_sm_config_and_enable", "pio_sm_put", "pio_sm_get", "pio_sm_exec",
-    "uart_putc", "uart_puts",
 ];
 
 // Subset of `NATIVE_C_LIB_FNS` whose C ABI return width on LP64 / 64-bit targets is `i64` (`size_t` / `long` / pointer).
@@ -123,10 +119,6 @@ const NATIVE_C_LIB_I64_FNS: &[&str] = &[
     "strlen", "atol", "labs", "time", "ftell",
     "calloc", "realloc", "strcpy", "strncpy", "strcat", "strchr", "strstr",
     "memcpy", "memmove", "memset", "fopen", "getenv", "fread", "fwrite",
-    "gpio_init", "gpio_set_dir", "gpio_put", "gpio_toggle", "gpio_get",
-    "mmio_read32", "mmio_write32", "sleep_ms", "sleep_us", "time_us", "time_us_64",
-    "pio_instr_write", "pio_sm_config_and_enable", "pio_sm_put", "pio_sm_get", "pio_sm_exec",
-    "uart_putc", "uart_puts",
 ];
 
 /// Classifies whether a parsed type annotation maps to IEEE-754 `double`.
@@ -410,6 +402,7 @@ pub struct ScopeTree {
     pub collection_elem_types: HashMap<String, String>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
+    pub extern_fns: HashMap<String, (Vec<IrType>, Option<IrType>)>,
     pub fn_param_defs: HashMap<String, Vec<omni_parser::ParamDef>>,
     pub method_param_defs: HashMap<(String, String), Vec<omni_parser::ParamDef>>,
     pub method_defining_class: HashMap<(String, String), String>,
@@ -441,6 +434,7 @@ impl ScopeTree {
             collection_elem_types: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
+            extern_fns: HashMap::new(),
             fn_param_defs: HashMap::new(),
             method_param_defs: HashMap::new(),
             method_defining_class: HashMap::new(),
@@ -820,6 +814,7 @@ struct ActiveFnAiContext {
 pub struct CodeGenerator<'a> {
     engine: &'a dyn InferenceEngine,
     target_triple: String,
+    platform_slug: String,
     cmp_re: Regex,
     idx_re: Regex,
     len_re: Regex,
@@ -840,6 +835,7 @@ impl<'a> CodeGenerator<'a> {
         Self {
             engine,
             target_triple: host_target_triple().to_string(),
+            platform_slug: String::new(),
             cmp_re: Regex::new(r#"^\s*(.*?)\s*(===|!==|==|!=|~=|<=|>=|<|>)\s*(.*?)\s*$"#).unwrap(),
             idx_re: Regex::new(r#"^([a-zA-Z_0-9]+)\[(.+?)\]$"#).unwrap(),
             len_re: Regex::new(r#"^len\s*\(\s*([a-zA-Z_0-9]+)\s*\)$"#).unwrap(),
@@ -879,6 +875,58 @@ impl<'a> CodeGenerator<'a> {
             self.target_triple = t;
         }
         self
+    }
+
+    pub fn with_platform_slug(mut self, slug: impl Into<String>) -> Self {
+        self.platform_slug = slug.into();
+        self
+    }
+
+    fn emit_extern_fn_call(
+        &self,
+        fn_name: &str,
+        ret_ty: Option<&IrType>,
+        actual_c_args: &str,
+        ir: &mut String,
+        temp_counter: &mut usize,
+    ) -> TypedValue {
+        match ret_ty {
+            Some(IrType::Ptr) => {
+                let r = format!("%ext_ptr_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i8* @{}({})\n", r, fn_name, actual_c_args));
+                ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", r));
+                TypedValue { reg: r, ty: IrType::Ptr }
+            }
+            Some(IrType::F64) => {
+                let r = format!("%ext_f64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call double @{}({})\n", r, fn_name, actual_c_args));
+                TypedValue { reg: r, ty: IrType::F64 }
+            }
+            None => {
+                ir.push_str(&format!("  call void @{}({})\n", fn_name, actual_c_args));
+                TypedValue { reg: "0".to_string(), ty: IrType::I64 }
+            }
+            Some(IrType::I32) => {
+                let r = format!("%ext_i32_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i32 @{}({})\n", r, fn_name, actual_c_args));
+                TypedValue { reg: r, ty: IrType::I32 }
+            }
+            Some(IrType::I1) => {
+                let r = format!("%ext_i1_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i1 @{}({})\n", r, fn_name, actual_c_args));
+                TypedValue { reg: r, ty: IrType::I1 }
+            }
+            Some(_) => {
+                let r = format!("%ext_i64_{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call i64 @{}({})\n", r, fn_name, actual_c_args));
+                TypedValue { reg: r, ty: IrType::I64 }
+            }
+        }
     }
 
     pub fn with_drilled_spines(mut self, spines: Vec<String>) -> Self {
@@ -1525,6 +1573,7 @@ impl<'a> CodeGenerator<'a> {
         inner_scope.has_open_ns_import = outer_scope.has_open_ns_import;
         inner_scope.enum_variants = outer_scope.enum_variants.clone();
         inner_scope.known_functions = outer_scope.known_functions.clone();
+        inner_scope.extern_fns = outer_scope.extern_fns.clone();
         inner_scope.fn_param_defs = outer_scope.fn_param_defs.clone();
         inner_scope.method_param_defs = outer_scope.method_param_defs.clone();
         inner_scope.method_defining_class = outer_scope.method_defining_class.clone();
@@ -2302,8 +2351,40 @@ impl<'a> CodeGenerator<'a> {
         for ev in scope_tree.gather_abductive_evidence(&rewritten_expr, &ctx_snapshot.import_chain) {
             enriched_imports.push(format!("__OMNI_ABDUCTIVE_EVIDENCE__:{}", ev));
         }
+        // Expose in-scope user functions & extern/HAL declarations so the LLM can dynamically
+        // target real available symbols in the current module/platform without hardcoded aliases.
+        let mut avail_sigs: Vec<String> = Vec::new();
+        for fn_sym in &scope_tree.known_functions {
+            if fn_sym != "main" && fn_sym != &ctx_snapshot.enclosing_fn {
+                let ret_str = match scope_tree.fn_return_types.get(fn_sym) {
+                    Some(IrType::Ptr) => "i8*",
+                    Some(IrType::F64) => "double",
+                    Some(IrType::I32) => "i32",
+                    _ => "i64",
+                };
+                avail_sigs.push(format!("{} @__omni_fn_{}(...)", ret_str, fn_sym));
+            }
+        }
+        let mut ext_keys: Vec<&String> = scope_tree.extern_fns.keys().collect();
+        ext_keys.sort();
+        for ek in ext_keys {
+            if let Some((params, ret_opt)) = scope_tree.extern_fns.get(ek) {
+                let ret_str = match ret_opt {
+                    None => "void",
+                    Some(IrType::Ptr) => "i8*",
+                    Some(IrType::F64) => "double",
+                    Some(IrType::I32) => "i32",
+                    _ => "i64",
+                };
+                let p_str = vec!["i64"; params.len()].join(", ");
+                avail_sigs.push(format!("{} @{}({})", ret_str, ek, p_str));
+            }
+        }
+        for sig in avail_sigs.into_iter().take(24) {
+            enriched_imports.push(format!("__OMNI_AVAILABLE_SYM__:{}", sig));
+        }
         enriched_imports.push(format!(
-            "__OMNI_SEMANTIC_OBLIGATION__:compute '{}' using active registers and store result into {}",
+            "__OMNI_SEMANTIC_OBLIGATION__:compute '{}' using active registers or runtime intrinsics and store result into {}",
             rewritten_expr, slot_ptr
         ));
         let envelope = SsaContextEnvelope {
@@ -2380,9 +2461,28 @@ impl<'a> CodeGenerator<'a> {
             ir.push('\n');
         }
 
+        let mut produced_ptr_reg: Option<String> = None;
         let already_stored = exec_lines.iter().any(|l| {
             l.starts_with("store ")
                 && (l.contains(&format!("* {}", slot_ptr)) || l.contains(&format!("*{}", slot_ptr)))
+        });
+        // Detect if the synthesized IR produced a string/pointer (`i8*`) value (e.g. `call i8* @__omni_input(...)`)
+        let last_ptr_call = exec_lines.iter().rev().find_map(|l| {
+            if l.starts_with('%') && l.contains('=') {
+                let eq = l.find('=')?;
+                let reg = l[..eq].trim();
+                let rhs = l[eq + 1..].trim();
+                let head = rhs.split('(').next().unwrap_or(rhs);
+                if rhs.starts_with("call i8*")
+                    || rhs.starts_with("load i8*")
+                    || head.contains("i8*")
+                    || rhs.starts_with("inttoptr")
+                    || rhs.starts_with("getelementptr")
+                {
+                    return Some(reg.to_string());
+                }
+            }
+            None
         });
         if !already_stored {
             if let Some(last_assign) = exec_lines.iter().rev().find(|l| l.starts_with('%') && l.contains('=')) {
@@ -2396,6 +2496,7 @@ impl<'a> CodeGenerator<'a> {
                         || rhs.starts_with("inttoptr")
                         || rhs.starts_with("getelementptr")
                     {
+                        produced_ptr_reg = Some(reg.to_string());
                         let cast_reg = format!("%ptr_to_i64_{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", cast_reg, reg));
@@ -2417,6 +2518,19 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
             }
+        } else if let Some(ptr_reg) = last_ptr_call {
+            // If the LLM emitted `call i8* @__omni_input(...)` and stored `ptrtoint` into `slot_ptr`,
+            // preserve its `IrType::Ptr` string type for downstream callers like `uart_puts` / `wifi_connect`!
+            if exec_lines.iter().any(|l| l.contains("ptrtoint i8*")) {
+                produced_ptr_reg = Some(ptr_reg);
+            }
+        }
+
+        if let Some(ptr_reg) = produced_ptr_reg {
+            return Some(TypedValue {
+                reg: ptr_reg,
+                ty: IrType::Ptr,
+            });
         }
 
         let loaded = format!("%ai_subexpr_{}", *temp_counter);
@@ -2932,6 +3046,11 @@ impl<'a> CodeGenerator<'a> {
                 if let Some((rec, mname)) = callee.rsplit_once('.') {
                     let rec = rec.trim();
                     let mname = mname.trim();
+                    if scope_tree.c_module_aliases.contains(rec)
+                        && matches!(scope_tree.extern_fns.get(mname), Some((_, Some(IrType::Ptr))))
+                    {
+                        return true;
+                    }
                     let inner = trimmed[lp + 1..trimmed.len() - 1].trim();
                     let arity = if inner.is_empty() {
                         0
@@ -5554,6 +5673,17 @@ impl<'a> CodeGenerator<'a> {
                                     arg_regs.push("0".to_string());
                                 }
 
+                                if let Some((_, ref ret_ty)) = scope_tree.extern_fns.get(method).cloned() {
+                                    if scope_tree.c_module_aliases.contains(rec) {
+                                        return self.emit_extern_fn_call(
+                                            method,
+                                            ret_ty.as_ref(),
+                                            &actual_c_args,
+                                            ir,
+                                            temp_counter,
+                                        );
+                                    }
+                                }
                                 if NATIVE_C_LIB_I64_FNS.contains(&method) {
                                     let ret_reg = format!("%foreign_ret_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -5693,6 +5823,7 @@ impl<'a> CodeGenerator<'a> {
 
                         // Indirect fat-closure / bare function pointer call (`f(args)` or curried `make_adder(10)(5)` / `(lambda x: x+1)(5)`)
                         let is_expr_callee = !scope_tree.known_functions.contains(call_target)
+                            && !scope_tree.extern_fns.contains_key(call_target)
                             && !NATIVE_C_LIB_I64_FNS.contains(&call_target)
                             && !NATIVE_C_LIB_FNS.contains(&call_target)
                             && (call_target.contains('(')
@@ -5875,6 +6006,15 @@ impl<'a> CodeGenerator<'a> {
                             .map(|r| format!("i64 {}", r))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        if let Some((_, ref ret_ty)) = scope_tree.extern_fns.get(call_target).cloned() {
+                            return self.emit_extern_fn_call(
+                                call_target,
+                                ret_ty.as_ref(),
+                                &actual_c_args,
+                                ir,
+                                temp_counter,
+                            );
+                        }
                         while arg_regs.len() < 6 {
                             arg_regs.push("0".to_string());
                         }
@@ -7739,6 +7879,35 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  store i64 0, i64* {}\n", target_ptr));
                             }
                         }
+
+                        // If the LLM synthesized a string-returning call (`call i8* @__omni_input`,
+                        // `call i8* @__omni_str_*`, or `ptrtoint i8* ... to i64`), promote the binding
+                        // to `i8* (string)` so `print(x)`, `puts(x)`, `strlen(x)`, and `x + "..."`
+                        // work identically on both x86_64 desktop and Cortex-M targets!
+                        let produced_str_ptr = exec_lines.iter().any(|l| {
+                            l.contains("call i8* @__omni_input")
+                                || l.contains("call i8* @__omni_str_")
+                                || l.contains("ptrtoint i8*")
+                        });
+                        if produced_str_ptr {
+                            let str_slot = format!("%str_var_{}_{}", target, *temp_counter);
+                            let raw_ld = format!("%str_i64_{}", *temp_counter);
+                            let cast_p = format!("%str_p_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = alloca i8*\n  {} = load i64, i64* {}\n  {} = inttoptr i64 {} to i8*\n  store i8* {}, i8** {}\n",
+                                str_slot, raw_ld, target_ptr, cast_p, raw_ld, cast_p, str_slot
+                            ));
+                            scope_tree.insert(
+                                target.clone(),
+                                SymbolBinding {
+                                    name: target.clone(),
+                                    llvm_ptr: str_slot,
+                                    type_hint: "i8* (string)".to_string(),
+                                    is_scoped: *is_scoped_decl,
+                                },
+                            );
+                        }
                         continue;
                     }
 
@@ -8183,7 +8352,9 @@ impl<'a> CodeGenerator<'a> {
                         branch_is_tail,
                     )?;
                     if !then_ret {
-                        Self::emit_cleanups(ir, &deferred_frees[then_snapshot..], temp_counter, "Then Branch Exit");
+                        if let Some(slice) = deferred_frees.get(then_snapshot..) {
+                            Self::emit_cleanups(ir, slice, temp_counter, "Then Branch Exit");
+                        }
                     }
                     deferred_frees.truncate(then_snapshot);
                     scope_tree.exit_scope();
@@ -8214,7 +8385,9 @@ impl<'a> CodeGenerator<'a> {
                             branch_is_tail,
                         )?;
                         if !else_ret {
-                            Self::emit_cleanups(ir, &deferred_frees[else_snapshot..], temp_counter, "Else Branch Exit");
+                            if let Some(slice) = deferred_frees.get(else_snapshot..) {
+                                Self::emit_cleanups(ir, slice, temp_counter, "Else Branch Exit");
+                            }
                         }
                         deferred_frees.truncate(else_snapshot);
                         scope_tree.exit_scope();
@@ -8273,7 +8446,9 @@ impl<'a> CodeGenerator<'a> {
                     scope_tree.loop_cond_labels.pop();
                     scope_tree.loop_entry_try_depths.pop();
                     if !body_ret {
-                        Self::emit_cleanups(ir, &deferred_frees[while_snapshot..], temp_counter, "While Iteration Exit");
+                        if let Some(slice) = deferred_frees.get(while_snapshot..) {
+                            Self::emit_cleanups(ir, slice, temp_counter, "While Iteration Exit");
+                        }
                     }
                     deferred_frees.truncate(while_snapshot);
                     scope_tree.exit_scope();
@@ -9831,6 +10006,7 @@ impl<'a> CodeGenerator<'a> {
                                 }
                             } else if !is_rust_tail_expr
                                 && (scope_tree.known_functions.contains(target)
+                                    || scope_tree.extern_fns.contains_key(target)
                                     || NATIVE_C_LIB_FNS.contains(&target)
                                     || NATIVE_C_LIB_I64_FNS.contains(&target))
                             {
@@ -11746,6 +11922,7 @@ impl<'a> CodeGenerator<'a> {
 
         // 2. Functions & Return Type Lattice
         let mut known_functions_set = HashSet::new();
+        let mut extern_fns_map: HashMap<String, (Vec<IrType>, Option<IrType>)> = HashMap::new();
         let mut fn_param_defs_map: HashMap<String, Vec<omni_parser::ParamDef>> = HashMap::new();
         let mut fn_return_types_map: HashMap<String, IrType> = HashMap::new();
         let mut fn_return_ptr_kinds_map: HashMap<String, String> = HashMap::new();
@@ -11829,6 +12006,69 @@ impl<'a> CodeGenerator<'a> {
             if let Some(pk) = Self::infer_return_ptr_kind(&f.body, &f.params) {
                 fn_return_ptr_kinds_map.insert(f.name.clone(), pk);
             }
+        }
+
+        // 2-B. External / HAL Syscall `extern fn` Declarations (Platform Prelude + `import "pico*"` + User `extern fn`)
+        let mut collected_extern_defs: Vec<omni_parser::ExternFnDef> = Vec::new();
+        if self.target_triple.starts_with("thumb") {
+            let plat_prelude = if matches!(self.platform_slug.as_str(), "rp2040" | "rp2350") {
+                omni_preamble::PICO_HAL_BASE_PRELUDE
+            } else {
+                omni_preamble::PICO_HAL_FULL_PRELUDE
+            };
+            collected_extern_defs.extend(
+                omni_parser::OmniParser::new()
+                    .parse_module("__hal_platform_prelude", plat_prelude)
+                    .extern_functions,
+            );
+        }
+        for imp in &module.imports {
+            if let Some((hal_mod, alias_opt)) = omni_preamble::extract_builtin_hal_import(imp) {
+                let stem = hal_mod.split('/').next().unwrap_or(hal_mod);
+                c_module_aliases_set.insert(stem.to_string());
+                if let Some(a) = alias_opt {
+                    c_module_aliases_set.insert(a.to_string());
+                }
+                if let Some(src) = omni_preamble::builtin_hal_prelude_for_import(hal_mod) {
+                    collected_extern_defs.extend(
+                        omni_parser::OmniParser::new()
+                            .parse_module("__hal_import_prelude", src)
+                            .extern_functions,
+                    );
+                }
+            }
+        }
+        collected_extern_defs.extend(module.extern_functions.iter().cloned());
+
+        for ext in collected_extern_defs {
+            if known_functions_set.contains(&ext.name) {
+                continue;
+            }
+            let p_tys: Vec<IrType> = ext
+                .params
+                .iter()
+                .map(|p| {
+                    p.type_hint
+                        .as_deref()
+                        .map(|th| classify_type_token(th, &class_fields_map))
+                        .unwrap_or(IrType::I64)
+                })
+                .collect();
+            let r_ty: Option<IrType> = match ext.return_type.as_deref().map(|s| s.trim()) {
+                Some("void") | Some("()") | Some("None") => None,
+                Some("i32") | Some("int32") => Some(IrType::I32),
+                Some(rt) => Some(classify_type_token(rt, &class_fields_map)),
+                None => Some(IrType::I64),
+            };
+            if let Some(ref rt_inner) = r_ty {
+                if *rt_inner == IrType::Ptr {
+                    fn_return_ptr_kinds_map
+                        .entry(ext.name.clone())
+                        .or_insert_with(|| "i8* (string)".to_string());
+                }
+                fn_return_types_map.insert(ext.name.clone(), rt_inner.clone());
+            }
+            extern_fns_map.insert(ext.name, (p_tys, r_ty));
         }
 
         let mut functions_ir = String::new();
@@ -11936,6 +12176,7 @@ impl<'a> CodeGenerator<'a> {
                 scope_tree.has_open_ns_import = has_open_ns_import;
                 scope_tree.enum_variants = enum_variants_map.clone();
                 scope_tree.known_functions = known_functions_set.clone();
+                scope_tree.extern_fns = extern_fns_map.clone();
                 scope_tree.fn_param_defs = fn_param_defs_map.clone();
                 scope_tree.method_param_defs = method_param_defs_map.clone();
                 scope_tree.method_defining_class = method_defining_map.clone();
@@ -12131,6 +12372,7 @@ impl<'a> CodeGenerator<'a> {
             scope_tree.has_open_ns_import = has_open_ns_import;
             scope_tree.enum_variants = enum_variants_map.clone();
             scope_tree.known_functions = known_functions_set.clone();
+            scope_tree.extern_fns = extern_fns_map.clone();
             scope_tree.fn_param_defs = fn_param_defs_map.clone();
             scope_tree.method_param_defs = method_param_defs_map.clone();
             scope_tree.method_defining_class = method_defining_map.clone();
@@ -12347,6 +12589,7 @@ impl<'a> CodeGenerator<'a> {
         synth_scope.method_defining_class = method_defining_map.clone();
         synth_scope.method_param_defs = method_param_defs_map.clone();
         synth_scope.known_functions = known_functions_set.clone();
+        synth_scope.extern_fns = extern_fns_map.clone();
         synth_scope.fn_param_defs = fn_param_defs_map.clone();
         synth_scope.fn_return_types = fn_return_types_map.clone();
         synth_scope.fn_return_ptr_kinds = fn_return_ptr_kinds_map.clone();
@@ -12492,7 +12735,18 @@ impl<'a> CodeGenerator<'a> {
                 && !functions_ir.contains(&format!("define i32 @{}(", sym))
                 && !dynamic_declarations.iter().any(|d| d.contains(&format!("@{}(", sym)))
             {
-                if NATIVE_C_LIB_I64_FNS.contains(&sym.as_str()) {
+                if let Some((param_tys, ret_ty)) = extern_fns_map.get(&sym) {
+                    let ret_llvm = match ret_ty {
+                        Some(IrType::Ptr) => "i8*",
+                        Some(IrType::F64) => "double",
+                        None => "void",
+                        Some(IrType::I32) => "i32",
+                        Some(IrType::I1) => "i1",
+                        Some(_) => "i64",
+                    };
+                    let params_llvm = vec!["i64"; param_tys.len()].join(", ");
+                    dynamic_declarations.insert(format!("declare {} @{}({})", ret_llvm, sym, params_llvm));
+                } else if NATIVE_C_LIB_I64_FNS.contains(&sym.as_str()) {
                     dynamic_declarations.insert(format!("declare i64 @{}(...)", sym));
                 } else if NATIVE_C_LIB_FNS.contains(&sym.as_str()) {
                     dynamic_declarations.insert(format!("declare i32 @{}(...)", sym));
@@ -13426,5 +13680,68 @@ def main():
             "Unexpected error message: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_extern_fn_and_pico_hal_prelude_isolation() {
+        let parser = OmniParser::new();
+        let engine = MockSynthesisEngine::new();
+
+        // 1) Desktop target WITHOUT `import "pico"` or `extern fn` MUST reject bare-metal `wifi_ip()` / `gpio_put()`
+        let desktop_cg = CodeGenerator::new(&engine);
+        let unimported_mod = parser.parse_module(
+            "desktop_no_pico",
+            "fn main() -> int {\n    let s = wifi_ip();\n    print(s);\n    return 0;\n}\n",
+        );
+        let err = desktop_cg
+            .generate_module_ir(&unimported_mod, 0.0)
+            .expect_err("Desktop target without `import \"pico\"` must reject `wifi_ip()`");
+        assert!(
+            err.to_string().contains("OMNIC SEMANTIC ERROR") && err.to_string().contains("wifi_ip"),
+            "Unexpected error: {}",
+            err
+        );
+
+        // 2) Non-wireless `--platform pico2` (`rp2350`) has GPIO/PIO/USB HAL, but rejects `wifi_ip()` unless `import "pico/net"`
+        let pico2_cg = CodeGenerator::new(&engine)
+            .with_target_triple("thumbv8m.main-none-eabihf")
+            .with_platform_slug("rp2350");
+        let gpio_only_mod = parser.parse_module(
+            "pico2_gpio",
+            "fn main() -> int {\n    gpio_init(25);\n    gpio_put(25, 1);\n    return 0;\n}\n",
+        );
+        let gpio_ir = pico2_cg
+            .generate_module_ir(&gpio_only_mod, 0.0)
+            .expect("pico2 base HAL should resolve gpio_init/gpio_put");
+        assert!(gpio_ir.contains("declare i64 @gpio_put(i64, i64)"));
+
+        let pico2_wifi_err = pico2_cg
+            .generate_module_ir(&unimported_mod, 0.0)
+            .expect_err("Non-wireless pico2 must reject `wifi_ip()` without `import \"pico/net\"`");
+        assert!(pico2_wifi_err.to_string().contains("wifi_ip"));
+
+        // 3) Explicit `import "pico"` (unqualified & aliased) + `--platform pico2w` resolves `wifi_ip() -> i8*` & `gpio_put -> i64`
+        let pico_import_src = r#"
+import "pico" as pico;
+
+extern fn custom_sensor_read(reg: int) -> int;
+
+fn main() -> int {
+    pico.gpio_init(15);
+    let ip = pico.wifi_ip();
+    let msg = ws_poll();
+    let v = custom_sensor_read(42);
+    print(ip + msg);
+    return v;
+}
+"#;
+        let pico_mod = parser.parse_module("pico_import_test", pico_import_src);
+        let pico_ir = desktop_cg
+            .generate_module_ir(&pico_mod, 0.0)
+            .expect("`import \"pico\"` + `extern fn` should lower cleanly");
+        assert!(pico_ir.contains("declare i8* @wifi_ip()"), "IR:\n{}", pico_ir);
+        assert!(pico_ir.contains("declare i8* @ws_poll()"), "IR:\n{}", pico_ir);
+        assert!(pico_ir.contains("declare i64 @gpio_init(i64)"), "IR:\n{}", pico_ir);
+        assert!(pico_ir.contains("declare i64 @custom_sensor_read(i64)"), "IR:\n{}", pico_ir);
     }
 }

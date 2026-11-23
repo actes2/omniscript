@@ -98,9 +98,10 @@ impl SyntheticDatasetGenerator {
         Ok(Self { verifier })
     }
 
-    /// Generates a Clang-verified training dataset spanning 20 parametric 64-bit / IEEE-754 `double` /
-    /// `%struct.*` GEP / `setjmp` / C FFI `declare` / `<compiler_diagnostic>` self-repair families,
-    /// plus polyglot dialect-classification tasks when `count >= 100`.
+    /// Generates a Clang-verified training dataset spanning 24 parametric 64-bit / IEEE-754 `double` /
+    /// `%struct.*` GEP / `setjmp` / C FFI `declare` / polyglot console I/O (`@__omni_input`, `@getchar`,
+    /// `@__omni_print_*`) / dynamic `<platform_abi>` available-symbol dispatch / `<compiler_diagnostic>`
+    /// self-repair families, plus polyglot dialect-classification tasks when `count >= 100`.
     pub fn generate_verified_dataset(&self, count: usize) -> Vec<DatasetRecord> {
         let mut rng = SplitMix64::new(0x0D15_7111_2026_64B1);
         let dialect_budget = if count >= 100 { (count / 20).max(20) } else { 0 };
@@ -108,10 +109,10 @@ impl SyntheticDatasetGenerator {
 
         let mut scenarios = Vec::with_capacity(ir_target);
         for i in 0..ir_target {
-            let family = i % 20;
-            // Rotate repair phase across cycles of 20 so ALL 20 families receive ~25% self-repair coverage,
+            let family = i % 24;
+            // Rotate repair phase across cycles of 24 so ALL 24 families receive ~25% self-repair coverage,
             // while ALL samples with a `broken_completion` retain `rejected_completion` for ORPO!
-            let emit_as_repair = count >= 20 && ((i + (i / 20)) % 4 == 3);
+            let emit_as_repair = count >= 24 && ((i + (i / 24)) % 4 == 3);
             let scen = self.synthesize_parametric_scenario(i, family, emit_as_repair, &mut rng);
             scenarios.push((i, emit_as_repair, scen));
         }
@@ -1306,7 +1307,7 @@ impl SyntheticDatasetGenerator {
             }
 
             // 19: Cooperative Fiber Sleep & Print Telemetry (`@__omni_sleep_ms` + `@__omni_print_float`)
-            _ => {
+            19 => {
                 let f_var = *rng.pick(FLOAT_NAMES);
                 let f_reg = format!("%f64_var_{}_{}", f_var, slot_suf);
                 let ms = rng.range(5, 250);
@@ -1348,6 +1349,290 @@ impl SyntheticDatasetGenerator {
                     completion,
                     broken_completion: None,
                     diagnostic_hint: None,
+                }
+            }
+
+            // 20: Polyglot Console Line Input (`Console.ReadLine()`, `readLine()`, `prompt()`, `gets()`, `input()`)
+            //     -> universal `@__omni_input(i8* null)` across desktop & Cortex-M targets (with ORPO anti-loop rejection!)
+            20 => {
+                let (eco, imp, call_expr) = *rng.pick(&[
+                    ("csharp (module: System)", "csharp (module: System)", "Console.ReadLine()"),
+                    ("kotlin", "kotlin (module: kotlin.io)", "readLine()"),
+                    ("swift", "swift (module: Swift)", "readLine()"),
+                    ("javascript", "javascript (module: global)", "prompt()"),
+                    ("ruby", "ruby (module: Kernel)", "gets()"),
+                    ("python", "python (module: builtins)", "input()"),
+                ]);
+                let dst_var = *rng.pick(&["ssid", "pass", "line", "cmd", "user_input", "jitter"]);
+                let dst_reg = format!("%var_{}_{}", dst_var, slot_suf);
+                let as_i64_slot = (seq_idx / 24) % 2 == 1;
+                let intent = format!("{dst_var} = {call_expr}");
+                let effective_abi = if (seq_idx / 24) % 3 == 0 {
+                    "thumbv8m.main-none-eabihf".to_string()
+                } else {
+                    target_abi
+                };
+
+                let (preamble, type_hint, yield_exp, completion) = if as_i64_slot {
+                    (
+                        format!("  {dst_reg} = alloca i64\n  store i64 0, i64* {dst_reg}\n"),
+                        "i64",
+                        format!("store 64-bit scalar result to {dst_reg}"),
+                        format!(
+                            "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i8* @__omni_input(i8* null)\n  %t_{} = ptrtoint i8* %t_{ssa} to i64\n  store i64 %t_{}, i64* {dst_reg}\n",
+                            ssa + 1,
+                            ssa + 1
+                        ),
+                    )
+                } else {
+                    (
+                        format!("  {dst_reg} = alloca i8*\n  store i8* null, i8** {dst_reg}\n"),
+                        "i8*",
+                        format!("store i8* string result to {dst_reg}"),
+                        format!(
+                            "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i8* @__omni_input(i8* null)\n  store i8* %t_{ssa}, i8** {dst_reg}\n"
+                        ),
+                    )
+                };
+                // Explicitly reject the degenerate comment-only loop pattern in ORPO!
+                let broken = format!(
+                    "  ; >>> [Synthesized: {intent}]\n  ; >>> [Synthesized: {call_expr}]\n  ; >>> [Synthesized: {intent}]\n"
+                );
+                let diag = format!(
+                    "Semantic obligation violated: synthesized block for '{intent}' contains zero executable instructions. Call `i8* @__omni_input(i8* null)` from <platform_abi> and store the result into {dst_reg}."
+                );
+
+                GeneratedScenario {
+                    domain: "polyglot_console_readline",
+                    envelope: SsaContextEnvelope {
+                        target_abi: effective_abi,
+                        enclosing_fn: fn_name,
+                        return_type: ret_ty.to_string(),
+                        next_ssa_idx: ssa,
+                        active_symbols: vec![SsaVariable {
+                            name: dst_var.to_string(),
+                            llvm_name: dst_reg,
+                            type_hint: type_hint.to_string(),
+                        }],
+                        struct_definitions: vec![],
+                        raw_intent: intent.clone(),
+                        idiom_hint: Some("PolyglotConsoleInput".to_string()),
+                        anchor_id: anchor,
+                        physical_source: Some(intent),
+                        concurrency_mode: None,
+                        yield_expectation: Some(yield_exp),
+                        action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+                        ecosystem_context: Some(eco.to_string()),
+                        lifetime_context: None,
+                        import_chain: vec![imp.to_string()],
+                    },
+                    harness_preamble: preamble,
+                    extra_decls: vec![],
+                    completion,
+                    broken_completion: Some(broken),
+                    diagnostic_hint: Some(diag),
+                }
+            }
+
+            // 21: Polyglot Console Output (`Console.WriteLine`, `System.out.println`, `fmt.Println`, `console.log`)
+            //     -> universal `@__omni_print_str(i8*)` / `@__omni_print_int(i64)`
+            21 => {
+                let (eco, imp, call_prefix) = *rng.pick(&[
+                    ("csharp (module: System)", "csharp (module: System)", "Console.WriteLine"),
+                    ("java (module: java.lang)", "java (module: java.lang)", "System.out.println"),
+                    ("go (module: fmt)", "go (module: fmt)", "fmt.Println"),
+                    ("javascript", "javascript (module: console)", "console.log"),
+                ]);
+                let is_str = (seq_idx / 24) % 2 == 0;
+                let (var_name, var_reg, ty_hint, preamble, completion) = if is_str {
+                    let vn = *rng.pick(STR_NAMES);
+                    let vr = format!("%str_var_{}_{}", vn, slot_suf);
+                    let pre = format!("  {vr} = alloca i8*\n  store i8* null, i8** {vr}\n");
+                    let intent = format!("{call_prefix}({vn})");
+                    let comp = format!(
+                        "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = load i8*, i8** {vr}\n  call void @__omni_print_str(i8* %t_{ssa})\n"
+                    );
+                    (vn, vr, "i8*", pre, comp)
+                } else {
+                    let vn = *rng.pick(SCALAR_NAMES);
+                    let vr = format!("%var_{}_{}", vn, slot_suf);
+                    let pre = format!("  {vr} = alloca i64\n  store i64 42, i64* {vr}\n");
+                    let intent = format!("{call_prefix}({vn})");
+                    let comp = format!(
+                        "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = load i64, i64* {vr}\n  call void @__omni_print_int(i64 %t_{ssa})\n"
+                    );
+                    (vn, vr, "i64", pre, comp)
+                };
+                let intent = format!("{call_prefix}({var_name})");
+
+                GeneratedScenario {
+                    domain: "polyglot_console_output",
+                    envelope: SsaContextEnvelope {
+                        target_abi,
+                        enclosing_fn: fn_name,
+                        return_type: ret_ty.to_string(),
+                        next_ssa_idx: ssa,
+                        active_symbols: vec![SsaVariable {
+                            name: var_name.to_string(),
+                            llvm_name: var_reg,
+                            type_hint: ty_hint.to_string(),
+                        }],
+                        struct_definitions: vec![],
+                        raw_intent: intent.clone(),
+                        idiom_hint: Some("PolyglotConsoleOutput".to_string()),
+                        anchor_id: anchor,
+                        physical_source: Some(intent),
+                        concurrency_mode: None,
+                        yield_expectation: Some("void".to_string()),
+                        action_directive: Some("LOWER_ANONYMOUS_INTENT".to_string()),
+                        ecosystem_context: Some(eco.to_string()),
+                        lifetime_context: None,
+                        import_chain: vec![imp.to_string()],
+                    },
+                    harness_preamble: preamble,
+                    extra_decls: vec![],
+                    completion,
+                    broken_completion: None,
+                    diagnostic_hint: None,
+                }
+            }
+
+            // 22: Dynamic Available-Symbol Dispatch (`__OMNI_AVAILABLE_SYM__` in `<platform_abi>`)
+            //     Teaches the LLM to bind polyglot / HAL intents directly to real available extern/module symbols!
+            22 => {
+                let dst_var = *rng.pick(&["rc", "status", "res", "jitter"]);
+                let dst_reg = format!("%var_{}_{}", dst_var, slot_suf);
+                let pin = rng.range(2, 26);
+                let val = rng.range(0, 2);
+                let (intent, decl, call_ir, bad_sym) = match (seq_idx / 24) % 3 {
+                    0 => (
+                        format!("{dst_var} = digitalWrite({pin}, {val})"),
+                        "declare i64 @gpio_put(i64, i64)".to_string(),
+                        format!(
+                            "  %t_{ssa} = call i64 @gpio_put(i64 {pin}, i64 {val})\n  store i64 %t_{ssa}, i64* {dst_reg}\n"
+                        ),
+                        "@digitalWrite",
+                    ),
+                    1 => {
+                        let ms = rng.range(10, 500);
+                        (
+                            format!("{dst_var} = delay({ms})"),
+                            "declare i64 @sleep_ms(i64)".to_string(),
+                            format!(
+                                "  %t_{ssa} = call i64 @sleep_ms(i64 {ms})\n  store i64 %t_{ssa}, i64* {dst_reg}\n"
+                            ),
+                            "@delay",
+                        )
+                    }
+                    _ => (
+                        format!("{dst_var} = Serial.read()"),
+                        "declare i64 @usb_cdc_getc()".to_string(),
+                        format!(
+                            "  %t_{ssa} = call i64 @usb_cdc_getc()\n  store i64 %t_{ssa}, i64* {dst_reg}\n"
+                        ),
+                        "@Serial_read",
+                    ),
+                };
+
+                let preamble = format!("  {dst_reg} = alloca i64\n  store i64 0, i64* {dst_reg}\n");
+                let completion = format!("  ; >>> [Synthesized: {intent}]\n{call_ir}");
+                let broken = format!(
+                    "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i64 {bad_sym}()\n  store i64 %t_{ssa}, i64* {dst_reg}\n"
+                );
+                let diag = format!(
+                    "LLVM IR verification error: use of undefined value '{bad_sym}'. Use an available symbol listed in <platform_abi>."
+                );
+
+                GeneratedScenario {
+                    domain: "available_symbol_hal_dispatch",
+                    envelope: SsaContextEnvelope {
+                        target_abi: "thumbv8m.main-none-eabihf".to_string(),
+                        enclosing_fn: fn_name,
+                        return_type: ret_ty.to_string(),
+                        next_ssa_idx: ssa,
+                        active_symbols: vec![SsaVariable {
+                            name: dst_var.to_string(),
+                            llvm_name: dst_reg,
+                            type_hint: "i64".to_string(),
+                        }],
+                        struct_definitions: vec![],
+                        raw_intent: intent.clone(),
+                        idiom_hint: Some("HalSymbolDispatch".to_string()),
+                        anchor_id: anchor,
+                        physical_source: Some(intent),
+                        concurrency_mode: None,
+                        yield_expectation: Some("i64".to_string()),
+                        action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+                        ecosystem_context: Some("dir: pico".to_string()),
+                        lifetime_context: None,
+                        import_chain: vec![
+                            "dir: pico".to_string(),
+                            "__OMNI_AVAILABLE_SYM__:i64 @gpio_init(i64)".to_string(),
+                            "__OMNI_AVAILABLE_SYM__:i64 @gpio_put(i64, i64)".to_string(),
+                            "__OMNI_AVAILABLE_SYM__:i64 @sleep_ms(i64)".to_string(),
+                            "__OMNI_AVAILABLE_SYM__:i64 @usb_cdc_getc()".to_string(),
+                            "__OMNI_AVAILABLE_SYM__:i8* @wifi_ip()".to_string(),
+                        ],
+                    },
+                    harness_preamble: preamble,
+                    extra_decls: vec![decl],
+                    completion,
+                    broken_completion: Some(broken),
+                    diagnostic_hint: Some(diag),
+                }
+            }
+
+            // 23: Polyglot Single-Character Console Read (`Console.Read()`, `getchar()`, `sys.stdin.read(1)`)
+            //     -> `i32 @getchar()` + `sext i32 ... to i64`
+            _ => {
+                let (eco, imp, call_expr) = *rng.pick(&[
+                    ("csharp (module: System)", "csharp (module: System)", "Console.Read()"),
+                    ("c (module: stdio.h)", "c (module: stdio.h)", "getchar()"),
+                    ("python (module: sys)", "python (module: sys)", "sys.stdin.read(1)"),
+                ]);
+                let ch_var = *rng.pick(&["ch", "byte_in", "key", "next_char", "jitter"]);
+                let ch_reg = format!("%var_{}_{}", ch_var, slot_suf);
+                let intent = format!("{ch_var} = {call_expr}");
+                let preamble = format!("  {ch_reg} = alloca i64\n  store i64 0, i64* {ch_reg}\n");
+                let completion = format!(
+                    "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i32 @getchar()\n  %t_{} = sext i32 %t_{ssa} to i64\n  store i64 %t_{}, i64* {ch_reg}\n",
+                    ssa + 1,
+                    ssa + 1
+                );
+                let broken = format!(
+                    "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i64 @getchar()\n  store i64 %t_{ssa}, i64* {ch_reg}\n"
+                );
+                let diag = "LLVM IR verification error: '@getchar' defined with type 'i32 ()*' but called as 'i64 ()*'. Use `call i32 @getchar()` then `sext i32 ... to i64`.".to_string();
+
+                GeneratedScenario {
+                    domain: "polyglot_console_getchar",
+                    envelope: SsaContextEnvelope {
+                        target_abi,
+                        enclosing_fn: fn_name,
+                        return_type: ret_ty.to_string(),
+                        next_ssa_idx: ssa,
+                        active_symbols: vec![SsaVariable {
+                            name: ch_var.to_string(),
+                            llvm_name: ch_reg,
+                            type_hint: "i64".to_string(),
+                        }],
+                        struct_definitions: vec![],
+                        raw_intent: intent.clone(),
+                        idiom_hint: Some("PolyglotCharInput".to_string()),
+                        anchor_id: anchor,
+                        physical_source: Some(intent),
+                        concurrency_mode: None,
+                        yield_expectation: Some("i64".to_string()),
+                        action_directive: Some("LOWER_ASSIGNMENT".to_string()),
+                        ecosystem_context: Some(eco.to_string()),
+                        lifetime_context: None,
+                        import_chain: vec![imp.to_string()],
+                    },
+                    harness_preamble: preamble,
+                    extra_decls: vec!["declare i32 @getchar()".to_string()],
+                    completion,
+                    broken_completion: Some(broken),
+                    diagnostic_hint: Some(diag),
                 }
             }
         }
@@ -1452,9 +1737,9 @@ mod tests {
     #[test]
     fn test_synthetic_dataset_generation_and_verification() {
         let generator = SyntheticDatasetGenerator::new().expect("Verifier init failed");
-        let records = generator.generate_verified_dataset(24);
+        let records = generator.generate_verified_dataset(48);
 
-        assert_eq!(records.len(), 24);
+        assert_eq!(records.len(), 48);
         let mut repair_seen = 0;
         for r in &records {
             assert!(r.verified);
@@ -1469,7 +1754,7 @@ mod tests {
         let out_path = std::env::temp_dir().join(format!("test_synthetic_dataset_{}.jsonl", std::process::id()));
         let written = SyntheticDatasetGenerator::write_jsonl(&records, &out_path)
             .expect("Failed to write jsonl");
-        assert_eq!(written, 24);
+        assert_eq!(written, 48);
         assert!(out_path.exists());
         let _ = std::fs::remove_file(&out_path);
     }

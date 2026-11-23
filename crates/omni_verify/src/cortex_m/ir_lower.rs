@@ -1,10 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use super::chip::RpChipProfile;
+use super::cyw43_fw::{
+    emit_cyw43_lowlevel, emit_cyw43_net_entrypoints, CYW43_43439_CLM_BLOB, CYW43_43439_FW_BLOB,
+    CYW43_43439_NVRAM_BLOB, CYW43_DRIVER_IR, CYW43_NET_SYMBOL_NAMES, CYW43_SYMBOL_NAMES,
+    CYW43_WS_STACK_IR,
+};
 use super::runtime_fw::{
     emit_bare_metal_runtime, emit_boot_header, SramDataInit, SRAM_USER_GLOBALS_OFF,
 };
 use super::thumb_enc::{Cond, ThumbAssembler};
+use super::usb_cdc_fw::{
+    emit_usb_cdc_lowlevel, emit_usb_cdc_rodata, USB_CDC_DRIVER_IR, USB_CDC_RODATA_SYMS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerType {
@@ -225,13 +233,36 @@ pub fn compile_llvm_ir_to_flash_image(
         None
     };
 
-    // 2. Emit `Reset_Handler` and freestanding Cortex-M runtime
+    // 2. Emit `Reset_Handler`, freestanding Cortex-M runtime, & USB 2.0 CDC-ACM (`/dev/ttyACM0`) stack
     emit_bare_metal_runtime(&mut asm, chip, data_init.as_ref())?;
+    emit_usb_cdc_lowlevel(&mut asm, chip)?;
+    let usb_mod = parse_llvm_ir_module(USB_CDC_DRIVER_IR)
+        .map_err(|(ln, msg)| format!("usb_cdc_fw IR line {}: {}", ln, msg))?;
 
-    // Collect set of all function names (both runtime + user IR functions) so `@fn` knows Thumb bit `| 1`
+    // Collect set of all function names (runtime + USB CDC + user IR functions) so `@fn` knows Thumb bit `| 1`
     let mut all_fn_names: HashSet<String> = asm.symbols.keys().cloned().collect();
+    for uf in &usb_mod.functions {
+        all_fn_names.insert(uf.name.clone());
+    }
+    for &cyw_sym in CYW43_SYMBOL_NAMES {
+        all_fn_names.insert(cyw_sym.to_string());
+    }
     for f in &module.functions {
         all_fn_names.insert(f.name.clone());
+    }
+
+    for uf in &usb_mod.functions {
+        if asm.symbols.contains_key(&uf.name) {
+            continue;
+        }
+        lower_function(
+            &mut asm,
+            chip,
+            uf,
+            &usb_mod.structs,
+            &sram_globals,
+            &all_fn_names,
+        )?;
     }
 
     // 3. Lower every `define` function in the LLVM IR module!
@@ -250,6 +281,85 @@ pub fn compile_llvm_ir_to_flash_image(
         )?;
     }
 
+    // 3.5. Lazily link bare-metal Infineon CYW43439 gSPI + Firmware/NVRAM + OmniNet WebSocket stack ONLY if referenced!
+    let link_cyw43_net = asm.global_relocs.iter().any(|r| {
+        !asm.symbols.contains_key(&r.symbol) && CYW43_NET_SYMBOL_NAMES.contains(&r.symbol.as_str())
+    });
+    let link_cyw43 = link_cyw43_net
+        || asm.global_relocs.iter().any(|r| {
+            !asm.symbols.contains_key(&r.symbol) && CYW43_SYMBOL_NAMES.contains(&r.symbol.as_str())
+        });
+    let mut extra_rodata: Vec<GlobalConst> = Vec::new();
+
+    if link_cyw43 {
+        emit_cyw43_lowlevel(&mut asm, chip)?;
+        let cyw_mod = parse_llvm_ir_module(CYW43_DRIVER_IR)
+            .map_err(|(ln, msg)| format!("cyw43_fw IR line {}: {}", ln, msg))?;
+        for k in asm.symbols.keys() {
+            all_fn_names.insert(k.clone());
+        }
+        for cf in &cyw_mod.functions {
+            all_fn_names.insert(cf.name.clone());
+        }
+        for cf in &cyw_mod.functions {
+            if asm.symbols.contains_key(&cf.name) {
+                continue;
+            }
+            lower_function(
+                &mut asm,
+                chip,
+                cf,
+                &cyw_mod.structs,
+                &sram_globals,
+                &all_fn_names,
+            )?;
+        }
+        // Register zero-cost `cyw_ll_*` aliases for internal OmniNet stack calls!
+        for (alias, target) in [
+            ("cyw_ll_clm_ptr", "__omni_cyw43_clm_ptr"),
+            ("cyw_ll_sram_scratch", "__omni_cyw43_sram_scratch"),
+            ("cyw_ll_pack_cmd", "__omni_cyw43_pack_cmd"),
+            ("cyw_ll_read_reg", "__omni_cyw43_read_reg"),
+            ("cyw_ll_write_reg", "__omni_cyw43_write_reg"),
+            ("cyw_ll_write_bp", "__omni_cyw43_write_bp"),
+            ("cyw_ll_gspi_write_u32", "__omni_cyw43_gspi_write_u32"),
+            ("cyw_ll_gspi_write_bytes", "__omni_cyw43_gspi_write_bytes"),
+            ("cyw_ll_gspi_read_bytes", "__omni_cyw43_gspi_read_bytes"),
+        ] {
+            if let Some(&off) = asm.symbols.get(target) {
+                asm.symbols.insert(alias.to_string(), off);
+                all_fn_names.insert(alias.to_string());
+            }
+        }
+
+        if link_cyw43_net && !CYW43_WS_STACK_IR.trim().is_empty() {
+            let ws_mod = parse_llvm_ir_module(CYW43_WS_STACK_IR)
+                .map_err(|(ln, msg)| format!("cyw43_ws_ir line {}: {}", ln, msg))?;
+            for g in &ws_mod.globals {
+                if g.is_constant {
+                    extra_rodata.push(g.clone());
+                }
+            }
+            for wf in &ws_mod.functions {
+                all_fn_names.insert(wf.name.clone());
+            }
+            emit_cyw43_net_entrypoints(&mut asm, chip)?;
+            for wf in &ws_mod.functions {
+                if asm.symbols.contains_key(&wf.name) {
+                    continue;
+                }
+                lower_function(
+                    &mut asm,
+                    chip,
+                    wf,
+                    &ws_mod.structs,
+                    &sram_globals,
+                    &all_fn_names,
+                )?;
+            }
+        }
+    }
+
     // 4. Emit any unresolved `declare` external functions as safe zero-returning stubs so custom prototypes never fail link
     let referenced_syms: Vec<String> = asm
         .global_relocs
@@ -259,7 +369,12 @@ pub fn compile_llvm_ir_to_flash_image(
     for sym in referenced_syms {
         if !asm.symbols.contains_key(&sym)
             && sym != "__data_flash_lma"
+            && sym != "__cyw43_fw_blob"
+            && sym != "__cyw43_nvram_blob"
+            && sym != "__cyw43_clm_blob"
+            && !USB_CDC_RODATA_SYMS.contains(&sym.as_str())
             && !rodata_globals.iter().any(|g| g.name == sym)
+            && !extra_rodata.iter().any(|g| g.name == sym)
         {
             asm.begin_function(&sym);
             asm.emit_movs_imm8(0, 0);
@@ -269,15 +384,31 @@ pub fn compile_llvm_ir_to_flash_image(
         }
     }
 
-    // 5. Append Flash `.rodata` string literals & `.data` initialization image
+    // 5. Append Flash `.rodata` string literals, USB CDC descriptors, optional CYW43439 firmware/NVRAM, & `.data` init image
     asm.align4_zero();
-    for g in rodata_globals {
+    emit_usb_cdc_rodata(&mut asm);
+    for g in rodata_globals.into_iter().chain(extra_rodata.iter()) {
         asm.align4_zero();
         asm.symbols.insert(g.name.clone(), asm.pos());
         asm.code.extend_from_slice(&g.bytes);
         if g.bytes.is_empty() {
             asm.code.push(0);
         }
+    }
+
+    if link_cyw43 {
+        asm.align4_zero();
+        asm.symbols
+            .insert("__cyw43_fw_blob".to_string(), asm.pos());
+        asm.code.extend_from_slice(CYW43_43439_FW_BLOB);
+        asm.align4_zero();
+        asm.symbols
+            .insert("__cyw43_nvram_blob".to_string(), asm.pos());
+        asm.code.extend_from_slice(CYW43_43439_NVRAM_BLOB);
+        asm.align4_zero();
+        asm.symbols
+            .insert("__cyw43_clm_blob".to_string(), asm.pos());
+        asm.code.extend_from_slice(CYW43_43439_CLM_BLOB);
     }
 
     if !sram_init_blob.is_empty() {

@@ -1,0 +1,34 @@
+// Bare-Metal Raspberry Pi Pico 2 W (RP2350 + CYW43439) Onboard LED Blink
+// Compile: omnic build --platform pico2w examples/pico2w_blink/blink_pico2w.omni
+//
+// On Pico 2 W, the onboard green LED is wired to WL_GPIO0 on the Infineon CYW43439
+// wireless SoC (3-wire gSPI: GP23=WL_ON, GP24=WL_DIO, GP25=WL_CS, GP29=WL_CLK).
+// `omnic` natively links the freestanding CYW43439 gSPI + Silicon Backplane + A0
+// firmware/NVRAM loader into XIP Flash when `cyw43_*` intrinsics are referenced.
+
+import "pico";
+
+fn main() -> int {
+    // Optional mirror onto GP15 for an external breadboard LED / logic analyzer probe
+    gpio_init(15);
+    gpio_set_dir(15, 1);
+    gpio_put(15, 0);
+
+    print("OmniScript RP2350 Bare-Metal Booting Pico 2 W...");
+    let rc = cyw43_led_init();
+    print("CYW43439 init status:");
+    print(rc);
+
+    let state = 1;
+    while 1 {
+        cyw43_led_put(state);
+        gpio_put(15, state);
+        sleep_ms(250);
+        if state != 0 {
+            state = 0;
+        } else {
+            state = 1;
+        }
+    }
+    return 0;
+}

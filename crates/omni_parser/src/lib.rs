@@ -32,7 +32,7 @@ const NON_FLOOR_DIV_PREFIXES: &[&str] = &[
     "let ", "const ", "var ", "int ", "int32 ", "int64 ", "long ", "float ", "double ",
     "bool ", "boolean ", "void ", "auto ", "char ", "char*", "public ", "private ",
     "protected ", "internal ", "static ", "final ", "sealed ", "fn ", "func ",
-    "function ", "package ", "use ", "struct ", "impl ", "interface ", "enum ",
+    "function ", "package ", "use ", "struct ", "impl ", "interface ", "enum ", "extern ",
 ];
 
 // Valid Python binary/clause keywords permitted between adjacent identifiers after `//` floor division.
@@ -52,9 +52,18 @@ pub struct OmniModule {
     pub structs_and_classes: Vec<ClassDef>,
     pub enums: Vec<EnumDef>,
     pub functions: Vec<FunctionDef>,
+    #[serde(default)]
+    pub extern_functions: Vec<ExternFnDef>,
     pub top_level_statements: Vec<Statement>,
     pub base_dir: Option<std::path::PathBuf>,
     pub diagnostics: Vec<OmniDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternFnDef {
+    pub name: String,
+    pub params: Vec<ParamDef>,
+    pub return_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2545,6 +2554,7 @@ impl OmniParser {
         let mem_norm = MemoryNormalizer::new();
         let mut imports = Vec::new();
         let mut functions = Vec::new();
+        let mut extern_functions = Vec::new();
         let mut classes = Vec::new();
         let mut enums = Vec::new();
         let mut top_level = Vec::new();
@@ -3350,6 +3360,46 @@ impl OmniParser {
                 }
             }
 
+            // Foreign / HAL ABI declarations:
+            //   `extern fn foo(a: int) -> str;`
+            //   `extern "C" fn foo(a: int) -> int;`
+            //   `extern "C" { fn foo(a: int) -> int; ... }`
+            let ext_strip = trimmed.trim_start_matches("pub ").trim();
+            if ext_strip == "extern"
+                || ((ext_strip.starts_with("extern \"") || ext_strip.starts_with("extern '"))
+                    && !ext_strip.contains('('))
+            {
+                let blk_indent = Self::indent_level(line);
+                idx += 1;
+                while idx < raw_lines.len() {
+                    let nl = raw_lines[idx];
+                    let nt = nl.trim();
+                    if nt.is_empty() || Self::is_hash_comment(nt) || nt.starts_with("//") {
+                        idx += 1;
+                        continue;
+                    }
+                    if nt == "}" || nt.starts_with("};") {
+                        idx += 1;
+                        break;
+                    }
+                    if Self::indent_level(nl) <= blk_indent {
+                        break;
+                    }
+                    if let Some(ext_fn) = self.try_parse_extern_fn_decl(nt, true) {
+                        extern_functions.push(ext_fn);
+                    }
+                    idx += 1;
+                }
+                current_decorators.clear();
+                continue;
+            }
+            if let Some(ext_fn) = self.try_parse_extern_fn_decl(ext_strip, false) {
+                extern_functions.push(ext_fn);
+                current_decorators.clear();
+                idx += 1;
+                continue;
+            }
+
             // Top-level functions: `def foo():`, `fn foo() -> i32:`, `int foo() {`
             if let Some(caps) = self.fn_re.captures(trimmed) {
                 let fn_name = caps[1].to_string();
@@ -3463,10 +3513,54 @@ impl OmniParser {
             structs_and_classes: classes,
             enums,
             functions,
+            extern_functions,
             top_level_statements: top_level,
             base_dir: base_dir.map(|p| p.to_path_buf()),
             diagnostics: Vec::new(),
         }
+    }
+
+    fn try_parse_extern_fn_decl(&self, line: &str, inside_extern_block: bool) -> Option<ExternFnDef> {
+        let mut s = Self::strip_trailing_comment(line)
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_start_matches("pub ")
+            .trim();
+        if !inside_extern_block {
+            if let Some(rest) = s.strip_prefix("extern") {
+                let mut r = rest.trim_start();
+                if r.starts_with('"') || r.starts_with('\'') {
+                    let q = r.chars().next().unwrap();
+                    if let Some(end_q) = r[1..].find(q) {
+                        r = r[end_q + 2..].trim_start();
+                    }
+                }
+                if r.is_empty() {
+                    return None;
+                }
+                s = r;
+            } else if let Some(rest) = s.strip_prefix("declare ") {
+                s = rest.trim_start();
+            } else {
+                return None;
+            }
+        }
+        let caps = self.fn_re.captures(s)?;
+        let fn_name = caps[1].to_string();
+        let return_type = Self::extract_fn_return_type(s, &fn_name);
+        let raw_params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let params: Vec<ParamDef> = Self::split_respecting_quotes(raw_params, ',')
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| Self::parse_param(p))
+            .collect();
+        Some(ExternFnDef {
+            name: fn_name,
+            params,
+            return_type,
+        })
     }
 
     fn discover_fields_recursive(stmts: &[Statement], class_fields: &mut Vec<FieldDef>) {

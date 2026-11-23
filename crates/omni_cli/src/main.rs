@@ -442,8 +442,21 @@ fn build_file(
     oenv: Option<&str>,
 ) -> anyhow::Result<()> {
     let build_start = std::time::Instant::now();
-    let target_platform = TargetPlatform::parse(platform_spec)
+    let mut target_platform = TargetPlatform::parse(platform_spec)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+    if platform_spec.trim().eq_ignore_ascii_case("auto") {
+        if let Ok(raw_src) = fs::read_to_string(source_path) {
+            let peek_mod = OmniParser::new().parse_module("peek", &raw_src);
+            for imp in &peek_mod.imports {
+                if let Some((hal_mod, _)) = omni_preamble::extract_builtin_hal_import(imp) {
+                    if let Some(inferred) = omni_preamble::infer_platform_from_hal_import(hal_mod) {
+                        target_platform = inferred;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let targeting_windows = target_platform.llvm_triple.contains("windows");
     let targeting_rp_mcu = target_platform.is_rp_mcu();
     let final_output = normalize_output_binary_path(
@@ -629,6 +642,16 @@ fn compile_source(
     while let Some(import) = pending_imports.pop() {
         let import_key = format!("{:?}", import);
         if !processed_imports.insert(import_key) {
+            continue;
+        }
+        if let Some((hal_mod, alias_opt)) = omni_preamble::extract_builtin_hal_import(&import) {
+            if verbose {
+                println!(
+                    "  -> Activated built-in bare-metal HAL syscall prelude '{}' (alias: {:?})",
+                    hal_mod,
+                    alias_opt.unwrap_or("unqualified")
+                );
+            }
             continue;
         }
         match import {
@@ -1288,6 +1311,7 @@ fn compile_source(
             let primary_verified = VerifiedSynthesisEngine::new(candle_engine, &verifier);
             let codegen = CodeGenerator::new(&primary_verified)
                 .with_target_triple(target_platform.llvm_triple.clone())
+                .with_platform_slug(target_platform.slug.clone())
                 .with_drilled_spines(collected_drilled_spines.clone())
                 .with_user_functions(user_defined_fns.clone())
                 .with_foreign_symbols(foreign_syms);
@@ -1302,6 +1326,7 @@ fn compile_source(
                 let composite = FallbackEngine::new(primary_verified, fallback);
                 let codegen = CodeGenerator::new(&composite)
                     .with_target_triple(target_platform.llvm_triple.clone())
+                    .with_platform_slug(target_platform.slug.clone())
                     .with_drilled_spines(collected_drilled_spines.clone())
                     .with_user_functions(user_defined_fns.clone())
                     .with_foreign_symbols(foreign_syms);
@@ -1309,6 +1334,7 @@ fn compile_source(
             } else {
                 let codegen = CodeGenerator::new(&primary_verified)
                     .with_target_triple(target_platform.llvm_triple.clone())
+                    .with_platform_slug(target_platform.slug.clone())
                     .with_drilled_spines(collected_drilled_spines.clone())
                     .with_user_functions(user_defined_fns.clone())
                     .with_foreign_symbols(foreign_syms);

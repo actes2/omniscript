@@ -162,6 +162,7 @@ impl SsaContextEnvelope {
         let mut short_circuit_hints = Vec::new();
         let mut abductive_evidence = Vec::new();
         let mut semantic_obligations = Vec::new();
+        let mut available_syms = Vec::new();
         for imp in &self.import_chain {
             if let Some(sc) = imp.strip_prefix("__OMNI_SHORT_CIRCUIT_IR__:") {
                 let sc_t = sc.trim();
@@ -186,6 +187,11 @@ impl SsaContextEnvelope {
                 let so_t = so.trim();
                 if !semantic_obligations.contains(&so_t) {
                     semantic_obligations.push(so_t);
+                }
+            } else if let Some(av) = imp.strip_prefix("__OMNI_AVAILABLE_SYM__:") {
+                let av_t = av.trim();
+                if !av_t.is_empty() && !available_syms.contains(&av_t) {
+                    available_syms.push(av_t);
                 }
             } else if !imp.starts_with("__OMNI_DEP_WALK__:")
                 && !imp.starts_with("__OMNI_CARVED_FN__:")
@@ -354,7 +360,15 @@ impl SsaContextEnvelope {
         }
         out.push_str("  <platform_abi>\n");
         out.push_str("    Full LLVM IR instruction set is active. You may emit standard 'declare' prototypes for external platform C ABI calls if not present in runtime declarations.\n");
-        out.push_str("    Core runtime intrinsics: @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), @__omni_str_concat(i8*, i8*), @__omni_int_to_str(i64).\n");
+        out.push_str("    Core runtime intrinsics: i8* @__omni_input(i8* prompt), void @__omni_print_str(i8*), void @__omni_print_int(i64), i32 @getchar(), i32 @putchar(i32), @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), i8* @__omni_str_concat(i8*, i8*), i8* @__omni_int_to_str(i64).\n");
+        if !available_syms.is_empty() {
+            let joined = available_syms
+                .into_iter()
+                .take(24)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("    Available module & extern symbols: {}.\n", joined));
+        }
         out.push_str("  </platform_abi>\n");
 
         out.push_str(&format!("  <intent>{}</intent>\n", clean_intent));
