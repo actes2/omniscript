@@ -1347,6 +1347,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "omni_codegen",
  "omni_engine",
  "omni_mem",
@@ -1354,6 +1355,7 @@ dependencies = [
  "omni_preamble",
  "omni_runtime",
  "omni_verify",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

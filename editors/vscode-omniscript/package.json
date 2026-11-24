@@ -1,0 +1,123 @@
+{
+  "name": "omniscript",
+  "displayName": "OmniScript Polyglot Language Support",
+  "description": "Syntax highlighting, bracket matching, and snippets for OmniScript (.omni) polyglot source files (Python, Rust, C, C#, Java, Go, JS, Pico bare-metal).",
+  "version": "0.2.2",
+  "publisher": "omniscript",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "activationEvents": [
+    "onLanguage:omniscript"
+  ],
+  "main": "./extension.js",
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Linters"
+  ],
+  "keywords": [
+    "omniscript",
+    "omni",
+    "polyglot",
+    "llvm",
+    "pico",
+    "rp2350",
+    "embedded"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "OmniScript",
+      "properties": {
+        "omniscript.omnicPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `omnic` compiler binary. Leave empty to auto-detect `<workspace>/target/release/omnic`, `<workspace>/target/debug/omnic`, or `omnic` on PATH."
+        },
+        "omniscript.requirementsFile": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the active `omni-requirements.txt` manifest used for package lookups and `omnic install`. Leave empty to default to `<workspace>/omni-requirements.txt`."
+        },
+        "omniscript.enableDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run fast zero-LLM `omnic check --json` diagnostics on open and save."
+        },
+        "omniscript.showLlmInferredHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show informational squiggles on lines that will be dynamically inferred by omni-coder.gguf."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "omniscript.runFile",
+        "title": "OmniScript: Run Current File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "omniscript.buildFile",
+        "title": "OmniScript: Build Current File",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "omniscript.statusBarMenu",
+        "title": "OmniScript: Open Status Menu"
+      },
+      {
+        "command": "omniscript.selectOmnicPath",
+        "title": "OmniScript: Select omnic Binary Path"
+      },
+      {
+        "command": "omniscript.selectRequirementsFile",
+        "title": "OmniScript: Select omni-requirements.txt File"
+      },
+      {
+        "command": "omniscript.lookupImportPackage",
+        "title": "OmniScript: Lookup Import Package & Add to omni-requirements.txt"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "omniscript.runFile",
+          "when": "resourceLangId == omniscript",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omniscript.buildFile",
+          "when": "resourceLangId == omniscript",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "languages": [
+      {
+        "id": "omniscript",
+        "aliases": [
+          "OmniScript",
+          "omni"
+        ],
+        "extensions": [
+          ".omni"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "omniscript",
+        "scopeName": "source.omni",
+        "path": "./syntaxes/omniscript.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "omniscript",
+        "path": "./snippets/omniscript.json"
+      }
+    ]
+  }
+}
