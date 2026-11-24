@@ -2,7 +2,7 @@
   "name": "omniscript",
   "displayName": "OmniScript Polyglot Language Support",
   "description": "Syntax highlighting, bracket matching, and snippets for OmniScript (.omni) polyglot source files (Python, Rust, C, C#, Java, Go, JS, Pico bare-metal).",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "publisher": "omniscript",
   "engines": {
     "vscode": "^1.75.0"
