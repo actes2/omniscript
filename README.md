@@ -2,13 +2,18 @@
 
 > **Autonomous Polyglot Systems Compiler & Zero-GC Runtime with In-Process AI Lowering**
 
-OmniScript (`omnic`) is a high-performance polyglot systems programming compiler and runtime written in Rust and low-level C. 
+OmniScript (`omnic`) is a compiler aimed at being, a universal compiler for all languages to a common-IR.
+> We do so in-deterministically, which is a beautiful violation to compiler theory!
 
-It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **Go**, **JavaScript**, **C/C++**, **Java**, **C#**, and **Lua** within single translation units. 
+It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **Go**, **JavaScript**, **C/C++**, **Java**, **C#**, and **Lua** within single translation units.
 
 OmniScript lowers directly to **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution; **completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
 
-## What is OmniScript
+____
+#### Check out our latest [major release here!](https://github.com/actes2/omniscript/releases/v0.3.0)
+____
+
+## What is OmniScript?
 
 It's all the languages, but its none-of-them at the same time, simply write in any language you want
 ```python
@@ -44,7 +49,7 @@ Make sure you've installed `clang.exe` and its available in your `%PATH%`
 
 ___
 #### What OmniScript Actually Compiles Today (Beyond Syntax Mixing)
-Unlike polyglot wrappers that embed heavy foreign runtimes (`libpython`, V8, JVM, or Go's GC) or bridge languages over slow IPC/FFI shims, `omnic` acts as a **whole-program cross-ecosystem static compiler & binary lifter**:
+Unlike other compilers or frameworks aiming to map across ecosystems, we don't embed other compilers or shims. We focus entirely on, converting **your instructions** to LLVM, in any way possible. This is done through clever parsing and mixing of different lexicological algorithms to infer syntax intent based on a magnitude of languages
 * **Dependency Carving:**
 `omni_preamble` statically traces reachable call spines across **C/C++**, **Python**, **Go**, **Rust**, **Java/JVM Bytecode**, **JavaScript/TypeScript**, **C#**, and **Lua** (plus procedural idioms from Zig, Julia, Nim, Ruby, Kotlin, and Swift), dead-stripping 99%+ of unused package code and compiling the surviving cross-language graph into **one single LLVM IR translation unit** (`clang -O2` inlines across Python, Go, and C simultaneously, linking only the OS syscall libc).
 > We basically drill through every dependency chain until we find the lowest level possible and translate back-up the 'spine' the intentions of those dependencies; which are converted to LLVM IR
@@ -60,7 +65,7 @@ ___
 ### Background
 OmniScript is a language I wrote over a weekend, after considering the paradigm of: *"What if I could just put python, into my Go, and Java, and C, and Rust, and Javascript"* 
 
-After considering the notion and understanding the fundamentals behind compiler theory, and my own working experience with building transpilers I took on the task to make this unification of an omni-applicable language that can run just about any language you throw at it.
+After considering the notion and understanding the fundamentals behind compiler theory, and my own working experience with building transpilers I took on the task to make this unification of an omni-applicable processing system that can run just about any language you throw at it.
 
 ### How does it work?
 OmniScript essentially is a top-level AST (Abstract Syntax Tree), that converts incoming common programming language syntax into decorated IR (Intermediate Representation) code, with various type-hints and primitive LLVM constructs. In our 1st layer, we perform a **semi-stringent** pass where we convert most common language stuff to the same LLVM references. Then as part of that pass we find anonymous abstract code blocks that are unknown to our static-assignment maps; and we decorate them in a way that our LLM can properly read them.
