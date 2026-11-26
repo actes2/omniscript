@@ -143,5 +143,138 @@ fn main() -> int {
     let u_out = String::from_utf8_lossy(&run_u.stdout);
     assert!(u_out.contains("Stage-3 OK") && u_out.contains("65"), "Unexpected stdout: {}", u_out);
 
+    // 7. Stage-3 compiles a Rust (.rs) program (pub struct, impl, &mut self, for..in, else if, +=, println!)
+    let rust_src = tmp.join("rust_demo.rs");
+    let rust_obc = tmp.join("rust_demo.obc");
+    std::fs::write(
+        &rust_src,
+        r#"
+pub struct Accumulator {
+    pub total: i64,
+    pub steps: i64,
+}
+impl Accumulator {
+    pub fn reset(&mut self, base: i64) -> i64 {
+        self.total = base;
+        self.steps = 0;
+        return 0;
+    }
+    pub fn add(&mut self, delta: i64) -> i64 {
+        self.total += delta;
+        self.steps += 1;
+        return self.total;
+    }
+}
+pub fn fib(n: i64) -> i64 {
+    if n <= 1 {
+        return n;
+    } else if n == 2 {
+        return 1;
+    } else {
+        return fib(n - 1) + fib(n - 2);
+    }
+}
+pub fn main() -> i64 {
+    let mut acc = Accumulator::new();
+    acc.reset(0);
+    for i in 1..11 {
+        acc.add(i);
+    }
+    let f = fib(10);
+    if !false && true {
+        println!("Rust Stage-3 OK");
+        println!(acc.total);
+    }
+    return acc.total + f;
+}
+"#,
+    )
+    .unwrap();
+
+    let br = Command::new(&omnic_bin)
+        .args([
+            "run",
+            stage3_obc.to_str().unwrap(),
+            rust_src.to_str().unwrap(),
+            rust_obc.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Stage-3 Rust compile failed");
+    assert!(br.status.success(), "Stage-3 failed to compile rust_demo.rs");
+    let run_r = Command::new(&omnic_bin)
+        .args(["run", rust_obc.to_str().unwrap()])
+        .output()
+        .expect("Running rust_demo.obc failed");
+    assert_eq!(run_r.status.code(), Some(110));
+    let r_out = String::from_utf8_lossy(&run_r.stdout);
+    assert!(r_out.contains("Rust Stage-3 OK") && r_out.contains("55"), "Unexpected Rust stdout: {}", r_out);
+
+    // 8. Native Linux x86_64 ELF64 (.o) 3-stage fixpoint (Stage-2.o === Stage-3.o, zero Rust/Cranelift/Clang!)
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let stage2_o = tmp.join("omnic_stage2.o");
+        let stage3_o = tmp.join("omnic_stage3.o");
+        let stage2_bin = tmp.join("omnic_stage2_native");
+
+        let e1 = Command::new(&stage1_bin)
+            .args([stage1_src.to_str().unwrap(), stage2_o.to_str().unwrap()])
+            .output()
+            .expect("Stage-1 ELF64 emit failed");
+        assert!(e1.status.success(), "Stage-1 failed to emit omnic_stage2.o");
+
+        // Locate newest libomni_runtime_native.a in target/release/build or target/debug/build
+        let mut rt_candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        for profile in ["release", "debug"] {
+            let build_dir = repo_root.join("target").join(profile).join("build");
+            if let Ok(entries) = std::fs::read_dir(&build_dir) {
+                for ent in entries.flatten() {
+                    let cand = ent.path().join("out/libomni_runtime_native.a");
+                    if let Ok(meta) = std::fs::metadata(&cand) {
+                        if let Ok(mtime) = meta.modified() {
+                            rt_candidates.push((mtime, cand));
+                        }
+                    }
+                }
+            }
+        }
+        rt_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let rt_lib = rt_candidates.into_iter().next().map(|(_, p)| p);
+        if let Some(rt) = rt_lib {
+            let lnk = Command::new("cc")
+                .args([
+                    stage2_o.to_str().unwrap(),
+                    rt.to_str().unwrap(),
+                    "-lm",
+                    "-lpthread",
+                    "-ldl",
+                    "-o",
+                    stage2_bin.to_str().unwrap(),
+                ])
+                .output()
+                .expect("cc link of omnic_stage2.o failed");
+            assert!(
+                lnk.status.success(),
+                "Linking Stage-2 native ELF failed:\n{}",
+                String::from_utf8_lossy(&lnk.stderr)
+            );
+
+            let e2 = Command::new(&stage2_bin)
+                .args([stage1_src.to_str().unwrap(), stage3_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 native self-compile failed");
+            assert!(e2.status.success(), "Stage-2 native failed to emit omnic_stage3.o");
+
+            let o2 = std::fs::read(&stage2_o).expect("read stage2.o");
+            let o3 = std::fs::read(&stage3_o).expect("read stage3.o");
+            assert!(o2.starts_with(b"\x7fELF"), "Stage-2 .o must be valid ELF64");
+            assert_eq!(
+                o2, o3,
+                "Native x86_64 ELF64 fixpoint violated: Stage-2.o ({} B) != Stage-3.o ({} B)",
+                o2.len(),
+                o3.len()
+            );
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&tmp);
 }
