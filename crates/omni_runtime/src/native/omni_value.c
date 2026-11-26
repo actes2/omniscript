@@ -2100,6 +2100,27 @@ int64_t __omni_fs_write_bytes(const char* path, void* ptr) {
     return (int64_t)wrote;
 }
 
+void* __omni_fs_read_bytes(const char* path) {
+    OmniBytes* b = (OmniBytes*)malloc(sizeof(OmniBytes));
+    b->data = NULL; b->len = 0; b->cap = 0;
+    if (!path) return b;
+    FILE* f = fopen(path, "rb");
+    if (!f) return b;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz < 0) sz = 0;
+    fseek(f, 0, SEEK_SET);
+    if (sz > 0) {
+        b->data = (uint8_t*)malloc((size_t)sz);
+        if (b->data) {
+            b->len = fread(b->data, 1, (size_t)sz, f);
+            b->cap = (size_t)sz;
+        }
+    }
+    fclose(f);
+    return b;
+}
+
 int64_t __omni_fs_exists(const char* path) {
     if (!path) return 0;
     FILE* f = fopen(path, "rb");

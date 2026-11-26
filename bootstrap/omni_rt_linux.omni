@@ -1,0 +1,141 @@
+// ============================================================================
+// Pure-OmniScript Freestanding Linux x86_64 Runtime (`bootstrap/omni_rt_linux.omni`)
+// Zero libc, Zero cc, Zero ld -- direct Linux kernel syscalls (`sys_brk`, `sys_openat`, `sys_read`, `sys_write`, `sys_close`)!
+// ============================================================================
+
+extern fn __omni_syscall4(num: int, a1: int, a2: int, a3: int, a4: int) -> int;
+extern fn __omni_mem_read8(addr: int) -> int;
+extern fn __omni_mem_write8(addr: int, val: int) -> void;
+extern fn __omni_mem_read64(addr: int) -> int;
+extern fn __omni_mem_write64(addr: int, val: int) -> void;
+
+// Direct Linux kernel sys_brk bump allocator (syscall 12)
+fn rt_alloc(size: int) -> int {
+    let aligned = ((size + 15) / 16) * 16
+    let cur = __omni_syscall4(12, 0, 0, 0, 0)
+    __omni_syscall4(12, cur + aligned, 0, 0, 0)
+    return cur
+}
+
+// Freestanding Slice: [len: i64, cap: i64, data_ptr: i64] (24 bytes)
+fn rt_slice_create(cap: int) -> int {
+    let c = cap
+    if c < 8 {
+        c = 8
+    }
+    let hdr = rt_alloc(24)
+    let data = rt_alloc(c * 8)
+    __omni_mem_write64(hdr, 0)
+    __omni_mem_write64(hdr + 8, c)
+    __omni_mem_write64(hdr + 16, data)
+    return hdr
+}
+
+fn rt_slice_len(sl: int) -> int {
+    return __omni_mem_read64(sl)
+}
+
+fn rt_slice_get(sl: int, idx: int) -> int {
+    let data = __omni_mem_read64(sl + 16)
+    return __omni_mem_read64(data + idx * 8)
+}
+
+fn rt_slice_set(sl: int, idx: int, val: int) -> int {
+    let data = __omni_mem_read64(sl + 16)
+    __omni_mem_write64(data + idx * 8, val)
+    return 0
+}
+
+fn rt_slice_append(sl: int, val: int) -> int {
+    let n = __omni_mem_read64(sl)
+    let cap = __omni_mem_read64(sl + 8)
+    let data = __omni_mem_read64(sl + 16)
+    if n >= cap {
+        let ncap = cap * 2
+        let ndata = rt_alloc(ncap * 8)
+        let i = 0
+        while i < n {
+            __omni_mem_write64(ndata + i * 8, __omni_mem_read64(data + i * 8))
+            i = i + 1
+        }
+        data = ndata
+        __omni_mem_write64(sl + 8, ncap)
+        __omni_mem_write64(sl + 16, ndata)
+    }
+    __omni_mem_write64(data + n * 8, val)
+    __omni_mem_write64(sl, n + 1)
+    return 0
+}
+
+// Freestanding Byte Buffer: [len: i64, cap: i64, data_ptr: i64]
+fn rt_bytes_create(cap: int) -> int {
+    let c = cap
+    if c < 64 {
+        c = 64
+    }
+    let hdr = rt_alloc(24)
+    let data = rt_alloc(c)
+    __omni_mem_write64(hdr, 0)
+    __omni_mem_write64(hdr + 8, c)
+    __omni_mem_write64(hdr + 16, data)
+    return hdr
+}
+
+fn rt_bytes_push_u8(b: int, v: int) -> int {
+    let n = __omni_mem_read64(b)
+    let cap = __omni_mem_read64(b + 8)
+    let data = __omni_mem_read64(b + 16)
+    if n >= cap {
+        let ncap = cap * 2
+        let ndata = rt_alloc(ncap)
+        let i = 0
+        while i < n {
+            __omni_mem_write8(ndata + i, __omni_mem_read8(data + i))
+            i = i + 1
+        }
+        data = ndata
+        __omni_mem_write64(b + 8, ncap)
+        __omni_mem_write64(b + 16, ndata)
+    }
+    __omni_mem_write8(data + n, v & 255)
+    __omni_mem_write64(b, n + 1)
+    return 0
+}
+
+fn rt_bytes_len(b: int) -> int {
+    return __omni_mem_read64(b)
+}
+
+fn rt_bytes_get(b: int, off: int) -> int {
+    let data = __omni_mem_read64(b + 16)
+    return __omni_mem_read8(data + off)
+}
+
+// Direct Linux sys_openat (257), sys_write (1), sys_read (0), sys_close (3)
+fn rt_fs_write_bytes(path: str, b: int) -> int {
+    // AT_FDCWD = -100, O_WRONLY|O_CREAT|O_TRUNC = 577 (0x241), mode = 420 (0644)
+    let fd = __omni_syscall4(257, -100, path, 577, 420)
+    if fd < 0 {
+        return -1
+    }
+    let data = __omni_mem_read64(b + 16)
+    let n = __omni_mem_read64(b)
+    let wrote = __omni_syscall4(1, fd, data, n, 0)
+    __omni_syscall4(3, fd, 0, 0, 0)
+    return wrote
+}
+
+fn rt_fs_read_text(path: str, max_len: int) -> str {
+    let fd = __omni_syscall4(257, -100, path, 0, 0)
+    if fd < 0 {
+        return ""
+    }
+    let buf = rt_alloc(max_len + 1)
+    let got = __omni_syscall4(0, fd, buf, max_len, 0)
+    __omni_syscall4(3, fd, 0, 0, 0)
+    if got < 0 {
+        got = 0
+    }
+    __omni_mem_write8(buf + got, 0)
+    return buf
+}

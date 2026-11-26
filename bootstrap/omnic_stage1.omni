@@ -518,6 +518,9 @@ fn load_source_with_imports(path: int, visited: int) -> int {
                 if q2 > q1 {
                     let rel = __omni_str_slice_step(src, q1, q2, 1, 1, 1)
                     let cand1 = __omni_str_concat(dir, rel)
+                    if __omni_str_len(rel) > 0 && __omni_str_byte_at(rel, 0) == 47 {
+                        cand1 = rel
+                    }
                     if __omni_fs_exists(cand1) == 1 {
                         imp_path = cand1
                     }
@@ -4528,8 +4531,9 @@ class Compiler {
                         ai = ai + 1
                     }
                     if eidx > 1 {
-                        print("omnic_stage1 error: unsupported extern in standalone binary")
+                        print("omnic_stage1 error: unsupported extern in standalone PE32+ binary")
                         __omni_bytes_destroy(text)
+                        __omni_bytes_destroy(rdata)
                         return 0
                     }
                     let tgt_off = pint_off
@@ -5092,6 +5096,55 @@ class Compiler {
         __omni_bytes_push_u8(text, 15)
         __omni_bytes_push_u8(text, 5)
 
+        // Builtin __omni_syscall4(num, a1, a2, a3, a4)
+        let sys4_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 248)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 247)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 214)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 202)
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 194)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 5)
+        __omni_bytes_push_u8(text, 195)
+
+        // Builtin __omni_mem_read8(addr) -> u8
+        let mr8_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 182)
+        __omni_bytes_push_u8(text, 7)
+        __omni_bytes_push_u8(text, 195)
+
+        // Builtin __omni_mem_write8(addr, val)
+        let mw8_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 64)
+        __omni_bytes_push_u8(text, 136)
+        __omni_bytes_push_u8(text, 55)
+        __omni_bytes_push_u8(text, 195)
+
+        // Builtin __omni_mem_read64(addr) -> i64
+        let mr64_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 139)
+        __omni_bytes_push_u8(text, 7)
+        __omni_bytes_push_u8(text, 195)
+
+        // Builtin __omni_mem_write64(addr, val)
+        let mw64_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 55)
+        __omni_bytes_push_u8(text, 195)
+
         // Builtin __omni_print_str(rdi = str_ptr) via Linux sys_write(1, ptr, len)
         let pstr_off = __omni_bytes_len(text)
         __omni_bytes_push_u8(text, 85)
@@ -5602,14 +5655,34 @@ class Compiler {
                         x64_load_arg_reg(text, ai, areg)
                         ai = ai + 1
                     }
-                    if eidx > 1 {
-                        print("omnic_stage1 error: unsupported extern in standalone binary")
-                        __omni_bytes_destroy(text)
-                        return 0
+                    let en_str = __omni_slice_get(self.extern_names, eidx)
+                    let tgt_off = -1
+                    if eidx == 0 {
+                        tgt_off = pint_off
                     }
-                    let tgt_off = pint_off
                     if eidx == 1 {
                         tgt_off = pstr_off
+                    }
+                    if str_eq_raw(en_str, "__omni_syscall4") == 1 {
+                        tgt_off = sys4_off
+                    }
+                    if str_eq_raw(en_str, "__omni_mem_read8") == 1 {
+                        tgt_off = mr8_off
+                    }
+                    if str_eq_raw(en_str, "__omni_mem_write8") == 1 {
+                        tgt_off = mw8_off
+                    }
+                    if str_eq_raw(en_str, "__omni_mem_read64") == 1 {
+                        tgt_off = mr64_off
+                    }
+                    if str_eq_raw(en_str, "__omni_mem_write64") == 1 {
+                        tgt_off = mw64_off
+                    }
+                    if tgt_off < 0 {
+                        print("omnic_stage1 error: unsupported extern in standalone ELF binary")
+                        __omni_bytes_destroy(text)
+                        __omni_bytes_destroy(rodata)
+                        return 0
                     }
                     __omni_bytes_push_u8(text, 232)
                     let coff = __omni_bytes_len(text)

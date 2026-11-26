@@ -29,6 +29,7 @@ MODELS_DIR = BASE_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_SCRIPT = SCRIPTS_DIR / "train_omni_model.py"
+GPU_SETUP_SCRIPT = SCRIPTS_DIR / "setup_and_train_gpu.sh"
 DATASET_FILE = OUTPUTS_DIR / "synthetic_training_dataset.jsonl"
 IMATRIX_FILE = OUTPUTS_DIR / "imatrix_calib.txt"
 DEFAULT_DEST_MODEL = MODELS_DIR / "omni-coder.gguf"
@@ -72,6 +73,9 @@ def index():
         <li><a href="/bundle.tar.gz">bundle.tar.gz</a> (All 3 files in a single archive)</li>
     </ul>
 
+    <h3>0. One-Liner Full Auto Setup + Train + Quantize + Upload on Fresh GPU Server:</h3>
+    <pre style="background: #f3f3f3; padding: 12px; border-radius: 4px;">curl -sSL {base}/setup_and_train_gpu.sh | bash -s -- {base}</pre>
+
     <h3>1. Pull Assets on Lab-Box:</h3>
     <pre style="background: #f3f3f3; padding: 12px; border-radius: 4px;">curl -O {base}/download/train_omni_model.py
 curl -O {base}/download/synthetic_training_dataset.jsonl
@@ -82,6 +86,14 @@ curl -O {base}/download/imatrix_calib.txt</pre>
 </body>
 </html>
 """
+
+
+@app.route("/setup_and_train_gpu.sh", methods=["GET"])
+@app.route("/download/setup_and_train_gpu.sh", methods=["GET"])
+def download_gpu_setup():
+    if not GPU_SETUP_SCRIPT.exists():
+        return jsonify({"error": "setup_and_train_gpu.sh not found"}), 404
+    return send_file(GPU_SETUP_SCRIPT, as_attachment=True, download_name="setup_and_train_gpu.sh")
 
 
 @app.route("/train_omni_model.py", methods=["GET"])

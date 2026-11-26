@@ -238,6 +238,7 @@ declare void @__omni_bytes_destroy(i8*)
 declare i8* @__omni_fs_read_text(i8*)
 declare i64 @__omni_fs_write_text(i8*, i8*)
 declare i64 @__omni_fs_write_bytes(i8*, i8*)
+declare i8* @__omni_fs_read_bytes(i8*)
 declare i64 @__omni_fs_exists(i8*)
 "#
         )
@@ -410,6 +411,7 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         fn __omni_fs_read_text(path: *const i8) -> *mut i8;
         fn __omni_fs_write_text(path: *const i8, content: *const i8) -> i64;
         fn __omni_fs_write_bytes(path: *const i8, b: *mut u8) -> i64;
+        fn __omni_fs_read_bytes(path: *const i8) -> *mut u8;
         fn __omni_fs_exists(path: *const i8) -> i64;
 
         fn pow(x: f64, y: f64) -> f64;
@@ -555,6 +557,7 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_fs_read_text", __omni_fs_read_text as *const u8),
         ("__omni_fs_write_text", __omni_fs_write_text as *const u8),
         ("__omni_fs_write_bytes", __omni_fs_write_bytes as *const u8),
+        ("__omni_fs_read_bytes", __omni_fs_read_bytes as *const u8),
         ("__omni_fs_exists", __omni_fs_exists as *const u8),
         ("pow", pow as *const u8),
     ]

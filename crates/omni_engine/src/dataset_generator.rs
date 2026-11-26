@@ -773,10 +773,20 @@ impl SyntheticDatasetGenerator {
                 let completion = format!(
                     "  ; >>> [Synthesized: {intent}]\n  %t_{ssa} = call i64 @__omni_random_range(i64 {eff_lo}, i64 {hi})\n  store i64 %t_{ssa}, i64* {d_reg}\n"
                 );
-                let broken = format!(
-                    "  %t_{ssa} = call i64 @__omni_random_range((int), i64 {hi})\n  store i64 %t_{ssa}, i64* {d_reg}\n"
-                );
-                let diag = "LLVM IR syntax error: expected type token, got C-style cast '(int)' (use explicit 'i64 <val>')".to_string();
+                let broken = if seq_idx % 2 == 0 {
+                    format!(
+                        "  %t_{ssa} = call i64 @__omni_fn_random_range(i64 {eff_lo}, i64 {hi})\n  store i64 %t_{ssa}, i64* {d_reg}\n"
+                    )
+                } else {
+                    format!(
+                        "  %t_{ssa} = call i64 @__omni_random_range((int), i64 {hi})\n  store i64 %t_{ssa}, i64* {d_reg}\n"
+                    )
+                };
+                let diag = if seq_idx % 2 == 0 {
+                    "LLVM IR error: undefined symbol '@__omni_fn_random_range' (universal runtime ABI symbol is '@__omni_random_range', never '@__omni_fn_*')".to_string()
+                } else {
+                    "LLVM IR syntax error: expected type token, got C-style cast '(int)' (use explicit 'i64 <val>')".to_string()
+                };
 
                 GeneratedScenario {
                     domain: "foreign_random_range",
