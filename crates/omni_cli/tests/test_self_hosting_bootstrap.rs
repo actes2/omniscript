@@ -423,6 +423,67 @@ fn main() -> int {
                 a2.len(),
                 a3.len()
             );
+
+            // 12. Standalone Windows x86_64 PE32+ (.exe) emitted by Stage-2 (zero MinGW/linker!)
+            let win_src = tmp.join("win64_demo.omni");
+            let win_exe = tmp.join("win64_demo.exe");
+            std::fs::write(
+                &win_src,
+                "fn fib(n: int) -> int {\n    if n <= 1 {\n        return n\n    }\n    return fib(n - 1) + fib(n - 2)\n}\nfn main() -> int {\n    print(\"Win64 PE32+ OK\")\n    let f = fib(10)\n    print(f)\n    return f\n}\n",
+            )
+            .unwrap();
+            let ew = Command::new(&stage2_bin)
+                .args([win_src.to_str().unwrap(), win_exe.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 Win64 PE32+ emit failed");
+            assert!(ew.status.success(), "Stage-2 failed to emit win64_demo.exe");
+            let pe_bytes = std::fs::read(&win_exe).expect("read win64_demo.exe");
+            assert!(pe_bytes.starts_with(b"MZ"), "Windows .exe must start with MZ header");
+            assert_eq!(&pe_bytes[64..68], b"PE\0\0", "Windows .exe must have PE\\0\\0 signature");
+            // If wine is installed and headless prefix is ready, execute the .exe live!
+            if let Ok(home) = std::env::var("HOME") {
+                let prefix = PathBuf::from(&home).join(".cache/omni_wine_prefix");
+                if prefix.exists() {
+                    if let Ok(rw) = Command::new("wine")
+                        .arg(&win_exe)
+                        .env_remove("DISPLAY")
+                        .env_remove("WAYLAND_DISPLAY")
+                        .env("WINEPREFIX", &prefix)
+                        .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
+                        .env("WINEDEBUG", "-all")
+                        .output()
+                    {
+                        assert_eq!(rw.status.code(), Some(55), "Win64 .exe under Wine must exit 55");
+                        let wout = String::from_utf8_lossy(&rw.stdout);
+                        assert!(wout.contains("Win64 PE32+ OK") && wout.contains("55"), "Unexpected Wine stdout: {}", wout);
+                    }
+                }
+            }
+
+            // 13. Bare-metal Cortex-M33 RP2350 Thumb-2 (.uf2) emitted by Stage-2 (zero arm-none-eabi-gcc!)
+            let rp_src = tmp.join("rp2350_demo.omni");
+            let rp_uf2 = tmp.join("rp2350_demo.uf2");
+            std::fs::write(
+                &rp_src,
+                "fn fib(n: int) -> int {\n    if n <= 1 {\n        return n\n    }\n    return fib(n - 1) + fib(n - 2)\n}\nfn main() -> int {\n    return fib(10)\n}\n",
+            )
+            .unwrap();
+            let erp = Command::new(&stage2_bin)
+                .args([rp_src.to_str().unwrap(), rp_uf2.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 RP2350 UF2 emit failed");
+            assert!(erp.status.success(), "Stage-2 failed to emit rp2350_demo.uf2");
+            let uf2_bytes = std::fs::read(&rp_uf2).expect("read rp2350_demo.uf2");
+            assert!(uf2_bytes.len() >= 512 && uf2_bytes.len() % 512 == 0, "UF2 must be 512-byte blocks");
+            assert_eq!(&uf2_bytes[0..4], &0x0A324655u32.to_le_bytes(), "UF2 magicStart0");
+            assert_eq!(&uf2_bytes[28..32], &0xE48BFF59u32.to_le_bytes(), "UF2 RP2350 familyID");
+            assert_eq!(&uf2_bytes[508..512], &0x0AB16F30u32.to_le_bytes(), "UF2 magicEnd");
+            if let Ok(pt) = Command::new("picotool").args(["info", "-a", rp_uf2.to_str().unwrap()]).output() {
+                if pt.status.success() {
+                    let pout = String::from_utf8_lossy(&pt.stdout);
+                    assert!(pout.contains("RP2350") && pout.contains("ARM Secure"), "Unexpected picotool output: {}", pout);
+                }
+            }
         }
     }
 

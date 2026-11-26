@@ -244,6 +244,118 @@ fn x64_store_arg_reg(text: int, arg_idx: int, slot_reg: int) -> int {
     return 0
 }
 
+fn win64_load_arg_reg(text: int, arg_idx: int, slot_reg: int) -> int {
+    let rex = 72
+    let modrm = 141
+    if arg_idx == 0 {
+        rex = 72
+        modrm = 141
+    }
+    if arg_idx == 1 {
+        rex = 72
+        modrm = 149
+    }
+    if arg_idx == 2 {
+        rex = 76
+        modrm = 133
+    }
+    if arg_idx == 3 {
+        rex = 76
+        modrm = 141
+    }
+    __omni_bytes_push_u8(text, rex)
+    __omni_bytes_push_u8(text, 139)
+    __omni_bytes_push_u8(text, modrm)
+    __omni_bytes_push_u32(text, x64_slot_disp(slot_reg))
+    return 0
+}
+
+fn win64_store_arg_reg(text: int, arg_idx: int, slot_reg: int) -> int {
+    let rex = 72
+    let modrm = 141
+    if arg_idx == 0 {
+        rex = 72
+        modrm = 141
+    }
+    if arg_idx == 1 {
+        rex = 72
+        modrm = 149
+    }
+    if arg_idx == 2 {
+        rex = 76
+        modrm = 133
+    }
+    if arg_idx == 3 {
+        rex = 76
+        modrm = 141
+    }
+    __omni_bytes_push_u8(text, rex)
+    __omni_bytes_push_u8(text, 137)
+    __omni_bytes_push_u8(text, modrm)
+    __omni_bytes_push_u32(text, x64_slot_disp(slot_reg))
+    return 0
+}
+
+fn pe_push_sec_a(out: int, name: str, vsz: int, vaddr: int, rsz: int, rptr: int) -> int {
+    let nlen = __omni_str_len(name)
+    __omni_bytes_push_str(out, name)
+    let pad = 8 - nlen
+    while pad > 0 {
+        __omni_bytes_push_u8(out, 0)
+        pad = pad - 1
+    }
+    __omni_bytes_push_u32(out, vsz)
+    __omni_bytes_push_u32(out, vaddr)
+    __omni_bytes_push_u32(out, rsz)
+    __omni_bytes_push_u32(out, rptr)
+    return 0
+}
+
+fn pe_push_sec_b(out: int, chars: int) -> int {
+    __omni_bytes_push_u32(out, 0)
+    __omni_bytes_push_u32(out, 0)
+    __omni_bytes_push_u16(out, 0)
+    __omni_bytes_push_u16(out, 0)
+    __omni_bytes_push_u32(out, chars)
+    return 0
+}
+
+fn thumb_patch_b32(buf: int, off: int, target: int, is_bl: int) -> int {
+    let rel = target - (off + 4)
+    let s = (rel >> 24) & 1
+    let i1 = (rel >> 23) & 1
+    let i2 = (rel >> 22) & 1
+    let j1 = (i1 ^ 1) ^ s
+    let j2 = (i2 ^ 1) ^ s
+    let imm10 = (rel >> 12) & 0x3FF
+    let imm11 = (rel >> 1) & 0x7FF
+    let hw1 = 0xF000 | (s << 10) | imm10
+    let base2 = 0x9000
+    if is_bl == 1 {
+        base2 = 0xD000
+    }
+    let hw2 = base2 | (j1 << 13) | (j2 << 11) | imm11
+    let packed = (hw2 << 16) | hw1
+    __omni_bytes_patch_u32(buf, off, packed)
+    return 0
+}
+
+fn thumb_push_movw_r0(buf: int, imm16: int) -> int {
+    let hw1 = 0xF240 | (((imm16 >> 11) & 1) << 10) | ((imm16 >> 12) & 0xF)
+    let hw2 = (((imm16 >> 8) & 7) << 12) | (imm16 & 0xFF)
+    __omni_bytes_push_u16(buf, hw1)
+    __omni_bytes_push_u16(buf, hw2)
+    return 0
+}
+
+fn thumb_push_movt_r0(buf: int, imm16: int) -> int {
+    let hw1 = 0xF2C0 | (((imm16 >> 11) & 1) << 10) | ((imm16 >> 12) & 0xF)
+    let hw2 = (((imm16 >> 8) & 7) << 12) | (imm16 & 0xFF)
+    __omni_bytes_push_u16(buf, hw1)
+    __omni_bytes_push_u16(buf, hw2)
+    return 0
+}
+
 fn x64_add_rela(rela: int, off: int, sym_idx: int, rtype: int, addend: int) -> int {
     __omni_bytes_push_u64(rela, off)
     __omni_bytes_push_u32(rela, rtype)
@@ -3273,6 +3385,1017 @@ class Compiler {
         __omni_bytes_destroy(strtab)
         return out
     }
+
+    fn emit_pe64_x86_64(self) -> int {
+        let nf = __omni_slice_len(self.fn_names)
+        let rdata = __omni_bytes_create(1024)
+        let global_offs = __omni_slice_create(64)
+        let ng = __omni_slice_len(self.globals)
+        let gi = 0
+        while gi < ng {
+            __omni_slice_append(global_offs, __omni_bytes_len(rdata))
+            __omni_bytes_push_str(rdata, __omni_slice_get(self.globals, gi))
+            __omni_bytes_push_u8(rdata, 0)
+            gi = gi + 1
+        }
+        if __omni_bytes_len(rdata) == 0 {
+            __omni_bytes_push_u8(rdata, 0)
+        }
+
+        let text = __omni_bytes_create(16384)
+        let iat_patches_off = __omni_slice_create(16)
+        let iat_patches_idx = __omni_slice_create(16)
+        let rdata_patches_off = __omni_slice_create(64)
+        let rdata_patches_goff = __omni_slice_create(64)
+        let fn_patches_off = __omni_slice_create(128)
+        let fn_patches_fidx = __omni_slice_create(128)
+
+        let main_fidx = 0
+        let mi = 0
+        while mi < nf {
+            if str_eq_raw(__omni_slice_get(self.fn_names, mi), "main") == 1 {
+                main_fidx = mi
+            }
+            mi = mi + 1
+        }
+
+        // _start at RVA 0x1000: sub rsp, 40; call main; mov ecx, eax; call [rip+IAT_ExitProcess]
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 236)
+        __omni_bytes_push_u8(text, 40)
+        __omni_bytes_push_u8(text, 232)
+        let start_call_main = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, 0)
+        __omni_slice_append(fn_patches_off, start_call_main)
+        __omni_slice_append(fn_patches_fidx, main_fidx)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 193)
+        __omni_bytes_push_u8(text, 255)
+        __omni_bytes_push_u8(text, 21)
+        __omni_slice_append(iat_patches_off, __omni_bytes_len(text))
+        __omni_slice_append(iat_patches_idx, 0)
+        __omni_bytes_push_u32(text, 0)
+
+        // Builtin __omni_print_str(rcx = str_ptr)
+        let pstr_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 85)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 229)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 236)
+        __omni_bytes_push_u8(text, 80)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 240)
+        __omni_bytes_push_u8(text, 49)
+        __omni_bytes_push_u8(text, 192)
+        let len_loop = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 128)
+        __omni_bytes_push_u8(text, 60)
+        __omni_bytes_push_u8(text, 1)
+        __omni_bytes_push_u8(text, 0)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 132)
+        let len_je = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 192)
+        __omni_bytes_push_u8(text, 1)
+        __omni_bytes_push_u8(text, 233)
+        let len_jmp = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, len_loop - (len_jmp + 4))
+        let len_done = __omni_bytes_len(text)
+        __omni_bytes_patch_u32(text, len_je, len_done - (len_je + 4))
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 232)
+        // hStdOut = GetStdHandle(-11)
+        __omni_bytes_push_u8(text, 185)
+        __omni_bytes_push_u32(text, -11)
+        __omni_bytes_push_u8(text, 255)
+        __omni_bytes_push_u8(text, 21)
+        __omni_slice_append(iat_patches_off, __omni_bytes_len(text))
+        __omni_slice_append(iat_patches_idx, 1)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 216)
+        // WriteFile(hStdOut, s, len, &written, NULL)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 193)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 139)
+        __omni_bytes_push_u8(text, 85)
+        __omni_bytes_push_u8(text, 240)
+        __omni_bytes_push_u8(text, 76)
+        __omni_bytes_push_u8(text, 139)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 232)
+        __omni_bytes_push_u8(text, 76)
+        __omni_bytes_push_u8(text, 141)
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 248)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 199)
+        __omni_bytes_push_u8(text, 68)
+        __omni_bytes_push_u8(text, 36)
+        __omni_bytes_push_u8(text, 32)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 255)
+        __omni_bytes_push_u8(text, 21)
+        __omni_slice_append(iat_patches_off, __omni_bytes_len(text))
+        __omni_slice_append(iat_patches_idx, 2)
+        __omni_bytes_push_u32(text, 0)
+        // WriteFile(hStdOut, "\n", 1, &written, NULL)
+        __omni_bytes_push_u8(text, 198)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 224)
+        __omni_bytes_push_u8(text, 10)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 139)
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 216)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 141)
+        __omni_bytes_push_u8(text, 85)
+        __omni_bytes_push_u8(text, 224)
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 184)
+        __omni_bytes_push_u32(text, 1)
+        __omni_bytes_push_u8(text, 76)
+        __omni_bytes_push_u8(text, 141)
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 248)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 199)
+        __omni_bytes_push_u8(text, 68)
+        __omni_bytes_push_u8(text, 36)
+        __omni_bytes_push_u8(text, 32)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 255)
+        __omni_bytes_push_u8(text, 21)
+        __omni_slice_append(iat_patches_off, __omni_bytes_len(text))
+        __omni_slice_append(iat_patches_idx, 2)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 201)
+        __omni_bytes_push_u8(text, 195)
+
+        // Builtin __omni_print_int(rcx = i64 val)
+        let pint_off = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 85)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 229)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 236)
+        __omni_bytes_push_u8(text, 80)
+        __omni_bytes_push_u8(text, 76)
+        __omni_bytes_push_u8(text, 141)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 255)
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 198)
+        __omni_bytes_push_u8(text, 0)
+        __omni_bytes_push_u8(text, 0)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 200)
+        __omni_bytes_push_u8(text, 69)
+        __omni_bytes_push_u8(text, 49)
+        __omni_bytes_push_u8(text, 201)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 133)
+        __omni_bytes_push_u8(text, 192)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 141)
+        let pos_jge = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 247)
+        __omni_bytes_push_u8(text, 216)
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 185)
+        __omni_bytes_push_u32(text, 1)
+        let pos_lbl = __omni_bytes_len(text)
+        __omni_bytes_patch_u32(text, pos_jge, pos_lbl - (pos_jge + 4))
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 186)
+        __omni_bytes_push_u32(text, 10)
+        let dloop = __omni_bytes_len(text)
+        __omni_bytes_push_u8(text, 49)
+        __omni_bytes_push_u8(text, 210)
+        __omni_bytes_push_u8(text, 73)
+        __omni_bytes_push_u8(text, 247)
+        __omni_bytes_push_u8(text, 242)
+        __omni_bytes_push_u8(text, 128)
+        __omni_bytes_push_u8(text, 194)
+        __omni_bytes_push_u8(text, 48)
+        __omni_bytes_push_u8(text, 73)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 232)
+        __omni_bytes_push_u8(text, 1)
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 136)
+        __omni_bytes_push_u8(text, 16)
+        __omni_bytes_push_u8(text, 72)
+        __omni_bytes_push_u8(text, 133)
+        __omni_bytes_push_u8(text, 192)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 133)
+        let dloop_jnz = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, dloop - (dloop_jnz + 4))
+        __omni_bytes_push_u8(text, 77)
+        __omni_bytes_push_u8(text, 133)
+        __omni_bytes_push_u8(text, 201)
+        __omni_bytes_push_u8(text, 15)
+        __omni_bytes_push_u8(text, 132)
+        let neg_jz = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, 0)
+        __omni_bytes_push_u8(text, 73)
+        __omni_bytes_push_u8(text, 131)
+        __omni_bytes_push_u8(text, 232)
+        __omni_bytes_push_u8(text, 1)
+        __omni_bytes_push_u8(text, 65)
+        __omni_bytes_push_u8(text, 198)
+        __omni_bytes_push_u8(text, 0)
+        __omni_bytes_push_u8(text, 45)
+        let neg_done = __omni_bytes_len(text)
+        __omni_bytes_patch_u32(text, neg_jz, neg_done - (neg_jz + 4))
+        __omni_bytes_push_u8(text, 76)
+        __omni_bytes_push_u8(text, 137)
+        __omni_bytes_push_u8(text, 193)
+        __omni_bytes_push_u8(text, 232)
+        let call_pstr = __omni_bytes_len(text)
+        __omni_bytes_push_u32(text, pstr_off - (call_pstr + 4))
+        __omni_bytes_push_u8(text, 201)
+        __omni_bytes_push_u8(text, 195)
+
+        let fn_text_offs = __omni_slice_create(nf + 1)
+        let fi = 0
+        while fi < nf {
+            let f_start = __omni_bytes_len(text)
+            __omni_slice_append(fn_text_offs, f_start)
+            let nparams = __omni_slice_get(self.fn_params_count, fi)
+            let nregs = __omni_slice_get(self.fn_regs_count, fi)
+            let frame_sz = ((nregs * 8 + 15) / 16) * 16 + 32
+            __omni_bytes_push_u8(text, 85)
+            __omni_bytes_push_u8(text, 72)
+            __omni_bytes_push_u8(text, 137)
+            __omni_bytes_push_u8(text, 229)
+            __omni_bytes_push_u8(text, 72)
+            __omni_bytes_push_u8(text, 129)
+            __omni_bytes_push_u8(text, 236)
+            __omni_bytes_push_u32(text, frame_sz)
+
+            let pi = 0
+            while pi < nparams {
+                win64_store_arg_reg(text, pi, pi)
+                pi = pi + 1
+            }
+
+            let ops_buf = __omni_slice_get(self.fn_ops_bufs, fi)
+            let op_count = __omni_slice_get(self.fn_ops_counts, fi)
+            let pc_to_off = __omni_slice_create(op_count + 1)
+            let bp_offs = __omni_slice_create(32)
+            let bp_tgts = __omni_slice_create(32)
+
+            let cur = 0
+            let oi = 0
+            while oi < op_count {
+                __omni_slice_append(pc_to_off, __omni_bytes_len(text))
+                let tag = __omni_bytes_get(ops_buf, cur)
+                cur = cur + 1
+                if tag == 1 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    cur = cur + 2
+                    __omni_bytes_push_u8(text, 72)
+                    __omni_bytes_push_u8(text, 184)
+                    let bi = 0
+                    while bi < 8 {
+                        __omni_bytes_push_u8(text, __omni_bytes_get(ops_buf, cur + bi))
+                        bi = bi + 1
+                    }
+                    cur = cur + 8
+                    x64_store_rax(text, dst)
+                }
+                if tag == 2 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let gidx = x64_read_u32(ops_buf, cur + 2)
+                    cur = cur + 6
+                    __omni_bytes_push_u8(text, 72)
+                    __omni_bytes_push_u8(text, 141)
+                    __omni_bytes_push_u8(text, 5)
+                    __omni_slice_append(rdata_patches_off, __omni_bytes_len(text))
+                    __omni_slice_append(rdata_patches_goff, __omni_slice_get(global_offs, gidx))
+                    __omni_bytes_push_u32(text, 0)
+                    x64_store_rax(text, dst)
+                }
+                if tag == 4 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let src = x64_read_u16(ops_buf, cur + 2)
+                    cur = cur + 4
+                    x64_load_rax(text, src)
+                    x64_store_rax(text, dst)
+                }
+                if tag == 12 || tag == 13 || tag == 14 || tag == 15 || tag == 17 || (tag >= 19 && tag <= 24) {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let a = x64_read_u16(ops_buf, cur + 2)
+                    let b = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    x64_load_rax(text, a)
+                    x64_load_rcx(text, b)
+                    if tag == 12 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 1)
+                        __omni_bytes_push_u8(text, 200)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 13 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 41)
+                        __omni_bytes_push_u8(text, 200)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 14 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 15)
+                        __omni_bytes_push_u8(text, 175)
+                        __omni_bytes_push_u8(text, 193)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 15 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 153)
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 247)
+                        __omni_bytes_push_u8(text, 249)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 17 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 153)
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 247)
+                        __omni_bytes_push_u8(text, 249)
+                        x64_store_rdx(text, dst)
+                    }
+                    if tag == 19 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 33)
+                        __omni_bytes_push_u8(text, 200)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 20 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 9)
+                        __omni_bytes_push_u8(text, 200)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 21 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 49)
+                        __omni_bytes_push_u8(text, 200)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 22 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 211)
+                        __omni_bytes_push_u8(text, 224)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 23 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 211)
+                        __omni_bytes_push_u8(text, 248)
+                        x64_store_rax(text, dst)
+                    }
+                    if tag == 24 {
+                        __omni_bytes_push_u8(text, 72)
+                        __omni_bytes_push_u8(text, 211)
+                        __omni_bytes_push_u8(text, 232)
+                        x64_store_rax(text, dst)
+                    }
+                }
+                if tag == 27 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let cc = __omni_bytes_get(ops_buf, cur + 2)
+                    let a = x64_read_u16(ops_buf, cur + 3)
+                    let b = x64_read_u16(ops_buf, cur + 5)
+                    cur = cur + 7
+                    x64_load_rax(text, a)
+                    __omni_bytes_push_u8(text, 72)
+                    __omni_bytes_push_u8(text, 59)
+                    __omni_bytes_push_u8(text, 133)
+                    __omni_bytes_push_u32(text, x64_slot_disp(b))
+                    let set_op = 148
+                    if cc == 1 {
+                        set_op = 149
+                    }
+                    if cc == 2 {
+                        set_op = 156
+                    }
+                    if cc == 3 {
+                        set_op = 158
+                    }
+                    if cc == 4 {
+                        set_op = 159
+                    }
+                    if cc == 5 {
+                        set_op = 157
+                    }
+                    __omni_bytes_push_u8(text, 15)
+                    __omni_bytes_push_u8(text, set_op)
+                    __omni_bytes_push_u8(text, 192)
+                    __omni_bytes_push_u8(text, 15)
+                    __omni_bytes_push_u8(text, 182)
+                    __omni_bytes_push_u8(text, 192)
+                    x64_store_rax(text, dst)
+                }
+                if tag == 61 {
+                    let tgt = x64_read_u32(ops_buf, cur)
+                    cur = cur + 4
+                    __omni_bytes_push_u8(text, 233)
+                    let poff = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0)
+                    __omni_slice_append(bp_offs, poff)
+                    __omni_slice_append(bp_tgts, tgt)
+                }
+                if tag == 62 {
+                    let cond = x64_read_u16(ops_buf, cur)
+                    let t_tgt = x64_read_u32(ops_buf, cur + 2)
+                    let f_tgt = x64_read_u32(ops_buf, cur + 6)
+                    cur = cur + 10
+                    x64_load_rax(text, cond)
+                    __omni_bytes_push_u8(text, 72)
+                    __omni_bytes_push_u8(text, 133)
+                    __omni_bytes_push_u8(text, 192)
+                    __omni_bytes_push_u8(text, 15)
+                    __omni_bytes_push_u8(text, 133)
+                    let poff_t = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0)
+                    __omni_slice_append(bp_offs, poff_t)
+                    __omni_slice_append(bp_tgts, t_tgt)
+                    __omni_bytes_push_u8(text, 233)
+                    let poff_f = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0)
+                    __omni_slice_append(bp_offs, poff_f)
+                    __omni_slice_append(bp_tgts, f_tgt)
+                }
+                if tag == 64 {
+                    let has_v = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    if has_v == 1 {
+                        let r = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        x64_load_rax(text, r)
+                    }
+                    __omni_bytes_push_u8(text, 201)
+                    __omni_bytes_push_u8(text, 195)
+                }
+                if tag == 66 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    let dst = 0
+                    if has_dst == 1 {
+                        dst = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                    }
+                    let cfidx = x64_read_u32(ops_buf, cur)
+                    let na = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    let ai = 0
+                    while ai < na {
+                        let areg = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        win64_load_arg_reg(text, ai, areg)
+                        ai = ai + 1
+                    }
+                    __omni_bytes_push_u8(text, 232)
+                    __omni_slice_append(fn_patches_off, __omni_bytes_len(text))
+                    __omni_slice_append(fn_patches_fidx, cfidx)
+                    __omni_bytes_push_u32(text, 0)
+                    if has_dst == 1 {
+                        x64_store_rax(text, dst)
+                    }
+                }
+                if tag == 67 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    let dst = 0
+                    if has_dst == 1 {
+                        dst = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                    }
+                    let eidx = x64_read_u32(ops_buf, cur)
+                    cur = cur + 5
+                    let na = x64_read_u16(ops_buf, cur)
+                    cur = cur + 2
+                    let ai = 0
+                    while ai < na {
+                        let areg = x64_read_u16(ops_buf, cur)
+                        cur = cur + 3
+                        win64_load_arg_reg(text, ai, areg)
+                        ai = ai + 1
+                    }
+                    let tgt_off = pint_off
+                    if eidx == 1 {
+                        tgt_off = pstr_off
+                    }
+                    __omni_bytes_push_u8(text, 232)
+                    let coff = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, tgt_off - (coff + 4))
+                    if has_dst == 1 {
+                        x64_store_rax(text, dst)
+                    }
+                }
+                oi = oi + 1
+            }
+
+            let nbp = __omni_slice_len(bp_offs)
+            let bpi = 0
+            while bpi < nbp {
+                let poff = __omni_slice_get(bp_offs, bpi)
+                let tgt = __omni_slice_get(bp_tgts, bpi)
+                let toff = __omni_slice_get(pc_to_off, tgt)
+                __omni_bytes_patch_u32(text, poff, toff - (poff + 4))
+                bpi = bpi + 1
+            }
+
+            __omni_bytes_destroy(ops_buf)
+            fi = fi + 1
+        }
+
+        let text_vsz = __omni_bytes_len(text)
+        let text_rsz = ((text_vsz + 511) / 512) * 512
+        let text_rva = 0x1000
+        let rdata_rva = text_rva + ((text_vsz + 4095) / 4096) * 4096
+        let rdata_vsz = __omni_bytes_len(rdata)
+        let rdata_rsz = ((rdata_vsz + 511) / 512) * 512
+        let idata_rva = rdata_rva + ((rdata_vsz + 4095) / 4096) * 4096
+
+        let nfp = __omni_slice_len(fn_patches_off)
+        let fpi = 0
+        while fpi < nfp {
+            let poff = __omni_slice_get(fn_patches_off, fpi)
+            let tfidx = __omni_slice_get(fn_patches_fidx, fpi)
+            let toff = __omni_slice_get(fn_text_offs, tfidx)
+            __omni_bytes_patch_u32(text, poff, toff - (poff + 4))
+            fpi = fpi + 1
+        }
+        let nrp = __omni_slice_len(rdata_patches_off)
+        let rpi = 0
+        while rpi < nrp {
+            let poff = __omni_slice_get(rdata_patches_off, rpi)
+            let goff = __omni_slice_get(rdata_patches_goff, rpi)
+            let tgt_rva = rdata_rva + goff
+            let rip_rva = text_rva + poff + 4
+            __omni_bytes_patch_u32(text, poff, tgt_rva - rip_rva)
+            rpi = rpi + 1
+        }
+        let nip = __omni_slice_len(iat_patches_off)
+        let ipi = 0
+        while ipi < nip {
+            let poff = __omni_slice_get(iat_patches_off, ipi)
+            let slot_i = __omni_slice_get(iat_patches_idx, ipi)
+            let iat_rva = idata_rva + 0x48 + slot_i * 8
+            let rip_rva = text_rva + poff + 4
+            __omni_bytes_patch_u32(text, poff, iat_rva - rip_rva)
+            ipi = ipi + 1
+        }
+
+        // Build .idata (KERNEL32.dll: ExitProcess, GetStdHandle, WriteFile)
+        let idata = __omni_bytes_create(512)
+        __omni_bytes_push_u32(idata, idata_rva + 0x28)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, idata_rva + 0x68)
+        __omni_bytes_push_u32(idata, idata_rva + 0x48)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+        // ILT at +0x28
+        __omni_bytes_push_u64(idata, idata_rva + 0x78)
+        __omni_bytes_push_u64(idata, idata_rva + 0x88)
+        __omni_bytes_push_u64(idata, idata_rva + 0x98)
+        __omni_bytes_push_u64(idata, 0)
+        // IAT at +0x48
+        __omni_bytes_push_u64(idata, idata_rva + 0x78)
+        __omni_bytes_push_u64(idata, idata_rva + 0x88)
+        __omni_bytes_push_u64(idata, idata_rva + 0x98)
+        __omni_bytes_push_u64(idata, 0)
+        // DLL name at +0x68 (16 bytes)
+        __omni_bytes_push_str(idata, "KERNEL32.dll")
+        __omni_bytes_push_u32(idata, 0)
+        // Hint/Name 0 at +0x78 (16 bytes)
+        __omni_bytes_push_u16(idata, 0)
+        __omni_bytes_push_str(idata, "ExitProcess")
+        __omni_bytes_push_u8(idata, 0)
+        __omni_bytes_push_u16(idata, 0)
+        // Hint/Name 1 at +0x88 (16 bytes)
+        __omni_bytes_push_u16(idata, 0)
+        __omni_bytes_push_str(idata, "GetStdHandle")
+        __omni_bytes_push_u16(idata, 0)
+        // Hint/Name 2 at +0x98 (16 bytes)
+        __omni_bytes_push_u16(idata, 0)
+        __omni_bytes_push_str(idata, "WriteFile")
+        __omni_bytes_push_u8(idata, 0)
+        __omni_bytes_push_u32(idata, 0)
+
+        let idata_vsz = __omni_bytes_len(idata)
+        let idata_rsz = 512
+        let size_of_image = idata_rva + 0x1000
+        let text_rptr = 0x200
+        let rdata_rptr = text_rptr + text_rsz
+        let idata_rptr = rdata_rptr + rdata_rsz
+
+        let out = __omni_bytes_create(4096)
+        // DOS Header (64 bytes)
+        __omni_bytes_push_str(out, "MZ")
+        let di = 2
+        while di < 60 {
+            __omni_bytes_push_u8(out, 0)
+            di = di + 1
+        }
+        __omni_bytes_push_u32(out, 64)
+        // PE Signature + COFF Header (24 bytes)
+        __omni_bytes_push_str(out, "PE")
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 0x8664)
+        __omni_bytes_push_u16(out, 3)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u16(out, 240)
+        __omni_bytes_push_u16(out, 0x0022)
+        // Optional Header PE32+ (240 bytes)
+        __omni_bytes_push_u16(out, 0x020B)
+        __omni_bytes_push_u8(out, 1)
+        __omni_bytes_push_u8(out, 0)
+        __omni_bytes_push_u32(out, text_rsz)
+        __omni_bytes_push_u32(out, rdata_rsz + idata_rsz)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u32(out, text_rva)
+        __omni_bytes_push_u32(out, text_rva)
+        __omni_bytes_push_u64(out, 0x00400000)
+        __omni_bytes_push_u32(out, 0x1000)
+        __omni_bytes_push_u32(out, 0x200)
+        __omni_bytes_push_u16(out, 6)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 6)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u32(out, size_of_image)
+        __omni_bytes_push_u32(out, 0x200)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u16(out, 3)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u64(out, 0x100000)
+        __omni_bytes_push_u64(out, 0x1000)
+        __omni_bytes_push_u64(out, 0x100000)
+        __omni_bytes_push_u64(out, 0x1000)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u32(out, 16)
+        // 16 Data Directories (128 bytes): [1] Import Table, [12] IAT
+        let ddi = 0
+        while ddi < 16 {
+            if ddi == 1 {
+                __omni_bytes_push_u32(out, idata_rva)
+                __omni_bytes_push_u32(out, 40)
+            }
+            if ddi == 12 {
+                __omni_bytes_push_u32(out, idata_rva + 0x48)
+                __omni_bytes_push_u32(out, 32)
+            }
+            if ddi != 1 && ddi != 12 {
+                __omni_bytes_push_u32(out, 0)
+                __omni_bytes_push_u32(out, 0)
+            }
+            ddi = ddi + 1
+        }
+        // 3 Section Headers
+        pe_push_sec_a(out, ".text", text_vsz, text_rva, text_rsz, text_rptr)
+        pe_push_sec_b(out, 0x60000020)
+        pe_push_sec_a(out, ".rdata", rdata_vsz, rdata_rva, rdata_rsz, rdata_rptr)
+        pe_push_sec_b(out, 0x40000040)
+        pe_push_sec_a(out, ".idata", idata_vsz, idata_rva, idata_rsz, idata_rptr)
+        pe_push_sec_b(out, 0xC0000040)
+
+        buf_pad_align(out, 512)
+        buf_append_buf(out, text)
+        buf_pad_align(out, 512)
+        buf_append_buf(out, rdata)
+        buf_pad_align(out, 512)
+        buf_append_buf(out, idata)
+        buf_pad_align(out, 512)
+
+        __omni_bytes_destroy(text)
+        __omni_bytes_destroy(rdata)
+        __omni_bytes_destroy(idata)
+        return out
+    }
+
+    fn emit_uf2_rp2350(self) -> int {
+        let nf = __omni_slice_len(self.fn_names)
+        let main_fidx = 0
+        let mi = 0
+        while mi < nf {
+            if str_eq_raw(__omni_slice_get(self.fn_names, mi), "main") == 1 {
+                main_fidx = mi
+            }
+            mi = mi + 1
+        }
+
+        let flash = __omni_bytes_create(8192)
+        // Vector Table (256 bytes = 64 words): MSP = 0x2008_2000, Reset = 0x1000_0121
+        __omni_bytes_push_u32(flash, 0x20082000)
+        let vi = 1
+        while vi < 64 {
+            __omni_bytes_push_u32(flash, 0x10000121)
+            vi = vi + 1
+        }
+        // Mandatory RP2350 PICOBIN IMAGE_DEF block at 0x100..0x114
+        __omni_bytes_push_u32(flash, 0xFFFFDED3)
+        __omni_bytes_push_u32(flash, 0x10210142)
+        __omni_bytes_push_u32(flash, 0x000001FF)
+        __omni_bytes_push_u32(flash, 0x00000000)
+        __omni_bytes_push_u32(flash, 0xAB123579)
+        __omni_bytes_push_u32(flash, 0)
+        __omni_bytes_push_u32(flash, 0)
+        __omni_bytes_push_u32(flash, 0)
+
+        // Reset_Handler at 0x120: bl main; b .
+        let reset_bl_off = __omni_bytes_len(flash)
+        __omni_bytes_push_u32(flash, 0)
+        __omni_bytes_push_u16(flash, 0xE7FE)
+        __omni_bytes_push_u16(flash, 0xBF00)
+
+        let fn_offs = __omni_slice_create(nf + 1)
+        let call_patches_off = __omni_slice_create(64)
+        let call_patches_fidx = __omni_slice_create(64)
+        __omni_slice_append(call_patches_off, reset_bl_off)
+        __omni_slice_append(call_patches_fidx, main_fidx)
+
+        let fi = 0
+        while fi < nf {
+            buf_pad_align(flash, 4)
+            __omni_slice_append(fn_offs, __omni_bytes_len(flash))
+            let nparams = __omni_slice_get(self.fn_params_count, fi)
+            let nregs = __omni_slice_get(self.fn_regs_count, fi)
+            if nregs < 4 {
+                nregs = 4
+            }
+            __omni_bytes_push_u16(flash, 0xB5F0)
+            __omni_bytes_push_u16(flash, 0xB080 | (nregs & 0x7F))
+            let pi = 0
+            while pi < nparams {
+                __omni_bytes_push_u16(flash, 0x9000 | (pi << 8) | (pi & 0xFF))
+                pi = pi + 1
+            }
+
+            let ops_buf = __omni_slice_get(self.fn_ops_bufs, fi)
+            let op_count = __omni_slice_get(self.fn_ops_counts, fi)
+            let pc_to_off = __omni_slice_create(op_count + 1)
+            let bp_offs = __omni_slice_create(32)
+            let bp_tgts = __omni_slice_create(32)
+
+            let cur = 0
+            let oi = 0
+            while oi < op_count {
+                __omni_slice_append(pc_to_off, __omni_bytes_len(flash))
+                let tag = __omni_bytes_get(ops_buf, cur)
+                cur = cur + 1
+                if tag == 1 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let lo16 = x64_read_u16(ops_buf, cur + 2)
+                    let hi16 = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 10
+                    thumb_push_movw_r0(flash, lo16)
+                    if hi16 != 0 {
+                        thumb_push_movt_r0(flash, hi16)
+                    }
+                    __omni_bytes_push_u16(flash, 0x9000 | (dst & 0xFF))
+                }
+                if tag == 2 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    cur = cur + 6
+                    thumb_push_movw_r0(flash, 0)
+                    __omni_bytes_push_u16(flash, 0x9000 | (dst & 0xFF))
+                }
+                if tag == 4 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let src = x64_read_u16(ops_buf, cur + 2)
+                    cur = cur + 4
+                    __omni_bytes_push_u16(flash, 0x9800 | (src & 0xFF))
+                    __omni_bytes_push_u16(flash, 0x9000 | (dst & 0xFF))
+                }
+                if tag == 12 || tag == 13 || tag == 14 || tag == 15 || tag == 17 || (tag >= 19 && tag <= 24) {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let a = x64_read_u16(ops_buf, cur + 2)
+                    let b = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    __omni_bytes_push_u16(flash, 0x9800 | (a & 0xFF))
+                    __omni_bytes_push_u16(flash, 0x9900 | (b & 0xFF))
+                    if tag == 12 {
+                        __omni_bytes_push_u16(flash, 0x1840)
+                    }
+                    if tag == 13 {
+                        __omni_bytes_push_u16(flash, 0x1A40)
+                    }
+                    if tag == 14 {
+                        __omni_bytes_push_u16(flash, 0x4348)
+                    }
+                    if tag == 15 {
+                        __omni_bytes_push_u16(flash, 0xFB90)
+                        __omni_bytes_push_u16(flash, 0xF0F1)
+                    }
+                    if tag == 19 {
+                        __omni_bytes_push_u16(flash, 0x4008)
+                    }
+                    if tag == 20 {
+                        __omni_bytes_push_u16(flash, 0x4308)
+                    }
+                    if tag == 21 {
+                        __omni_bytes_push_u16(flash, 0x4048)
+                    }
+                    if tag == 22 {
+                        __omni_bytes_push_u16(flash, 0x4088)
+                    }
+                    if tag == 23 {
+                        __omni_bytes_push_u16(flash, 0x4108)
+                    }
+                    if tag == 24 {
+                        __omni_bytes_push_u16(flash, 0x40C8)
+                    }
+                    __omni_bytes_push_u16(flash, 0x9000 | (dst & 0xFF))
+                }
+                if tag == 27 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let cc = __omni_bytes_get(ops_buf, cur + 2)
+                    let a = x64_read_u16(ops_buf, cur + 3)
+                    let b = x64_read_u16(ops_buf, cur + 5)
+                    cur = cur + 7
+                    __omni_bytes_push_u16(flash, 0x9800 | (a & 0xFF))
+                    __omni_bytes_push_u16(flash, 0x9900 | (b & 0xFF))
+                    __omni_bytes_push_u16(flash, 0x4288)
+                    __omni_bytes_push_u16(flash, 0x2200)
+                    let inv = 1
+                    if cc == 1 {
+                        inv = 0
+                    }
+                    if cc == 2 {
+                        inv = 10
+                    }
+                    if cc == 3 {
+                        inv = 12
+                    }
+                    if cc == 4 {
+                        inv = 13
+                    }
+                    if cc == 5 {
+                        inv = 11
+                    }
+                    __omni_bytes_push_u16(flash, 0xD000 | (inv << 8))
+                    __omni_bytes_push_u16(flash, 0x2201)
+                    __omni_bytes_push_u16(flash, 0x9200 | (dst & 0xFF))
+                }
+                if tag == 61 {
+                    let tgt = x64_read_u32(ops_buf, cur)
+                    cur = cur + 4
+                    __omni_slice_append(bp_offs, __omni_bytes_len(flash))
+                    __omni_slice_append(bp_tgts, tgt)
+                    __omni_bytes_push_u32(flash, 0)
+                }
+                if tag == 62 {
+                    let cond = x64_read_u16(ops_buf, cur)
+                    let t_tgt = x64_read_u32(ops_buf, cur + 2)
+                    let f_tgt = x64_read_u32(ops_buf, cur + 6)
+                    cur = cur + 10
+                    __omni_bytes_push_u16(flash, 0x9800 | (cond & 0xFF))
+                    __omni_bytes_push_u16(flash, 0x2800)
+                    __omni_bytes_push_u16(flash, 0xD001)
+                    __omni_slice_append(bp_offs, __omni_bytes_len(flash))
+                    __omni_slice_append(bp_tgts, t_tgt)
+                    __omni_bytes_push_u32(flash, 0)
+                    __omni_slice_append(bp_offs, __omni_bytes_len(flash))
+                    __omni_slice_append(bp_tgts, f_tgt)
+                    __omni_bytes_push_u32(flash, 0)
+                }
+                if tag == 64 {
+                    let has_v = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    if has_v == 1 {
+                        let r = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        __omni_bytes_push_u16(flash, 0x9800 | (r & 0xFF))
+                    }
+                    __omni_bytes_push_u16(flash, 0xB000 | (nregs & 0x7F))
+                    __omni_bytes_push_u16(flash, 0xBDF0)
+                }
+                if tag == 66 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    let dst = 0
+                    if has_dst == 1 {
+                        dst = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                    }
+                    let cfidx = x64_read_u32(ops_buf, cur)
+                    let na = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    let ai = 0
+                    while ai < na {
+                        let areg = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        __omni_bytes_push_u16(flash, 0x9800 | (ai << 8) | (areg & 0xFF))
+                        ai = ai + 1
+                    }
+                    __omni_slice_append(call_patches_off, __omni_bytes_len(flash))
+                    __omni_slice_append(call_patches_fidx, cfidx)
+                    __omni_bytes_push_u32(flash, 0)
+                    if has_dst == 1 {
+                        __omni_bytes_push_u16(flash, 0x9000 | (dst & 0xFF))
+                    }
+                }
+                if tag == 67 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    if has_dst == 1 {
+                        cur = cur + 2
+                    }
+                    cur = cur + 5
+                    let na = x64_read_u16(ops_buf, cur)
+                    cur = cur + 2 + na * 3
+                }
+                oi = oi + 1
+            }
+
+            let nbp = __omni_slice_len(bp_offs)
+            let bpi = 0
+            while bpi < nbp {
+                let poff = __omni_slice_get(bp_offs, bpi)
+                let tgt = __omni_slice_get(bp_tgts, bpi)
+                let toff = __omni_slice_get(pc_to_off, tgt)
+                thumb_patch_b32(flash, poff, toff, 0)
+                bpi = bpi + 1
+            }
+
+            __omni_bytes_destroy(ops_buf)
+            fi = fi + 1
+        }
+
+        let ncp = __omni_slice_len(call_patches_off)
+        let cpi = 0
+        while cpi < ncp {
+            let poff = __omni_slice_get(call_patches_off, cpi)
+            let cfidx = __omni_slice_get(call_patches_fidx, cpi)
+            let toff = __omni_slice_get(fn_offs, cfidx)
+            thumb_patch_b32(flash, poff, toff, 1)
+            cpi = cpi + 1
+        }
+
+        // Frame flash image into 512-byte UF2 blocks for RP2350 (0xE48B_FF59)
+        let flen = __omni_bytes_len(flash)
+        let nblks = (flen + 255) / 256
+        let uf2 = __omni_bytes_create(nblks * 512)
+        let bi = 0
+        while bi < nblks {
+            __omni_bytes_push_u32(uf2, 0x0A324655)
+            __omni_bytes_push_u32(uf2, 0x9E5D5157)
+            __omni_bytes_push_u32(uf2, 0x00002000)
+            __omni_bytes_push_u32(uf2, 0x10000000 + bi * 256)
+            __omni_bytes_push_u32(uf2, 256)
+            __omni_bytes_push_u32(uf2, bi)
+            __omni_bytes_push_u32(uf2, nblks)
+            __omni_bytes_push_u32(uf2, 0xE48BFF59)
+            let pi = 0
+            while pi < 476 {
+                let foff = bi * 256 + pi
+                if pi < 256 && foff < flen {
+                    __omni_bytes_push_u8(uf2, __omni_bytes_get(flash, foff))
+                } else {
+                    __omni_bytes_push_u8(uf2, 0)
+                }
+                pi = pi + 1
+            }
+            __omni_bytes_push_u32(uf2, 0x0AB16F30)
+            bi = bi + 1
+        }
+        __omni_bytes_destroy(flash)
+        return uf2
+    }
 }
 
 fn compile_file(in_path: str, out_path: str) -> int {
@@ -3286,25 +4409,45 @@ fn compile_file(in_path: str, out_path: str) -> int {
     c.init_compiler(source)
     c.compile_module()
     let olen = __omni_str_len(out_path)
+    let is_uf2 = 0
+    if olen >= 4 {
+        let tail4u = __omni_str_slice_step(out_path, olen - 4, olen, 1, 1, 1)
+        if __omni_str_eq(tail4u, ".uf2") == 1 {
+            is_uf2 = 1
+        }
+    }
+    let is_exe = 0
+    if is_uf2 == 0 && olen >= 4 {
+        let tail4 = __omni_str_slice_step(out_path, olen - 4, olen, 1, 1, 1)
+        if __omni_str_eq(tail4, ".exe") == 1 {
+            is_exe = 1
+        }
+    }
     let is_arm64 = 0
-    if olen >= 8 {
+    if is_uf2 == 0 && is_exe == 0 && olen >= 8 {
         let tail8 = __omni_str_slice_step(out_path, olen - 8, olen, 1, 1, 1)
         if __omni_str_eq(tail8, ".arm64.o") == 1 {
             is_arm64 = 1
         }
     }
     let is_obj = 0
-    if is_arm64 == 0 && olen >= 2 && __omni_str_byte_at(out_path, olen - 2) == 46 && __omni_str_byte_at(out_path, olen - 1) == 111 {
+    if is_uf2 == 0 && is_exe == 0 && is_arm64 == 0 && olen >= 2 && __omni_str_byte_at(out_path, olen - 2) == 46 && __omni_str_byte_at(out_path, olen - 1) == 111 {
         is_obj = 1
     }
     let out_buf = 0
-    if is_arm64 == 1 {
+    if is_uf2 == 1 {
+        out_buf = c.emit_uf2_rp2350()
+    }
+    if is_uf2 == 0 && is_exe == 1 {
+        out_buf = c.emit_pe64_x86_64()
+    }
+    if is_uf2 == 0 && is_exe == 0 && is_arm64 == 1 {
         out_buf = c.emit_elf64_aarch64()
     }
-    if is_arm64 == 0 && is_obj == 1 {
+    if is_uf2 == 0 && is_exe == 0 && is_arm64 == 0 && is_obj == 1 {
         out_buf = c.emit_elf64_x86_64()
     }
-    if is_arm64 == 0 && is_obj == 0 {
+    if is_uf2 == 0 && is_exe == 0 && is_arm64 == 0 && is_obj == 0 {
         out_buf = c.emit_obc_bytes()
     }
     let wrote = __omni_fs_write_bytes(out_path, out_buf)
