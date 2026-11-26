@@ -1,5 +1,6 @@
 pub mod cortex_m;
 pub mod cranelift_backend;
+pub mod omni_bc;
 
 use regex::Regex;
 use std::fs;
@@ -591,15 +592,31 @@ impl LlvmVerifier {
         extra_c_files: &[PathBuf],
         args: &[String],
     ) -> Result<std::process::ExitStatus, VerifyError> {
-        let force_clang = std::env::var("OMNI_BACKEND")
-            .map(|v| v.eq_ignore_ascii_case("clang"))
-            .unwrap_or(false);
+        let backend_env = std::env::var("OMNI_BACKEND").unwrap_or_default();
+        let force_clang = backend_env.eq_ignore_ascii_case("clang");
+        let force_bc_vm = backend_env.eq_ignore_ascii_case("bc") || backend_env.eq_ignore_ascii_case("vm");
         let only_std_runtime = extra_c_files.iter().all(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| n.contains("omni_runtime_native"))
                 .unwrap_or(false)
         });
+        if force_bc_vm && only_std_runtime {
+            let bc = omni_bc::compile_llvm_ir_to_bc(ir)?;
+            let syms = omni_runtime::jit_runtime_symbols();
+            let vm = omni_bc::OmniBcVm::new(&bc, &syms);
+            let code = vm.call_by_name("main", &[0, 0])? as i32;
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                return Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::ExitStatusExt;
+                return Ok(std::process::ExitStatus::from_raw(code as u32));
+            }
+        }
         // In-process Cranelift JIT fast-path when no external C FFI libs, no `exit()`/`_setjmp`, and not forced to clang
         if !force_clang
             && only_std_runtime

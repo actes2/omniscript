@@ -1708,9 +1708,10 @@ pub enum DevicePreference {
     Metal(usize),
 }
 
-/// In-process zero-Candle native GGUF inference engine (AVX2/FMA + batched prefill + native BPE).
+/// In-process zero-Candle native GGUF inference engine (AVX2/FMA + batched prefill + native BPE + system KV cache).
 pub struct CandleGgufEngine {
     model: NativeGgufModel,
+    system_prefix_kv: std::sync::OnceLock<(usize, NativeKvCache)>,
     pub model_path: PathBuf,
     pub system_prompt: String,
     pub sample_len: usize,
@@ -1756,6 +1757,7 @@ impl CandleGgufEngine {
         let eos_token_id = model.config.eos_token_id;
         Ok(Self {
             model,
+            system_prefix_kv: std::sync::OnceLock::new(),
             model_path,
             system_prompt: dataset_generator::DEFAULT_IR_SYSTEM_PROMPT.to_string(),
             sample_len: 128,
@@ -1769,6 +1771,7 @@ impl CandleGgufEngine {
         let eos_token_id = model.config.eos_token_id;
         Ok(Self {
             model,
+            system_prefix_kv: std::sync::OnceLock::new(),
             model_path: PathBuf::from("[embedded:omni-coder.gguf]"),
             system_prompt: dataset_generator::DEFAULT_IR_SYSTEM_PROMPT.to_string(),
             sample_len: 128,
@@ -1910,23 +1913,35 @@ impl InferenceEngine for CandleGgufEngine {
         temp: f32,
     ) -> Result<String, EngineError> {
         let prompt_body = envelope.to_prompt_micro_tags();
-        let formatted_prompt = format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            self.system_prompt, prompt_body
-        );
+        let sys_prefix = format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n", self.system_prompt);
+        let user_suffix = format!("{}<|im_end|>\n<|im_start|>assistant\n", prompt_body);
 
-        let tokens = self.model.tokenizer.encode(&formatted_prompt);
+        // Pre-compute and cache the constant system prompt KV state once per engine instance!
+        let (prefix_len, prefix_kv) = self.system_prefix_kv.get_or_init(|| {
+            let p_toks = self.model.tokenizer.encode(&sys_prefix);
+            let mut p_kv = NativeKvCache::new(&self.model.config, p_toks.len());
+            self.model.forward_prefill_prefix(&p_toks, &mut p_kv);
+            (p_toks.len(), p_kv)
+        });
+
+        let suffix_tokens = self.model.tokenizer.encode(&user_suffix);
+        let total_prompt_len = *prefix_len + suffix_tokens.len();
         let verbose_synth = std::env::var_os("OMNI_VERBOSE").is_some();
         let synth_start = std::time::Instant::now();
         if verbose_synth {
             let preview: String = envelope.raw_intent.lines().next().unwrap_or("").chars().take(96).collect();
-            eprintln!("     [Synth] Prefilling {} tokens for intent: '{}'", tokens.len(), preview);
+            eprintln!(
+                "     [Synth] Prefilling {} suffix tokens (+{} cached sys) for intent: '{}'",
+                suffix_tokens.len(),
+                prefix_len,
+                preview
+            );
         }
 
-        let mut kv = NativeKvCache::new(&self.model.config, tokens.len() + self.sample_len + 4);
+        let mut kv = NativeKvCache::from_prefix(prefix_kv, *prefix_len, total_prompt_len + self.sample_len + 4);
         let mut rng_state: u64 = 299_792_458;
 
-        let logits = self.model.forward_prefill_batch(&tokens, 0, &mut kv);
+        let logits = self.model.forward_prefill_batch(&suffix_tokens, *prefix_len, &mut kv);
         let mut next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
 
         let is_stop_token = |t: u32| -> bool {
@@ -1942,7 +1957,7 @@ impl InferenceEngine for CandleGgufEngine {
             if is_stop_token(next_token) {
                 break;
             }
-            let logits = self.model.forward_token(next_token, tokens.len() + step, &mut kv, true);
+            let logits = self.model.forward_token(next_token, total_prompt_len + step, &mut kv, true);
             next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
             if is_stop_token(next_token) {
                 break;

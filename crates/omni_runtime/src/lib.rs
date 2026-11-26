@@ -220,6 +220,22 @@ declare i8* @__omni_os_socket_getpeername(i32)
 declare i32 @__omni_os_socket_send(i32, i8*)
 declare i8* @__omni_os_socket_recv(i32, i32)
 declare i8* @__omni_os_pipe_pair()
+
+; Universal Growable Byte Buffer & File I/O (Self-Hosting & Systems Primitives)
+declare i8* @__omni_bytes_create(i64)
+declare void @__omni_bytes_push_u8(i8*, i64)
+declare void @__omni_bytes_push_u16(i8*, i64)
+declare void @__omni_bytes_push_u32(i8*, i64)
+declare void @__omni_bytes_push_u64(i8*, i64)
+declare void @__omni_bytes_push_str(i8*, i8*)
+declare void @__omni_bytes_patch_u32(i8*, i64, i64)
+declare i64 @__omni_bytes_get(i8*, i64)
+declare i64 @__omni_bytes_len(i8*)
+declare void @__omni_bytes_destroy(i8*)
+declare i8* @__omni_fs_read_text(i8*)
+declare i64 @__omni_fs_write_text(i8*, i8*)
+declare i64 @__omni_fs_write_bytes(i8*, i8*)
+declare i64 @__omni_fs_exists(i8*)
 "#
         )
     };
@@ -375,6 +391,21 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         fn __omni_os_socket_recv(fd: i32, n: i32) -> *mut i8;
         fn __omni_os_pipe_pair() -> *mut u8;
 
+        fn __omni_bytes_create(cap: i64) -> *mut u8;
+        fn __omni_bytes_push_u8(b: *mut u8, v: i64);
+        fn __omni_bytes_push_u16(b: *mut u8, v: i64);
+        fn __omni_bytes_push_u32(b: *mut u8, v: i64);
+        fn __omni_bytes_push_u64(b: *mut u8, v: i64);
+        fn __omni_bytes_push_str(b: *mut u8, s: *const i8);
+        fn __omni_bytes_patch_u32(b: *mut u8, off: i64, v: i64);
+        fn __omni_bytes_get(b: *mut u8, off: i64) -> i64;
+        fn __omni_bytes_len(b: *mut u8) -> i64;
+        fn __omni_bytes_destroy(b: *mut u8);
+        fn __omni_fs_read_text(path: *const i8) -> *mut i8;
+        fn __omni_fs_write_text(path: *const i8, content: *const i8) -> i64;
+        fn __omni_fs_write_bytes(path: *const i8, b: *mut u8) -> i64;
+        fn __omni_fs_exists(path: *const i8) -> i64;
+
         fn pow(x: f64, y: f64) -> f64;
     }
 
@@ -502,6 +533,20 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_os_socket_send", __omni_os_socket_send as *const u8),
         ("__omni_os_socket_recv", __omni_os_socket_recv as *const u8),
         ("__omni_os_pipe_pair", __omni_os_pipe_pair as *const u8),
+        ("__omni_bytes_create", __omni_bytes_create as *const u8),
+        ("__omni_bytes_push_u8", __omni_bytes_push_u8 as *const u8),
+        ("__omni_bytes_push_u16", __omni_bytes_push_u16 as *const u8),
+        ("__omni_bytes_push_u32", __omni_bytes_push_u32 as *const u8),
+        ("__omni_bytes_push_u64", __omni_bytes_push_u64 as *const u8),
+        ("__omni_bytes_push_str", __omni_bytes_push_str as *const u8),
+        ("__omni_bytes_patch_u32", __omni_bytes_patch_u32 as *const u8),
+        ("__omni_bytes_get", __omni_bytes_get as *const u8),
+        ("__omni_bytes_len", __omni_bytes_len as *const u8),
+        ("__omni_bytes_destroy", __omni_bytes_destroy as *const u8),
+        ("__omni_fs_read_text", __omni_fs_read_text as *const u8),
+        ("__omni_fs_write_text", __omni_fs_write_text as *const u8),
+        ("__omni_fs_write_bytes", __omni_fs_write_bytes as *const u8),
+        ("__omni_fs_exists", __omni_fs_exists as *const u8),
         ("pow", pow as *const u8),
     ]
 }

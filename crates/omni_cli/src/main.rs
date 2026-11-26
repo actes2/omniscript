@@ -156,7 +156,23 @@ fn main() -> anyhow::Result<()> {
             synth_dataset(count, &output)?;
         }
         Some(Commands::Run { source, args: prog_args }) => {
-            run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
+            if source
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("obc"))
+                .unwrap_or(false)
+            {
+                let raw = fs::read(&source)?;
+                let bc = omni_verify::omni_bc::OmniBcModule::from_bytes(&raw)?;
+                let syms = omni_runtime::jit_runtime_symbols();
+                let vm = omni_verify::omni_bc::OmniBcVm::new(&bc, &syms);
+                let code = vm.call_by_name("main", &[0, 0])? as i32;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            } else {
+                run_file(&source, &prog_args, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
+            }
         }
         Some(Commands::Build { source, output }) => {
             build_file(&source, &output, args.temp, args.opt_level, args.no_cache, &args.cache_dir, args.verbose, &args.device, &args.platform, args.auto_resolve_dependencies, args.oenv.as_deref())?;
@@ -509,6 +525,27 @@ fn build_file(
     } else {
         "ELF"
     };
+    // Portable OmniBC (`.obc`) bytecode output target — zero linker, zero external toolchain
+    if final_output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("obc"))
+        .unwrap_or(false)
+    {
+        println!("\n[5/5] Emitting portable OmniBC bytecode (.obc)...");
+        let bc_start = std::time::Instant::now();
+        let bc = omni_verify::omni_bc::compile_llvm_ir_to_bc(&llvm_ir)?;
+        let bytes = bc.to_bytes();
+        fs::write(&final_output, &bytes)?;
+        println!(
+            "  -> Emitted OmniBC artifact: {} ({} bytes in {:.2?})",
+            final_output.display(),
+            bytes.len(),
+            bc_start.elapsed()
+        );
+        return Ok(());
+    }
+
     println!("\n[5/5] Linking native {} binary ({})...", bin_fmt, target_platform.llvm_triple);
     let link_start = std::time::Instant::now();
     let target_triple_opt = if target_platform.llvm_triple != omni_codegen::host_target_triple() {

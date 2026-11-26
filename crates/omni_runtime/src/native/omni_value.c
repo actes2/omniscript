@@ -1944,5 +1944,169 @@ void* __omni_os_pipe_pair(void) {
     return slice;
 }
 
+// ============================================================================
+// Universal Growable Little-Endian Byte Buffer (`__omni_bytes_*`) & File I/O (`__omni_fs_*`)
+// Compiler-writing & systems primitives for Stage-1 self-hosting (`bootstrap/*.omni`)
+// ============================================================================
+
+typedef struct {
+    uint8_t* data;
+    size_t len;
+    size_t cap;
+} OmniBytes;
+
+static void __omni_bytes_ensure(OmniBytes* b, size_t extra) {
+    if (!b) return;
+    if (b->len + extra <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap * 2 : 64;
+    while (new_cap < b->len + extra) new_cap *= 2;
+    uint8_t* nd = (uint8_t*)realloc(b->data, new_cap);
+    if (!nd) return;
+    b->data = nd;
+    b->cap = new_cap;
+}
+
+void* __omni_bytes_create(int64_t cap) {
+    OmniBytes* b = (OmniBytes*)calloc(1, sizeof(OmniBytes));
+    if (!b) return NULL;
+    size_t c = cap > 0 ? (size_t)cap : 64;
+    b->data = (uint8_t*)malloc(c);
+    b->len = 0;
+    b->cap = b->data ? c : 0;
+    __omni_c_return_ptr(b);
+    return b;
+}
+
+void __omni_bytes_push_u8(void* ptr, int64_t v) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b) return;
+    __omni_bytes_ensure(b, 1);
+    if (b->len + 1 <= b->cap) b->data[b->len++] = (uint8_t)(v & 0xFF);
+}
+
+void __omni_bytes_push_u16(void* ptr, int64_t v) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b) return;
+    __omni_bytes_ensure(b, 2);
+    if (b->len + 2 <= b->cap) {
+        b->data[b->len++] = (uint8_t)(v & 0xFF);
+        b->data[b->len++] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
+void __omni_bytes_push_u32(void* ptr, int64_t v) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b) return;
+    __omni_bytes_ensure(b, 4);
+    if (b->len + 4 <= b->cap) {
+        uint32_t u = (uint32_t)v;
+        b->data[b->len++] = (uint8_t)(u & 0xFF);
+        b->data[b->len++] = (uint8_t)((u >> 8) & 0xFF);
+        b->data[b->len++] = (uint8_t)((u >> 16) & 0xFF);
+        b->data[b->len++] = (uint8_t)((u >> 24) & 0xFF);
+    }
+}
+
+void __omni_bytes_push_u64(void* ptr, int64_t v) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b) return;
+    __omni_bytes_ensure(b, 8);
+    if (b->len + 8 <= b->cap) {
+        uint64_t u = (uint64_t)v;
+        for (int i = 0; i < 8; i++) {
+            b->data[b->len++] = (uint8_t)((u >> (i * 8)) & 0xFF);
+        }
+    }
+}
+
+void __omni_bytes_push_str(void* ptr, const char* s) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b || !s) return;
+    size_t n = strlen(s);
+    __omni_bytes_ensure(b, n);
+    if (b->len + n <= b->cap) {
+        memcpy(b->data + b->len, s, n);
+        b->len += n;
+    }
+}
+
+void __omni_bytes_patch_u32(void* ptr, int64_t offset, int64_t v) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b || offset < 0 || (size_t)offset + 4 > b->len) return;
+    uint32_t u = (uint32_t)v;
+    b->data[offset]     = (uint8_t)(u & 0xFF);
+    b->data[offset + 1] = (uint8_t)((u >> 8) & 0xFF);
+    b->data[offset + 2] = (uint8_t)((u >> 16) & 0xFF);
+    b->data[offset + 3] = (uint8_t)((u >> 24) & 0xFF);
+}
+
+int64_t __omni_bytes_get(void* ptr, int64_t offset) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b || offset < 0 || (size_t)offset >= b->len) return 0;
+    return (int64_t)b->data[offset];
+}
+
+int64_t __omni_bytes_len(void* ptr) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    return b ? (int64_t)b->len : 0;
+}
+
+void __omni_bytes_destroy(void* ptr) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!b) return;
+    free(b->data);
+    free(b);
+}
+
+char* __omni_fs_read_text(const char* path) {
+    if (!path) return strdup("");
+    FILE* f = fopen(path, "rb");
+    if (!f) return strdup("");
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return strdup("");
+    }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return strdup("");
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    buf[got] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int64_t __omni_fs_write_text(const char* path, const char* content) {
+    if (!path || !content) return -1;
+    FILE* f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t n = strlen(content);
+    size_t wrote = fwrite(content, 1, n, f);
+    fclose(f);
+    return (int64_t)wrote;
+}
+
+int64_t __omni_fs_write_bytes(const char* path, void* ptr) {
+    OmniBytes* b = (OmniBytes*)ptr;
+    if (!path || !b) return -1;
+    FILE* f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t wrote = b->len > 0 ? fwrite(b->data, 1, b->len, f) : 0;
+    fclose(f);
+    return (int64_t)wrote;
+}
+
+int64_t __omni_fs_exists(const char* path) {
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
 
 

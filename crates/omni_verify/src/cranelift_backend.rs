@@ -30,6 +30,7 @@ use crate::VerifyError;
 #[derive(Debug, Clone)]
 struct StructLayout {
     field_offsets: Vec<i32>,
+    field_types: Vec<String>,
     total_size: u32,
 }
 
@@ -37,6 +38,7 @@ struct StructLayout {
 struct GlobalConst {
     name: String, // without leading `@`
     bytes: Vec<u8>,
+    writable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,7 @@ struct FnDecl {
     name: String, // without leading `@`
     ret_ty: Option<String>,
     param_tys: Vec<String>,
+    is_extern_weak: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,11 +163,26 @@ fn llvm_type_size_align(ty: &str, structs: &BTreeMap<String, StructLayout>, ptr_
     if t.ends_with('*') || t == "ptr" {
         return (ptr_bytes, ptr_bytes);
     }
-    if let Some(sname) = t.strip_prefix("%struct.") {
+    if let Some(sname) = t.strip_prefix('%') {
         if let Some(sl) = structs.get(sname) {
-            return (sl.total_size.max(8), 8);
+            return (sl.total_size.max(8), 16);
+        }
+        if let Some(stripped) = sname.strip_prefix("struct.") {
+            if let Some(sl) = structs.get(stripped) {
+                return (sl.total_size.max(8), 8);
+            }
         }
         return (64, 8);
+    }
+    if t.starts_with('<') && t.ends_with('>') {
+        let inner = &t[1..t.len() - 1];
+        if let Some((cnt_s, elem_s)) = inner.split_once('x') {
+            if let Ok(cnt) = cnt_s.trim().parse::<u32>() {
+                let (es, _) = llvm_type_size_align(elem_s.trim(), structs, ptr_bytes);
+                let total = cnt.saturating_mul(es).max(1);
+                return (total, total.min(16));
+            }
+        }
     }
     if t.starts_with('[') && t.ends_with(']') {
         let inner = &t[1..t.len() - 1];
@@ -225,12 +243,13 @@ fn parse_llvm_module(ir: &str, ptr_bytes: u32) -> Result<ParsedModule, VerifyErr
             continue;
         }
 
-        // 1. Struct layout: `%struct.Foo = type { i64, i8*, double }`
-        if let Some(rest) = trimmed.strip_prefix("%struct.") {
-            if let Some((sname, rhs)) = rest.split_once(" = type ") {
-                let sname = sname.trim().to_string();
+        // 1. Named struct layout: `%struct.Foo = type { ... }` OR `%OmniCpuState = type { ... }`
+        if let Some(rest) = trimmed.strip_prefix('%') {
+            if let Some((sname_raw, rhs)) = rest.split_once(" = type ") {
+                let sname = sname_raw.trim().to_string();
                 let body = rhs.trim().trim_start_matches('{').trim_end_matches('}').trim();
                 let mut field_offsets = Vec::new();
+                let mut field_types = Vec::new();
                 let mut offset: u32 = 0;
                 if !body.is_empty() {
                     for fty in split_top_level_commas(body) {
@@ -238,23 +257,29 @@ fn parse_llvm_module(ir: &str, ptr_bytes: u32) -> Result<ParsedModule, VerifyErr
                         let align = align.max(1);
                         offset = (offset + align - 1) & !(align - 1);
                         field_offsets.push(offset as i32);
+                        field_types.push(fty.trim().to_string());
                         offset += sz;
                     }
                 }
-                let total_size = ((offset + 7) & !7).max(8);
-                structs.insert(
-                    sname,
-                    StructLayout {
-                        field_offsets,
-                        total_size,
-                    },
-                );
+                let total_size = ((offset + 15) & !15).max(8);
+                let layout = StructLayout {
+                    field_offsets,
+                    field_types,
+                    total_size,
+                };
+                if let Some(stripped) = sname.strip_prefix("struct.") {
+                    structs.insert(stripped.to_string(), layout.clone());
+                }
+                structs.insert(sname, layout);
             }
             continue;
         }
 
-        // 2. Global string/byte constant: `@.str.0 = private unnamed_addr constant [6 x i8] c"hello\00", align 1`
-        if trimmed.starts_with('@') && trimmed.contains(" constant ") {
+        // 2. Global string/byte constant or mutable byte array:
+        // `@.str.0 = private unnamed_addr constant [6 x i8] c"hello\00", align 1`
+        // `@__omni_lifted_img_... = internal global [N x i8] c"...", align 16`
+        if trimmed.starts_with('@') && (trimmed.contains(" constant ") || trimmed.contains(" global ")) {
+            let writable = trimmed.contains(" global ");
             if let Some((lhs, rhs)) = trimmed.split_once('=') {
                 let gname = lhs.trim().trim_start_matches('@').to_string();
                 if let Some(c_pos) = rhs.find(" c\"") {
@@ -264,15 +289,38 @@ fn parse_llvm_module(ir: &str, ptr_bytes: u32) -> Result<ParsedModule, VerifyErr
                         globals.push(GlobalConst {
                             name: gname,
                             bytes: decode_llvm_c_string(raw_s),
+                            writable,
                         });
                     }
+                } else {
+                    // Scalar or zeroinitializer global: e.g. `@x = internal global i32 0, align 4`
+                    let after_kw = rhs
+                        .split_once(" global ")
+                        .or_else(|| rhs.split_once(" constant "))
+                        .map(|(_, r)| r.trim())
+                        .unwrap_or("i64 0");
+                    let head = after_kw.split(',').next().unwrap_or("i64 0").trim();
+                    let (ty_s, init_s) = head.split_once(' ').unwrap_or((head, "0"));
+                    let (sz, _) = llvm_type_size_align(ty_s.trim(), &structs, ptr_bytes);
+                    let mut bytes = vec![0u8; sz.max(4) as usize];
+                    if let Ok(iv) = init_s.trim().parse::<i64>() {
+                        let le = iv.to_le_bytes();
+                        let n = bytes.len().min(8);
+                        bytes[..n].copy_from_slice(&le[..n]);
+                    }
+                    globals.push(GlobalConst { name: gname, bytes, writable });
                 }
             }
             continue;
         }
 
-        // 3. Function declaration: `declare [ret] @name(args...)`
+        // 3. Function declaration: `declare [extern_weak] [ret] @name(args...)`
         if let Some(rest) = trimmed.strip_prefix("declare ") {
+            let (is_extern_weak, rest) = if let Some(r) = rest.strip_prefix("extern_weak ") {
+                (true, r.trim())
+            } else {
+                (false, rest)
+            };
             let at_pos = rest
                 .find('@')
                 .ok_or_else(|| syntax_err(line_no, format!("Malformed declare: {}", trimmed)))?;
@@ -308,10 +356,20 @@ fn parse_llvm_module(ir: &str, ptr_bytes: u32) -> Result<ParsedModule, VerifyErr
                     }
                 }
             }
+            let is_crt_weak = matches!(
+                fname.as_str(),
+                "ITM_registerTMCloneTable"
+                    | "_ITM_registerTMCloneTable"
+                    | "ITM_deregisterTMCloneTable"
+                    | "_ITM_deregisterTMCloneTable"
+                    | "__gmon_start__"
+                    | "_Jv_RegisterClasses"
+            );
             decls.push(FnDecl {
                 name: fname,
                 ret_ty,
                 param_tys,
+                is_extern_weak: is_extern_weak || is_crt_weak,
             });
             continue;
         }
@@ -994,32 +1052,38 @@ impl<'a, M: Module> LowerCtx<'a, M> {
                     cur_ptr = builder.ins().iadd(cur_ptr, off);
                 }
 
-                // Index 1: struct field or array element
-                if parts.len() >= 4 {
-                    let (_, idx1_op) = split_type_and_operand(parts[3])
-                        .ok_or_else(|| syntax_err(line_no, format!("Malformed GEP idx1: {}", s)))?;
-                    if let Some(sname) = base_ty.strip_prefix("%struct.") {
-                        if let (Some(sl), Ok(fidx)) =
-                            (self.parsed.structs.get(sname), idx1_op.parse::<usize>())
-                        {
+                // Walk all subsequent aggregate indices (`parts[3..]`) through structs & nested arrays
+                let mut cur_ty = base_ty.to_string();
+                for idx_part in &parts[3..] {
+                    let (_, idx_op) = split_type_and_operand(idx_part)
+                        .ok_or_else(|| syntax_err(line_no, format!("Malformed GEP idx: {}", s)))?;
+                    if let Some(sname) = cur_ty.strip_prefix('%') {
+                        let sl_opt = self
+                            .parsed
+                            .structs
+                            .get(sname)
+                            .or_else(|| sname.strip_prefix("struct.").and_then(|st| self.parsed.structs.get(st)));
+                        if let (Some(sl), Ok(fidx)) = (sl_opt, idx_op.parse::<usize>()) {
                             let foff = sl.field_offsets.get(fidx).copied().unwrap_or((fidx * 8) as i32);
                             if foff != 0 {
                                 cur_ptr = builder.ins().iadd_imm(cur_ptr, foff as i64);
                             }
+                            cur_ty = sl.field_types.get(fidx).cloned().unwrap_or_else(|| "i64".to_string());
                         }
-                    } else if base_ty.starts_with('[') && base_ty.ends_with(']') {
-                        if idx1_op != "0" {
-                            let inner = &base_ty[1..base_ty.len() - 1];
-                            let elem_sz = inner
-                                .split_once('x')
-                                .map(|(_, et)| {
-                                    llvm_type_size_align(et.trim(), &self.parsed.structs, self.ptr_bytes).0
-                                })
-                                .unwrap_or(1);
-                            let idx1 = self.eval_operand(builder, idx1_op, self.ptr_ty, line_no)?;
-                            let off = builder.ins().imul_imm(idx1, elem_sz as i64);
+                    } else if cur_ty.starts_with('[') && cur_ty.ends_with(']') {
+                        let inner = &cur_ty[1..cur_ty.len() - 1];
+                        let elem_ty = inner
+                            .split_once('x')
+                            .map(|(_, et)| et.trim().to_string())
+                            .unwrap_or_else(|| "i8".to_string());
+                        if idx_op != "0" {
+                            let (elem_sz, _) =
+                                llvm_type_size_align(&elem_ty, &self.parsed.structs, self.ptr_bytes);
+                            let idx_v = self.eval_operand(builder, idx_op, self.ptr_ty, line_no)?;
+                            let off = builder.ins().imul_imm(idx_v, elem_sz as i64);
                             cur_ptr = builder.ins().iadd(cur_ptr, off);
                         }
+                        cur_ty = elem_ty;
                     }
                 }
 
@@ -1418,11 +1482,11 @@ fn compile_into_module<M: Module>(
     let ptr_bytes = module.target_config().pointer_bytes() as u32;
     let call_conv = module.target_config().default_call_conv;
 
-    // 1. Declare & define all global string constants
+    // 1. Declare & define all global string/byte constants & mutable globals
     let mut data_ids: HashMap<String, DataId> = HashMap::new();
     for g in &parsed.globals {
         let did = module
-            .declare_data(&g.name, Linkage::Local, false, false)
+            .declare_data(&g.name, Linkage::Local, g.writable, false)
             .map_err(|e| VerifyError::LinkError(e.to_string()))?;
         let mut dd = DataDescription::new();
         dd.define(g.bytes.clone().into_boxed_slice());
@@ -1432,8 +1496,9 @@ fn compile_into_module<M: Module>(
         data_ids.insert(g.name.clone(), did);
     }
 
-    // 2. Declare all external functions
+    // 2. Declare all external functions (and materialize `extern_weak` symbols as safe weak no-ops)
     let mut func_ids: HashMap<String, (FuncId, Signature)> = HashMap::new();
+    let mut weak_stub_ids: Vec<(FuncId, Signature)> = Vec::new();
     for d in &parsed.decls {
         let link_name = if d.name == "llvm.pow.f64" {
             "pow"
@@ -1454,12 +1519,49 @@ fn compile_into_module<M: Module>(
                 sig.returns.push(AbiParam::new(ct));
             }
         }
+        let linkage = if d.is_extern_weak {
+            Linkage::Preemptible
+        } else {
+            Linkage::Import
+        };
         let fid = module
-            .declare_function(link_name, Linkage::Import, &sig)
+            .declare_function(link_name, linkage, &sig)
             .map_err(|e| VerifyError::LinkError(e.to_string()))?;
+        if d.is_extern_weak {
+            weak_stub_ids.push((fid, sig.clone()));
+        }
         func_ids.insert(link_name.to_string(), (fid, sig.clone()));
         if link_name != d.name {
             func_ids.insert(d.name.clone(), (fid, sig));
+        }
+    }
+    if !weak_stub_ids.is_empty() {
+        let mut wctx = module.make_context();
+        let mut wfb_ctx = FunctionBuilderContext::new();
+        for (fid, sig) in weak_stub_ids {
+            wctx.clear();
+            wctx.func.signature = sig.clone();
+            let mut b = FunctionBuilder::new(&mut wctx.func, &mut wfb_ctx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            if let Some(ret_p) = sig.returns.first() {
+                let z = if ret_p.value_type == types::F64 {
+                    b.ins().f64const(0.0)
+                } else if ret_p.value_type == types::F32 {
+                    b.ins().f32const(0.0)
+                } else {
+                    b.ins().iconst(ret_p.value_type, 0)
+                };
+                b.ins().return_(&[z]);
+            } else {
+                b.ins().return_(&[]);
+            }
+            b.seal_all_blocks();
+            b.finalize();
+            module
+                .define_function(fid, &mut wctx)
+                .map_err(|e| VerifyError::LinkError(e.to_string()))?;
         }
     }
 

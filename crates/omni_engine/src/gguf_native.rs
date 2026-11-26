@@ -1083,6 +1083,28 @@ impl NativeKvCache {
             v: vec![vec![0.0f32; max_seq * kv_dim]; cfg.n_layers],
         }
     }
+
+    /// Clone a pre-computed prompt prefix KV cache into a larger cache for fast suffix prefill + decode.
+    pub fn from_prefix(prefix: &NativeKvCache, prefix_len: usize, new_max_seq: usize) -> Self {
+        let kv_dim = prefix.kv_dim;
+        let copy_elems = prefix_len * kv_dim;
+        let mut k = Vec::with_capacity(prefix.k.len());
+        let mut v = Vec::with_capacity(prefix.v.len());
+        for l in 0..prefix.k.len() {
+            let mut kl = vec![0.0f32; new_max_seq * kv_dim];
+            let mut vl = vec![0.0f32; new_max_seq * kv_dim];
+            kl[..copy_elems].copy_from_slice(&prefix.k[l][..copy_elems]);
+            vl[..copy_elems].copy_from_slice(&prefix.v[l][..copy_elems]);
+            k.push(kl);
+            v.push(vl);
+        }
+        Self {
+            max_seq: new_max_seq,
+            kv_dim,
+            k,
+            v,
+        }
+    }
 }
 
 impl NativeGgufModel {
@@ -1281,19 +1303,34 @@ impl NativeGgufModel {
     }
 
     /// Batched prompt prefill: processes all `prompt_ids` in ONE pass over the 941 MB weights,
-    /// populates `kv`, and returns the logits for the final prompt token!
+    /// populates `kv`, and optionally computes logits for the final prompt token.
     pub fn forward_prefill_batch(
         &self,
         prompt_ids: &[u32],
         start_pos: usize,
         kv: &mut NativeKvCache,
     ) -> Vec<f32> {
+        self.forward_prefill_batch_opt(prompt_ids, start_pos, kv, true)
+    }
+
+    /// Prefill a shared prompt prefix into `kv` without computing the 151,936-row LM head.
+    pub fn forward_prefill_prefix(&self, prefix_ids: &[u32], kv: &mut NativeKvCache) {
+        let _ = self.forward_prefill_batch_opt(prefix_ids, 0, kv, false);
+    }
+
+    fn forward_prefill_batch_opt(
+        &self,
+        prompt_ids: &[u32],
+        start_pos: usize,
+        kv: &mut NativeKvCache,
+        compute_logits: bool,
+    ) -> Vec<f32> {
         let s = prompt_ids.len();
         if s == 0 {
             return Vec::new();
         }
         if s == 1 {
-            return self.forward_token(prompt_ids[0], start_pos, kv, true);
+            return self.forward_token(prompt_ids[0], start_pos, kv, compute_logits);
         }
 
         let cfg = &self.config;
@@ -1394,6 +1431,10 @@ impl NativeGgufModel {
             for i in 0..s * d {
                 x[i] += proj[i];
             }
+        }
+
+        if !compute_logits {
+            return Vec::new();
         }
 
         // Compute logits only for the LAST prompt token!
