@@ -16,8 +16,10 @@ extern fn __omni_bytes_len(buf: int) -> int;
 extern fn __omni_bytes_destroy(buf: int) -> void;
 extern fn __omni_fs_read_text(path: str) -> str;
 extern fn __omni_fs_write_bytes(path: str, buf: int) -> int;
+extern fn __omni_fs_exists(path: str) -> int;
 extern fn __omni_str_byte_at(s: str, idx: int) -> int;
 extern fn __omni_str_slice_step(s: str, st: int, en: int, step: int, has_s: int, has_e: int) -> str;
+extern fn __omni_str_concat(a: str, b: str) -> str;
 extern fn __omni_str_len(s: str) -> int;
 extern fn __omni_str_eq(a: str, b: str) -> int;
 extern fn __omni_c_str_to_i64(s: str) -> int;
@@ -298,6 +300,151 @@ fn buf_pad_align(buf: int, align: int) -> int {
         }
     }
     return 0
+}
+
+fn a64_ldr_slot(text: int, rt: int, slot: int) -> int {
+    let imm12 = 2 + slot
+    let w = 0xF94003A0 | (imm12 << 10) | rt
+    __omni_bytes_push_u32(text, w)
+    return 0
+}
+
+fn a64_str_slot(text: int, rt: int, slot: int) -> int {
+    let imm12 = 2 + slot
+    let w = 0xF90003A0 | (imm12 << 10) | rt
+    __omni_bytes_push_u32(text, w)
+    return 0
+}
+
+fn a64_movz_imm16(text: int, rd: int, imm16: int) -> int {
+    let w = 0xD2800000 | ((imm16 & 0xFFFF) << 5) | rd
+    __omni_bytes_push_u32(text, w)
+    return 0
+}
+
+fn a64_movk_imm16(text: int, rd: int, imm16: int, shift_idx: int) -> int {
+    let base = 0xF2A00000
+    if shift_idx == 2 {
+        base = 0xF2C00000
+    }
+    if shift_idx == 3 {
+        base = 0xF2E00000
+    }
+    let w = base | ((imm16 & 0xFFFF) << 5) | rd
+    __omni_bytes_push_u32(text, w)
+    return 0
+}
+
+fn path_dirname(path: int) -> int {
+    let n = __omni_str_len(path)
+    let last_slash = -1
+    let i = 0
+    while i < n {
+        if __omni_str_byte_at(path, i) == 47 {
+            last_slash = i
+        }
+        i = i + 1
+    }
+    if last_slash < 0 {
+        return ""
+    }
+    return __omni_str_slice_step(path, 0, last_slash + 1, 1, 1, 1)
+}
+
+fn slice_has_str(sl: int, s: int) -> int {
+    let n = __omni_slice_len(sl)
+    let i = 0
+    while i < n {
+        if __omni_str_eq(__omni_slice_get(sl, i), s) == 1 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn load_source_with_imports(path: int, visited: int) -> int {
+    if slice_has_str(visited, path) == 1 {
+        return ""
+    }
+    __omni_slice_append(visited, path)
+    let src = __omni_fs_read_text(path)
+    let n = __omni_str_len(src)
+    if n == 0 {
+        return ""
+    }
+    let dir = path_dirname(path)
+    let combined = ""
+    let i = 0
+    while i < n {
+        let line_start = i
+        while i < n && __omni_str_byte_at(src, i) != 10 {
+            i = i + 1
+        }
+        let line_end = i
+        if i < n {
+            i = i + 1
+        }
+        let j = line_start
+        while j < line_end && (__omni_str_byte_at(src, j) == 32 || __omni_str_byte_at(src, j) == 9) {
+            j = j + 1
+        }
+        let imp_path = ""
+        if j + 7 < line_end && __omni_str_byte_at(src, j) == 105 && __omni_str_byte_at(src, j + 1) == 109 && __omni_str_byte_at(src, j + 2) == 112 && __omni_str_byte_at(src, j + 3) == 111 && __omni_str_byte_at(src, j + 4) == 114 && __omni_str_byte_at(src, j + 5) == 116 && __omni_str_byte_at(src, j + 6) == 32 {
+            let q = j + 7
+            while q < line_end && __omni_str_byte_at(src, q) != 34 {
+                q = q + 1
+            }
+            if q < line_end {
+                let q1 = q + 1
+                let q2 = q1
+                while q2 < line_end && __omni_str_byte_at(src, q2) != 34 {
+                    q2 = q2 + 1
+                }
+                if q2 > q1 {
+                    let rel = __omni_str_slice_step(src, q1, q2, 1, 1, 1)
+                    let cand1 = __omni_str_concat(dir, rel)
+                    if __omni_fs_exists(cand1) == 1 {
+                        imp_path = cand1
+                    } else {
+                        let cand2 = __omni_str_concat(cand1, ".omni")
+                        if __omni_fs_exists(cand2) == 1 {
+                            imp_path = cand2
+                        }
+                    }
+                }
+            }
+        }
+        if __omni_str_len(imp_path) == 0 && j + 4 < line_end && __omni_str_byte_at(src, j) == 109 && __omni_str_byte_at(src, j + 1) == 111 && __omni_str_byte_at(src, j + 2) == 100 && __omni_str_byte_at(src, j + 3) == 32 {
+            let m1 = j + 4
+            let m2 = m1
+            while m2 < line_end && is_alnum(__omni_str_byte_at(src, m2)) == 1 {
+                m2 = m2 + 1
+            }
+            if m2 > m1 {
+                let mname = __omni_str_slice_step(src, m1, m2, 1, 1, 1)
+                let base = __omni_str_concat(dir, mname)
+                let c_omni = __omni_str_concat(base, ".omni")
+                if __omni_fs_exists(c_omni) == 1 {
+                    imp_path = c_omni
+                } else {
+                    let c_rs = __omni_str_concat(base, ".rs")
+                    if __omni_fs_exists(c_rs) == 1 {
+                        imp_path = c_rs
+                    }
+                }
+            }
+        }
+        if __omni_str_len(imp_path) > 0 {
+            let sub = load_source_with_imports(imp_path, visited)
+            if __omni_str_len(sub) > 0 {
+                combined = __omni_str_concat(combined, sub)
+                combined = __omni_str_concat(combined, "\n")
+            }
+        }
+    }
+    combined = __omni_str_concat(combined, src)
+    return combined
 }
 
 class Compiler {
@@ -1911,8 +2058,18 @@ class Compiler {
                 self.advance()
                 handled = 1
             }
-            if handled == 0 && self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "use") == 1 {
+            if handled == 0 && self.peek_kind() == 1 && (str_eq_raw(self.peek_text(), "use") == 1 || str_eq_raw(self.peek_text(), "mod") == 1) {
                 while self.peek_kind() != 16 && self.peek_kind() != 0 {
+                    self.advance()
+                }
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                handled = 1
+            }
+            if handled == 0 && self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "import") == 1 {
+                self.advance()
+                if self.peek_kind() == 3 || self.peek_kind() == 1 {
                     self.advance()
                 }
                 if self.peek_kind() == 16 {
@@ -2606,10 +2763,521 @@ class Compiler {
         __omni_bytes_destroy(strtab)
         return out
     }
+
+    fn emit_elf64_aarch64(self) -> int {
+        let nf = __omni_slice_len(self.fn_names)
+        let has_main_wrapper = 0
+        let user_main_fidx = -1
+        let mi = 0
+        while mi < nf {
+            let fnm = __omni_slice_get(self.fn_names, mi)
+            if str_eq_raw(fnm, "main") == 1 && __omni_slice_get(self.fn_params_count, mi) == 1 {
+                has_main_wrapper = 1
+                user_main_fidx = mi
+            }
+            mi = mi + 1
+        }
+        let ext_sl_create = 0
+        let ext_sl_append = 0
+        let ext_sl_destroy = 0
+        if has_main_wrapper == 1 {
+            ext_sl_create = self.intern_extern("__omni_slice_create")
+            ext_sl_append = self.intern_extern("__omni_slice_append")
+            ext_sl_destroy = self.intern_extern("__omni_slice_destroy")
+        }
+
+        let rodata = __omni_bytes_create(1024)
+        let global_offs = __omni_slice_create(64)
+        let ng = __omni_slice_len(self.globals)
+        let gi = 0
+        while gi < ng {
+            __omni_slice_append(global_offs, __omni_bytes_len(rodata))
+            let gval = __omni_slice_get(self.globals, gi)
+            __omni_bytes_push_str(rodata, gval)
+            __omni_bytes_push_u8(rodata, 0)
+            gi = gi + 1
+        }
+
+        let ext_sym_base = 2 + nf + has_main_wrapper
+        let text = __omni_bytes_create(16384)
+        let rela = __omni_bytes_create(4096)
+        let fn_text_offs = __omni_slice_create(nf + 1)
+        let fn_text_sizes = __omni_slice_create(nf + 1)
+
+        let fi = 0
+        while fi < nf {
+            let f_start = __omni_bytes_len(text)
+            __omni_slice_append(fn_text_offs, f_start)
+
+            let nparams = __omni_slice_get(self.fn_params_count, fi)
+            let nregs = __omni_slice_get(self.fn_regs_count, fi)
+            let frame_sz = ((16 + nregs * 8 + 15) / 16) * 16
+            if frame_sz < 32 {
+                frame_sz = 32
+            }
+            a64_movz_imm16(text, 9, frame_sz & 0xFFFF)
+            if frame_sz >= 65536 {
+                a64_movk_imm16(text, 9, (frame_sz >> 16) & 0xFFFF, 1)
+            }
+            __omni_bytes_push_u32(text, 0xCB2963FF)
+            __omni_bytes_push_u32(text, 0xA9007BFD)
+            __omni_bytes_push_u32(text, 0x910003FD)
+
+            let pi = 0
+            while pi < nparams {
+                a64_str_slot(text, pi, pi)
+                pi = pi + 1
+            }
+
+            let ops_buf = __omni_slice_get(self.fn_ops_bufs, fi)
+            let op_count = __omni_slice_get(self.fn_ops_counts, fi)
+            let pc_to_off = __omni_slice_create(op_count + 1)
+            let bp_offs = __omni_slice_create(32)
+            let bp_tgts = __omni_slice_create(32)
+            let bp_kinds = __omni_slice_create(32)
+
+            let cur = 0
+            let oi = 0
+            while oi < op_count {
+                __omni_slice_append(pc_to_off, __omni_bytes_len(text))
+                let tag = __omni_bytes_get(ops_buf, cur)
+                cur = cur + 1
+                if tag == 1 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let w0 = x64_read_u16(ops_buf, cur + 2)
+                    let w1 = x64_read_u16(ops_buf, cur + 4)
+                    let w2 = x64_read_u16(ops_buf, cur + 6)
+                    let w3 = x64_read_u16(ops_buf, cur + 8)
+                    cur = cur + 10
+                    a64_movz_imm16(text, 0, w0)
+                    if w1 != 0 {
+                        a64_movk_imm16(text, 0, w1, 1)
+                    }
+                    if w2 != 0 {
+                        a64_movk_imm16(text, 0, w2, 2)
+                    }
+                    if w3 != 0 {
+                        a64_movk_imm16(text, 0, w3, 3)
+                    }
+                    a64_str_slot(text, 0, dst)
+                }
+                if tag == 2 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let gidx = x64_read_u32(ops_buf, cur + 2)
+                    cur = cur + 6
+                    let goff = __omni_slice_get(global_offs, gidx)
+                    let adrp_off = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x90000000)
+                    x64_add_rela(rela, adrp_off, 1, 275, goff)
+                    let add_off = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x91000000)
+                    x64_add_rela(rela, add_off, 1, 277, goff)
+                    a64_str_slot(text, 0, dst)
+                }
+                if tag == 4 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let src = x64_read_u16(ops_buf, cur + 2)
+                    cur = cur + 4
+                    a64_ldr_slot(text, 0, src)
+                    a64_str_slot(text, 0, dst)
+                }
+                if tag == 12 || tag == 13 || tag == 14 || tag == 15 || tag == 17 || (tag >= 19 && tag <= 24) {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let a = x64_read_u16(ops_buf, cur + 2)
+                    let b = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    a64_ldr_slot(text, 0, a)
+                    a64_ldr_slot(text, 1, b)
+                    if tag == 12 {
+                        __omni_bytes_push_u32(text, 0x8B010000)
+                    }
+                    if tag == 13 {
+                        __omni_bytes_push_u32(text, 0xCB010000)
+                    }
+                    if tag == 14 {
+                        __omni_bytes_push_u32(text, 0x9B017C00)
+                    }
+                    if tag == 15 {
+                        __omni_bytes_push_u32(text, 0x9AC10C00)
+                    }
+                    if tag == 17 {
+                        __omni_bytes_push_u32(text, 0x9AC10C02)
+                        __omni_bytes_push_u32(text, 0x9B018040)
+                    }
+                    if tag == 19 {
+                        __omni_bytes_push_u32(text, 0x8A010000)
+                    }
+                    if tag == 20 {
+                        __omni_bytes_push_u32(text, 0xAA010000)
+                    }
+                    if tag == 21 {
+                        __omni_bytes_push_u32(text, 0xCA010000)
+                    }
+                    if tag == 22 {
+                        __omni_bytes_push_u32(text, 0x9AC12000)
+                    }
+                    if tag == 23 {
+                        __omni_bytes_push_u32(text, 0x9AC12800)
+                    }
+                    if tag == 24 {
+                        __omni_bytes_push_u32(text, 0x9AC12400)
+                    }
+                    a64_str_slot(text, 0, dst)
+                }
+                if tag == 27 {
+                    let dst = x64_read_u16(ops_buf, cur)
+                    let cc = __omni_bytes_get(ops_buf, cur + 2)
+                    let a = x64_read_u16(ops_buf, cur + 3)
+                    let b = x64_read_u16(ops_buf, cur + 5)
+                    cur = cur + 7
+                    a64_ldr_slot(text, 0, a)
+                    a64_ldr_slot(text, 1, b)
+                    __omni_bytes_push_u32(text, 0xEB01001F)
+                    let cset_w = 0x9A9F17E0
+                    if cc == 1 {
+                        cset_w = 0x9A9F07E0
+                    }
+                    if cc == 2 {
+                        cset_w = 0x9A9FA7E0
+                    }
+                    if cc == 3 {
+                        cset_w = 0x9A9FC7E0
+                    }
+                    if cc == 4 {
+                        cset_w = 0x9A9FD7E0
+                    }
+                    if cc == 5 {
+                        cset_w = 0x9A9FB7E0
+                    }
+                    __omni_bytes_push_u32(text, cset_w)
+                    a64_str_slot(text, 0, dst)
+                }
+                if tag == 61 {
+                    let tgt = x64_read_u32(ops_buf, cur)
+                    cur = cur + 4
+                    let poff = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x14000000)
+                    __omni_slice_append(bp_offs, poff)
+                    __omni_slice_append(bp_tgts, tgt)
+                    __omni_slice_append(bp_kinds, 0)
+                }
+                if tag == 62 {
+                    let cond = x64_read_u16(ops_buf, cur)
+                    let t_tgt = x64_read_u32(ops_buf, cur + 2)
+                    let f_tgt = x64_read_u32(ops_buf, cur + 6)
+                    cur = cur + 10
+                    a64_ldr_slot(text, 0, cond)
+                    let poff_t = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0xB5000000)
+                    __omni_slice_append(bp_offs, poff_t)
+                    __omni_slice_append(bp_tgts, t_tgt)
+                    __omni_slice_append(bp_kinds, 1)
+                    let poff_f = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x14000000)
+                    __omni_slice_append(bp_offs, poff_f)
+                    __omni_slice_append(bp_tgts, f_tgt)
+                    __omni_slice_append(bp_kinds, 0)
+                }
+                if tag == 64 {
+                    let has_v = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    if has_v == 1 {
+                        let r = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        a64_ldr_slot(text, 0, r)
+                    }
+                    __omni_bytes_push_u32(text, 0x910003BF)
+                    __omni_bytes_push_u32(text, 0xA9407BFD)
+                    a64_movz_imm16(text, 9, frame_sz & 0xFFFF)
+                    if frame_sz >= 65536 {
+                        a64_movk_imm16(text, 9, (frame_sz >> 16) & 0xFFFF, 1)
+                    }
+                    __omni_bytes_push_u32(text, 0x8B2963FF)
+                    __omni_bytes_push_u32(text, 0xD65F03C0)
+                }
+                if tag == 66 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    let dst = 0
+                    if has_dst == 1 {
+                        dst = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                    }
+                    let cfidx = x64_read_u32(ops_buf, cur)
+                    let na = x64_read_u16(ops_buf, cur + 4)
+                    cur = cur + 6
+                    let ai = 0
+                    while ai < na {
+                        let areg = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                        a64_ldr_slot(text, ai, areg)
+                        ai = ai + 1
+                    }
+                    let coff = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x94000000)
+                    x64_add_rela(rela, coff, 2 + cfidx, 283, 0)
+                    if has_dst == 1 {
+                        a64_str_slot(text, 0, dst)
+                    }
+                }
+                if tag == 67 {
+                    let has_dst = __omni_bytes_get(ops_buf, cur)
+                    cur = cur + 1
+                    let dst = 0
+                    if has_dst == 1 {
+                        dst = x64_read_u16(ops_buf, cur)
+                        cur = cur + 2
+                    }
+                    let eidx = x64_read_u32(ops_buf, cur)
+                    cur = cur + 5
+                    let na = x64_read_u16(ops_buf, cur)
+                    cur = cur + 2
+                    let ai = 0
+                    while ai < na {
+                        let areg = x64_read_u16(ops_buf, cur)
+                        cur = cur + 3
+                        a64_ldr_slot(text, ai, areg)
+                        ai = ai + 1
+                    }
+                    let coff = __omni_bytes_len(text)
+                    __omni_bytes_push_u32(text, 0x94000000)
+                    x64_add_rela(rela, coff, ext_sym_base + eidx, 283, 0)
+                    if has_dst == 1 {
+                        a64_str_slot(text, 0, dst)
+                    }
+                }
+                oi = oi + 1
+            }
+
+            let nbp = __omni_slice_len(bp_offs)
+            let bpi = 0
+            while bpi < nbp {
+                let poff = __omni_slice_get(bp_offs, bpi)
+                let tgt = __omni_slice_get(bp_tgts, bpi)
+                let bkind = __omni_slice_get(bp_kinds, bpi)
+                let toff = __omni_slice_get(pc_to_off, tgt)
+                let rel_w = (toff - poff) / 4
+                if bkind == 0 {
+                    __omni_bytes_patch_u32(text, poff, 0x14000000 | (rel_w & 0x03FFFFFF))
+                } else {
+                    __omni_bytes_patch_u32(text, poff, 0xB5000000 | ((rel_w & 0x7FFFF) << 5))
+                }
+                bpi = bpi + 1
+            }
+
+            __omni_slice_append(fn_text_sizes, __omni_bytes_len(text) - f_start)
+            __omni_bytes_destroy(ops_buf)
+            fi = fi + 1
+        }
+
+        let wrap_off = 0
+        let wrap_sz = 0
+        if has_main_wrapper == 1 {
+            wrap_off = __omni_bytes_len(text)
+            a64_movz_imm16(text, 9, 64)
+            __omni_bytes_push_u32(text, 0xCB2963FF)
+            __omni_bytes_push_u32(text, 0xA9007BFD)
+            __omni_bytes_push_u32(text, 0x910003FD)
+            __omni_bytes_push_u32(text, 0x93407C00)
+            a64_str_slot(text, 0, 0)
+            a64_str_slot(text, 1, 1)
+            let c1 = __omni_bytes_len(text)
+            __omni_bytes_push_u32(text, 0x94000000)
+            x64_add_rela(rela, c1, ext_sym_base + ext_sl_create, 283, 0)
+            a64_str_slot(text, 0, 2)
+            a64_movz_imm16(text, 0, 0)
+            a64_str_slot(text, 0, 3)
+
+            let loop_off = __omni_bytes_len(text)
+            a64_ldr_slot(text, 0, 3)
+            a64_ldr_slot(text, 1, 0)
+            __omni_bytes_push_u32(text, 0xEB01001F)
+            let bge_off = __omni_bytes_len(text)
+            __omni_bytes_push_u32(text, 0x5400000A)
+
+            a64_ldr_slot(text, 0, 3)
+            a64_ldr_slot(text, 1, 1)
+            __omni_bytes_push_u32(text, 0xF8607821)
+            a64_ldr_slot(text, 0, 2)
+            let c2 = __omni_bytes_len(text)
+            __omni_bytes_push_u32(text, 0x94000000)
+            x64_add_rela(rela, c2, ext_sym_base + ext_sl_append, 283, 0)
+
+            a64_ldr_slot(text, 0, 3)
+            __omni_bytes_push_u32(text, 0x91000400)
+            a64_str_slot(text, 0, 3)
+            let b_off = __omni_bytes_len(text)
+            let back_w = (loop_off - b_off) / 4
+            __omni_bytes_push_u32(text, 0x14000000 | (back_w & 0x03FFFFFF))
+
+            let done_off = __omni_bytes_len(text)
+            let fwd_w = (done_off - bge_off) / 4
+            __omni_bytes_patch_u32(text, bge_off, 0x5400000A | ((fwd_w & 0x7FFFF) << 5))
+
+            a64_ldr_slot(text, 0, 2)
+            let c3 = __omni_bytes_len(text)
+            __omni_bytes_push_u32(text, 0x94000000)
+            x64_add_rela(rela, c3, 2 + user_main_fidx, 283, 0)
+            a64_str_slot(text, 0, 3)
+
+            a64_ldr_slot(text, 0, 2)
+            let c4 = __omni_bytes_len(text)
+            __omni_bytes_push_u32(text, 0x94000000)
+            x64_add_rela(rela, c4, ext_sym_base + ext_sl_destroy, 283, 0)
+
+            a64_ldr_slot(text, 0, 3)
+            __omni_bytes_push_u32(text, 0x910003BF)
+            __omni_bytes_push_u32(text, 0xA9407BFD)
+            a64_movz_imm16(text, 9, 64)
+            __omni_bytes_push_u32(text, 0x8B2963FF)
+            __omni_bytes_push_u32(text, 0xD65F03C0)
+            wrap_sz = __omni_bytes_len(text) - wrap_off
+        }
+
+        let shstrtab = __omni_bytes_create(128)
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_text_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".text")
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_rodata_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".rodata")
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_rela_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".rela.text")
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_shstr_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".shstrtab")
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_sym_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".symtab")
+        __omni_bytes_push_u8(shstrtab, 0)
+        let sh_str_nm = __omni_bytes_len(shstrtab)
+        __omni_bytes_push_str(shstrtab, ".strtab")
+        __omni_bytes_push_u8(shstrtab, 0)
+
+        let strtab = __omni_bytes_create(2048)
+        __omni_bytes_push_u8(strtab, 0)
+        let symtab = __omni_bytes_create(2048)
+        elf64_push_sym(symtab, 0, 0, 0, 0, 0)
+        elf64_push_sym(symtab, 0, 3, 2, 0, 0)
+
+        let sfi = 0
+        while sfi < nf {
+            let nm_off = __omni_bytes_len(strtab)
+            if has_main_wrapper == 1 && sfi == user_main_fidx {
+                __omni_bytes_push_str(strtab, "__omni_user_main")
+            } else {
+                __omni_bytes_push_str(strtab, __omni_slice_get(self.fn_names, sfi))
+            }
+            __omni_bytes_push_u8(strtab, 0)
+            elf64_push_sym(symtab, nm_off, 18, 1, __omni_slice_get(fn_text_offs, sfi), __omni_slice_get(fn_text_sizes, sfi))
+            sfi = sfi + 1
+        }
+        if has_main_wrapper == 1 {
+            let wm_off = __omni_bytes_len(strtab)
+            __omni_bytes_push_str(strtab, "main")
+            __omni_bytes_push_u8(strtab, 0)
+            elf64_push_sym(symtab, wm_off, 18, 1, wrap_off, wrap_sz)
+        }
+        let ne = __omni_slice_len(self.extern_names)
+        let sei = 0
+        while sei < ne {
+            let en_off = __omni_bytes_len(strtab)
+            __omni_bytes_push_str(strtab, __omni_slice_get(self.extern_names, sei))
+            __omni_bytes_push_u8(strtab, 0)
+            elf64_push_sym(symtab, en_off, 16, 0, 0, 0)
+            sei = sei + 1
+        }
+
+        let out = __omni_bytes_create(32768)
+        __omni_bytes_push_u8(out, 127)
+        __omni_bytes_push_str(out, "ELF")
+        __omni_bytes_push_u8(out, 2)
+        __omni_bytes_push_u8(out, 1)
+        __omni_bytes_push_u8(out, 1)
+        __omni_bytes_push_u8(out, 0)
+        __omni_bytes_push_u64(out, 0)
+        __omni_bytes_push_u16(out, 1)
+        __omni_bytes_push_u16(out, 183)
+        __omni_bytes_push_u32(out, 1)
+        __omni_bytes_push_u64(out, 0)
+        __omni_bytes_push_u64(out, 0)
+        let shoff_patch = __omni_bytes_len(out)
+        __omni_bytes_push_u64(out, 0)
+        __omni_bytes_push_u32(out, 0)
+        __omni_bytes_push_u16(out, 64)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 0)
+        __omni_bytes_push_u16(out, 64)
+        __omni_bytes_push_u16(out, 7)
+        __omni_bytes_push_u16(out, 4)
+
+        buf_pad_align(out, 16)
+        let off_text = __omni_bytes_len(out)
+        let sz_text = __omni_bytes_len(text)
+        buf_append_buf(out, text)
+
+        buf_pad_align(out, 8)
+        let off_rodata = __omni_bytes_len(out)
+        let sz_rodata = __omni_bytes_len(rodata)
+        buf_append_buf(out, rodata)
+
+        buf_pad_align(out, 8)
+        let off_rela = __omni_bytes_len(out)
+        let sz_rela = __omni_bytes_len(rela)
+        buf_append_buf(out, rela)
+
+        let off_shstr = __omni_bytes_len(out)
+        let sz_shstr = __omni_bytes_len(shstrtab)
+        buf_append_buf(out, shstrtab)
+
+        buf_pad_align(out, 8)
+        let off_sym = __omni_bytes_len(out)
+        let sz_sym = __omni_bytes_len(symtab)
+        buf_append_buf(out, symtab)
+
+        let off_str = __omni_bytes_len(out)
+        let sz_str = __omni_bytes_len(strtab)
+        buf_append_buf(out, strtab)
+
+        buf_pad_align(out, 8)
+        let shoff = __omni_bytes_len(out)
+        __omni_bytes_patch_u32(out, shoff_patch, shoff)
+
+        elf64_push_shdr_a(out, 0, 0, 0, 0, 0)
+        elf64_push_shdr_b(out, 0, 0, 0, 0)
+
+        elf64_push_shdr_a(out, sh_text_nm, 1, 6, off_text, sz_text)
+        elf64_push_shdr_b(out, 0, 0, 16, 0)
+
+        elf64_push_shdr_a(out, sh_rodata_nm, 1, 2, off_rodata, sz_rodata)
+        elf64_push_shdr_b(out, 0, 0, 8, 0)
+
+        elf64_push_shdr_a(out, sh_rela_nm, 4, 64, off_rela, sz_rela)
+        elf64_push_shdr_b(out, 5, 1, 8, 24)
+
+        elf64_push_shdr_a(out, sh_shstr_nm, 3, 0, off_shstr, sz_shstr)
+        elf64_push_shdr_b(out, 0, 0, 1, 0)
+
+        elf64_push_shdr_a(out, sh_sym_nm, 2, 0, off_sym, sz_sym)
+        elf64_push_shdr_b(out, 6, 2, 8, 24)
+
+        elf64_push_shdr_a(out, sh_str_nm, 3, 0, off_str, sz_str)
+        elf64_push_shdr_b(out, 0, 0, 1, 0)
+
+        __omni_bytes_destroy(text)
+        __omni_bytes_destroy(rodata)
+        __omni_bytes_destroy(rela)
+        __omni_bytes_destroy(shstrtab)
+        __omni_bytes_destroy(symtab)
+        __omni_bytes_destroy(strtab)
+        return out
+    }
 }
 
 fn compile_file(in_path: str, out_path: str) -> int {
-    let source = __omni_fs_read_text(in_path)
+    let visited = __omni_slice_create(16)
+    let source = load_source_with_imports(in_path, visited)
     if __omni_str_len(source) == 0 {
         print("omnic_stage1: failed to read input file")
         return 1
@@ -2618,14 +3286,25 @@ fn compile_file(in_path: str, out_path: str) -> int {
     c.init_compiler(source)
     c.compile_module()
     let olen = __omni_str_len(out_path)
+    let is_arm64 = 0
+    if olen >= 8 {
+        let tail8 = __omni_str_slice_step(out_path, olen - 8, olen, 1, 1, 1)
+        if __omni_str_eq(tail8, ".arm64.o") == 1 {
+            is_arm64 = 1
+        }
+    }
     let is_obj = 0
-    if olen >= 2 && __omni_str_byte_at(out_path, olen - 2) == 46 && __omni_str_byte_at(out_path, olen - 1) == 111 {
+    if is_arm64 == 0 && olen >= 2 && __omni_str_byte_at(out_path, olen - 2) == 46 && __omni_str_byte_at(out_path, olen - 1) == 111 {
         is_obj = 1
     }
     let out_buf = 0
-    if is_obj == 1 {
+    if is_arm64 == 1 {
+        out_buf = c.emit_elf64_aarch64()
+    }
+    if is_arm64 == 0 && is_obj == 1 {
         out_buf = c.emit_elf64_x86_64()
-    } else {
+    }
+    if is_arm64 == 0 && is_obj == 0 {
         out_buf = c.emit_obc_bytes()
     }
     let wrote = __omni_fs_write_bytes(out_path, out_buf)

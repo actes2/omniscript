@@ -356,6 +356,73 @@ fn main() -> int {
             assert_eq!(ru.status.code(), Some(87));
             let ru_out = String::from_utf8_lossy(&ru.stdout);
             assert!(ru_out.contains("87"), "Expected bitwise result 87, got: {}", ru_out);
+
+            // 10. Multi-file diamond import resolution by Stage-2 native binary
+            let mf_dir = tmp.join("multifile_proj");
+            std::fs::create_dir_all(&mf_dir).unwrap();
+            std::fs::write(
+                mf_dir.join("math_helpers.omni"),
+                "fn square(x: int) -> int {\n    return x * x\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                mf_dir.join("vec_ops.omni"),
+                "import \"math_helpers.omni\";\nfn sum_squares(arr: int) -> int {\n    let s = 0\n    for i in 0..arr.len() {\n        s += square(arr[i])\n    }\n    return s\n}\n",
+            )
+            .unwrap();
+            let mf_app = mf_dir.join("app.omni");
+            std::fs::write(
+                &mf_app,
+                "import \"math_helpers.omni\";\nimport \"vec_ops\";\nfn main() -> int {\n    let v = [2, 3, 4]\n    let res = sum_squares(v) + square(5)\n    print(res)\n    return res\n}\n",
+            )
+            .unwrap();
+            let mf_o = mf_dir.join("app.o");
+            let mf_bin = mf_dir.join("app_bin");
+            let emf = Command::new(&stage2_bin)
+                .args([mf_app.to_str().unwrap(), mf_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 multi-file compile failed");
+            assert!(emf.status.success(), "Stage-2 failed multi-file compile");
+            let lmf = Command::new("cc")
+                .args([
+                    mf_o.to_str().unwrap(),
+                    rt.to_str().unwrap(),
+                    "-lm",
+                    "-lpthread",
+                    "-ldl",
+                    "-o",
+                    mf_bin.to_str().unwrap(),
+                ])
+                .output()
+                .expect("cc link of multifile app.o failed");
+            assert!(lmf.status.success(), "Linking multifile app.o failed");
+            let rmf = Command::new(&mf_bin).output().expect("Running multifile app_bin failed");
+            assert_eq!(rmf.status.code(), Some(54));
+
+            // 11. Cross-target AArch64 ELF64 (.arm64.o) fixpoint: Stage-1 === Stage-2
+            let arm2_o = tmp.join("omnic_stage2.arm64.o");
+            let arm3_o = tmp.join("omnic_stage3.arm64.o");
+            let ea1 = Command::new(&stage1_bin)
+                .args([stage1_src.to_str().unwrap(), arm2_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-1 AArch64 cross-emit failed");
+            assert!(ea1.status.success(), "Stage-1 failed to emit omnic_stage2.arm64.o");
+            let ea2 = Command::new(&stage2_bin)
+                .args([stage1_src.to_str().unwrap(), arm3_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 AArch64 cross-emit failed");
+            assert!(ea2.status.success(), "Stage-2 failed to emit omnic_stage3.arm64.o");
+            let a2 = std::fs::read(&arm2_o).expect("read arm64 stage2.o");
+            let a3 = std::fs::read(&arm3_o).expect("read arm64 stage3.o");
+            assert!(a2.starts_with(b"\x7fELF"), "AArch64 .o must be ELF64");
+            // ELF64 e_machine at offset 18..20 must be EM_AARCH64 (183 = 0x00B7 LE)
+            assert_eq!(&a2[18..20], &[0xB7, 0x00], "e_machine must be EM_AARCH64 (183)");
+            assert_eq!(
+                a2, a3,
+                "Cross-target AArch64 ELF64 fixpoint violated: Stage-2 ({} B) != Stage-3 ({} B)",
+                a2.len(),
+                a3.len()
+            );
         }
     }
 
