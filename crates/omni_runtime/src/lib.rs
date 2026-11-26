@@ -85,6 +85,8 @@ declare i32 @strcmp(i8*, i8*)
 declare i8* @__omni_str_concat(i8*, i8*)
 declare i64 @__omni_str_len(i8*)
 declare i64 @__omni_str_eq(i8*, i8*)
+declare i64 @__omni_f64_bits_from_str(i8*)
+declare void @__omni_print_f64_bits(i64)
 declare i8* @__omni_str_char_at(i8*, i64)
 declare i64 @__omni_str_byte_at(i8*, i64)
 declare i64 @__omni_str_ord(i8*)
@@ -269,6 +271,8 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         fn __omni_str_concat(a: *const i8, b: *const i8) -> *mut i8;
         fn __omni_str_len(s: *const i8) -> i64;
         fn __omni_str_eq(a: *const i8, b: *const i8) -> i64;
+        fn __omni_f64_bits_from_str(s: *const i8) -> i64;
+        fn __omni_print_f64_bits(bits: i64);
         fn __omni_str_char_at(s: *const i8, idx: i64) -> *mut i8;
         fn __omni_str_byte_at(s: *const i8, idx: i64) -> i64;
         fn __omni_str_ord(s: *const i8) -> i64;
@@ -421,6 +425,8 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_str_concat", __omni_str_concat as *const u8),
         ("__omni_str_len", __omni_str_len as *const u8),
         ("__omni_str_eq", __omni_str_eq as *const u8),
+        ("__omni_f64_bits_from_str", __omni_f64_bits_from_str as *const u8),
+        ("__omni_print_f64_bits", __omni_print_f64_bits as *const u8),
         ("__omni_str_char_at", __omni_str_char_at as *const u8),
         ("__omni_str_byte_at", __omni_str_byte_at as *const u8),
         ("__omni_str_ord", __omni_str_ord as *const u8),

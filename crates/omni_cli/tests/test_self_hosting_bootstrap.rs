@@ -484,6 +484,68 @@ fn main() -> int {
                     assert!(pout.contains("RP2350") && pout.contains("ARM Secure"), "Unexpected picotool output: {}", pout);
                 }
             }
+
+            // 14. Phase A: Idiomatic Python (no 'let'!), trailing # comment on ':', f64 + IEEE-754 NaN FCmp, string '+', maps
+            let py_src = tmp.join("polyglot_py.py");
+            let py_o = tmp.join("polyglot_py.o");
+            let py_bin = tmp.join("polyglot_py_bin");
+            std::fs::write(
+                &py_src,
+                "def compute(n):\n    if n < 5: # small\n        return n * 2\n    elif n == 10:\n        return 42\n    else:\n        return n + 1\n\ndef main():\n    msg = \"Hello \" + \"Polyglot!\"\n    print(msg)\n    pi2 = 3.14 * 2.0 + 0.5\n    print(pi2)\n    bonus = 0\n    if -2.0 < -1.0:\n        bonus = bonus + 1\n    nan = 0.0 / 0.0\n    if nan != nan:\n        bonus = bonus + 1\n    if nan == nan:\n        bonus = bonus + 100\n    if nan < 1.0:\n        bonus = bonus + 100\n    m = {\"a\": 10, \"b\": 20}\n    m[\"c\"] = compute(10)\n    return m[\"a\"] + m[\"b\"] + m[\"c\"] + bonus\n",
+            )
+            .unwrap();
+            let epy = Command::new(&stage2_bin)
+                .args([py_src.to_str().unwrap(), py_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 Python compile failed");
+            assert!(epy.status.success());
+            let lpy = Command::new("cc")
+                .args([py_o.to_str().unwrap(), rt.to_str().unwrap(), "-lm", "-lpthread", "-ldl", "-o", py_bin.to_str().unwrap()])
+                .output()
+                .expect("link polyglot_py.o");
+            assert!(lpy.status.success(), "link polyglot_py.o failed:\n{}", String::from_utf8_lossy(&lpy.stderr));
+            let rpy = Command::new(&py_bin).output().expect("run polyglot_py_bin");
+            assert_eq!(rpy.status.code(), Some(74));
+            let py_out = String::from_utf8_lossy(&rpy.stdout);
+            assert!(py_out.contains("Hello Polyglot!") && py_out.contains("6.78"), "Unexpected Phase A stdout: {}", py_out);
+
+            // 15. Phase B: Zero-cc standalone Linux x86_64 ET_EXEC via explicit --target (extensionless!), Mach-O, and fail-closed UF2
+            let st_elf = tmp.join("standalone_noext");
+            let e_elf = Command::new(&stage2_bin)
+                .args(["--target", "x86_64-linux-exec", win_src.to_str().unwrap(), st_elf.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 standalone ELF64 emit failed");
+            assert!(e_elf.status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&st_elf).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&st_elf, perms).unwrap();
+            }
+            let r_elf = Command::new(&st_elf).output().expect("execute zero-cc standalone_noext");
+            assert_eq!(r_elf.status.code(), Some(55));
+            let elf_out = String::from_utf8_lossy(&r_elf.stdout);
+            assert!(elf_out.contains("Win64 PE32+ OK") && elf_out.contains("55"), "Unexpected standalone ELF stdout: {}", elf_out);
+
+            // Fail-closed check: bare-metal UF2 rejects unsupported host extern call (`print`)
+            let bad_uf2 = tmp.join("bad_host_extern.uf2");
+            let e_bad = Command::new(&stage2_bin)
+                .args([win_src.to_str().unwrap(), bad_uf2.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 fail-closed UF2 test failed");
+            assert!(!e_bad.status.success(), "Bare-metal UF2 must fail closed on unsupported host extern call");
+
+            let st_macho = tmp.join("standalone.macho.o");
+            let e_macho = Command::new(&stage2_bin)
+                .args([win_src.to_str().unwrap(), st_macho.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 Mach-O emit failed");
+            assert!(e_macho.status.success());
+            let mb = std::fs::read(&st_macho).expect("read macho.o");
+            assert_eq!(&mb[0..4], &0xFEEDFACFu32.to_le_bytes(), "Mach-O must start with MH_MAGIC_64");
+            assert_eq!(&mb[4..8], &0x0100000Cu32.to_le_bytes(), "Mach-O must be CPU_TYPE_ARM64");
+            assert!(mb.len() > 600, "Mach-O .o must contain real lowered AArch64 code + relocs, got {} B", mb.len());
         }
     }
 

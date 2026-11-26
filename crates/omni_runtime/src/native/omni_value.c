@@ -2114,6 +2114,20 @@ int64_t __omni_str_eq(const char* a, const char* b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+int64_t __omni_f64_bits_from_str(const char* s) {
+    double v = s ? strtod(s, NULL) : 0.0;
+    int64_t bits = 0;
+    memcpy(&bits, &v, sizeof(double));
+    return bits;
+}
+
+void __omni_print_f64_bits(int64_t bits) {
+    double v = 0.0;
+    memcpy(&v, &bits, sizeof(double));
+    __omni_print_float(v);
+}
+
+
 
 
 

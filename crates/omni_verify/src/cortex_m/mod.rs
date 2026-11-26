@@ -2798,4 +2798,56 @@ entry:
         let fin_frame = emu.cyw43_slave.as_ref().unwrap().tx_eth_frames.last().unwrap();
         assert_eq!(fin_frame[47], 0x11); // FIN|ACK
     }
+
+    #[test]
+    fn test_stage1_rp2350_uf2_executes_fib10_in_thumb_emu() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+        let omnic_bin = repo_root.join("target/release/omnic");
+        let stage1_src = repo_root.join("bootstrap/omnic_stage1.omni");
+        if !omnic_bin.exists() || !stage1_src.exists() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("omni_rp2350_emu_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let stage1_bin = tmp.join("omnic_stage1");
+        let prog_src = tmp.join("fib_rp2350.omni");
+        let prog_uf2 = tmp.join("fib_rp2350.uf2");
+        std::fs::write(
+            &prog_src,
+            "fn fib(n: int) -> int {\n    if n <= 1 {\n        return n\n    }\n    return fib(n - 1) + fib(n - 2)\n}\nfn main() -> int {\n    return fib(10)\n}\n",
+        )
+        .unwrap();
+
+        let b0 = std::process::Command::new(&omnic_bin)
+            .args(["build", "--no-cache", stage1_src.to_str().unwrap(), "-o", stage1_bin.to_str().unwrap()])
+            .output()
+            .expect("build omnic_stage1");
+        assert!(b0.status.success());
+
+        let b1 = std::process::Command::new(&stage1_bin)
+            .args([prog_src.to_str().unwrap(), prog_uf2.to_str().unwrap()])
+            .output()
+            .expect("emit rp2350 uf2");
+        assert!(b1.status.success());
+
+        let uf2 = std::fs::read(&prog_uf2).expect("read uf2");
+        assert!(uf2.len() >= 512 && uf2.len() % 512 == 0);
+        let mut flash = Vec::new();
+        for blk in uf2.chunks_exact(512) {
+            assert_eq!(&blk[0..4], &0x0A324655u32.to_le_bytes());
+            assert_eq!(&blk[28..32], &0xE48BFF59u32.to_le_bytes());
+            flash.extend_from_slice(&blk[32..288]);
+        }
+
+        let chip = RpChipProfile::rp2350();
+        let mut emu = ThumbCpuEmu::new(chip, flash, false);
+        let reset_vec = u32::from_le_bytes([emu.flash[4], emu.flash[5], emu.flash[6], emu.flash[7]]);
+        emu.r[15] = reset_vec & !1;
+        emu.r[14] = SENTINEL_EXIT_PC;
+        emu.run(50_000);
+        assert_eq!(emu.r[0], 55, "Stage-1 RP2350 Thumb-2 UF2 fib(10) must return r0 == 55");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
