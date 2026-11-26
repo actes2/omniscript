@@ -84,6 +84,7 @@ declare void @exit(i32)
 declare i32 @strcmp(i8*, i8*)
 declare i8* @__omni_str_concat(i8*, i8*)
 declare i64 @__omni_str_len(i8*)
+declare i64 @__omni_str_eq(i8*, i8*)
 declare i8* @__omni_str_char_at(i8*, i64)
 declare i64 @__omni_str_byte_at(i8*, i64)
 declare i64 @__omni_str_ord(i8*)
@@ -267,6 +268,7 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         fn __omni_input(prompt: *const i8) -> *mut i8;
         fn __omni_str_concat(a: *const i8, b: *const i8) -> *mut i8;
         fn __omni_str_len(s: *const i8) -> i64;
+        fn __omni_str_eq(a: *const i8, b: *const i8) -> i64;
         fn __omni_str_char_at(s: *const i8, idx: i64) -> *mut i8;
         fn __omni_str_byte_at(s: *const i8, idx: i64) -> i64;
         fn __omni_str_ord(s: *const i8) -> i64;
@@ -418,6 +420,7 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_input", __omni_input as *const u8),
         ("__omni_str_concat", __omni_str_concat as *const u8),
         ("__omni_str_len", __omni_str_len as *const u8),
+        ("__omni_str_eq", __omni_str_eq as *const u8),
         ("__omni_str_char_at", __omni_str_char_at as *const u8),
         ("__omni_str_byte_at", __omni_str_byte_at as *const u8),
         ("__omni_str_ord", __omni_str_ord as *const u8),
@@ -549,6 +552,30 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_fs_exists", __omni_fs_exists as *const u8),
         ("pow", pow as *const u8),
     ]
+}
+
+/// Build a temporary `__omni_slice` of C-string pointers for `argv` forwarding into
+/// `OmniBcVm` (`omnic run app.obc arg1 arg2 ...`), invoke `f(slice_ptr as u64)`, and
+/// destroy the slice cleanly afterwards.
+pub fn with_argv_slice<R>(args: &[String], f: impl FnOnce(u64) -> R) -> R {
+    extern "C" {
+        fn __omni_slice_create(cap: i64) -> *mut u8;
+        fn __omni_slice_append(s: *mut u8, v: i64);
+        fn __omni_slice_destroy(s: *mut u8);
+    }
+    let cstrings: Vec<std::ffi::CString> = args
+        .iter()
+        .map(|s| std::ffi::CString::new(s.as_str()).unwrap_or_else(|_| std::ffi::CString::new("").unwrap()))
+        .collect();
+    unsafe {
+        let sl = __omni_slice_create(cstrings.len().max(1) as i64);
+        for cs in &cstrings {
+            __omni_slice_append(sl, cs.as_ptr() as i64);
+        }
+        let res = f(sl as u64);
+        __omni_slice_destroy(sl);
+        res
+    }
 }
 
 #[cfg(test)]

@@ -166,7 +166,30 @@ fn main() -> anyhow::Result<()> {
                 let bc = omni_verify::omni_bc::OmniBcModule::from_bytes(&raw)?;
                 let syms = omni_runtime::jit_runtime_symbols();
                 let vm = omni_verify::omni_bc::OmniBcVm::new(&bc, &syms);
-                let code = vm.call_by_name("main", &[0, 0])? as i32;
+                let main_params = bc
+                    .functions
+                    .iter()
+                    .find(|f| f.name == "main")
+                    .map(|f| f.num_params)
+                    .unwrap_or(0);
+                let mut full_args = Vec::with_capacity(prog_args.len() + 1);
+                full_args.push(source.to_string_lossy().into_owned());
+                full_args.extend(prog_args.iter().cloned());
+                let code = if main_params == 1 {
+                    omni_runtime::with_argv_slice(&full_args, |argv_sl| {
+                        vm.call_by_name("main", &[argv_sl])
+                    })? as i32
+                } else if main_params == 2 {
+                    let cstrings: Vec<std::ffi::CString> = full_args
+                        .iter()
+                        .map(|s| std::ffi::CString::new(s.as_str()).unwrap_or_else(|_| std::ffi::CString::new("").unwrap()))
+                        .collect();
+                    let mut ptrs: Vec<*const i8> = cstrings.iter().map(|c| c.as_ptr()).collect();
+                    ptrs.push(std::ptr::null());
+                    vm.call_by_name("main", &[cstrings.len() as u64, ptrs.as_ptr() as u64])? as i32
+                } else {
+                    vm.call_by_name("main", &[])? as i32
+                };
                 if code != 0 {
                     std::process::exit(code);
                 }

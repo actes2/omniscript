@@ -2108,5 +2108,12 @@ int64_t __omni_fs_exists(const char* path) {
     return 1;
 }
 
+int64_t __omni_str_eq(const char* a, const char* b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    return strcmp(a, b) == 0 ? 1 : 0;
+}
+
+
 
 

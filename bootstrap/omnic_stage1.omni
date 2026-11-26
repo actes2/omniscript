@@ -1,0 +1,1187 @@
+// ============================================================================
+// OmniScript Stage-1 Self-Hosted Compiler (`bootstrap/omnic_stage1.omni`)
+// 100% Deterministic OmniScript -> compiles `.omni` source directly to `OBC1`
+// Capable of compiling ITSELF (Stage-1 -> Stage-2 -> Stage-3 fixpoint)!
+// ============================================================================
+
+extern fn __omni_bytes_create(cap: int) -> int;
+extern fn __omni_bytes_push_u8(buf: int, v: int) -> void;
+extern fn __omni_bytes_push_u16(buf: int, v: int) -> void;
+extern fn __omni_bytes_push_u32(buf: int, v: int) -> void;
+extern fn __omni_bytes_push_u64(buf: int, v: int) -> void;
+extern fn __omni_bytes_push_str(buf: int, s: str) -> void;
+extern fn __omni_bytes_patch_u32(buf: int, off: int, v: int) -> void;
+extern fn __omni_bytes_get(buf: int, off: int) -> int;
+extern fn __omni_bytes_len(buf: int) -> int;
+extern fn __omni_bytes_destroy(buf: int) -> void;
+extern fn __omni_fs_read_text(path: str) -> str;
+extern fn __omni_fs_write_bytes(path: str, buf: int) -> int;
+extern fn __omni_str_byte_at(s: str, idx: int) -> int;
+extern fn __omni_str_slice_step(s: str, st: int, en: int, step: int, has_s: int, has_e: int) -> str;
+extern fn __omni_str_len(s: str) -> int;
+extern fn __omni_str_eq(a: str, b: str) -> int;
+extern fn __omni_c_str_to_i64(s: str) -> int;
+extern fn __omni_slice_create(cap: int) -> int;
+extern fn __omni_slice_append(sl: int, val: int) -> void;
+extern fn __omni_slice_get(sl: int, idx: int) -> int;
+extern fn __omni_slice_set(sl: int, idx: int, val: int) -> void;
+extern fn __omni_slice_len(sl: int) -> int;
+
+fn is_alpha(c: int) -> int {
+    if c >= 65 && c <= 90 {
+        return 1
+    }
+    if c >= 97 && c <= 122 {
+        return 1
+    }
+    if c == 95 {
+        return 1
+    }
+    return 0
+}
+
+fn is_digit(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return 1
+    }
+    return 0
+}
+
+fn is_alnum(c: int) -> int {
+    if is_alpha(c) == 1 {
+        return 1
+    }
+    if is_digit(c) == 1 {
+        return 1
+    }
+    return 0
+}
+
+fn str_eq_raw(a: int, b: str) -> int {
+    return __omni_str_eq(a, b)
+}
+
+class Compiler {
+    src: str
+    src_len: int
+    tok_kinds: int
+    tok_texts: int
+    tok_count: int
+    pos: int
+
+    globals: int
+    extern_names: int
+    class_names: int
+    field_names: int
+    fn_names: int
+    fn_params_count: int
+    fn_regs_count: int
+    fn_ops_bufs: int
+    fn_ops_counts: int
+
+    cur_ops: int
+    cur_op_count: int
+    cur_next_reg: int
+    var_names: int
+    var_regs: int
+    var_is_str: int
+    last_expr_is_str: int
+
+    fn init_compiler(self, source: str) -> int {
+        self.src = source
+        self.src_len = __omni_str_len(source)
+        self.tok_kinds = __omni_slice_create(256)
+        self.tok_texts = __omni_slice_create(256)
+        self.tok_count = 0
+        self.pos = 0
+
+        self.globals = __omni_slice_create(32)
+        self.extern_names = __omni_slice_create(32)
+        __omni_slice_append(self.extern_names, "__omni_print_int")
+        __omni_slice_append(self.extern_names, "__omni_print_str")
+
+        self.class_names = __omni_slice_create(8)
+        self.field_names = __omni_slice_create(32)
+        self.fn_names = __omni_slice_create(64)
+        self.fn_params_count = __omni_slice_create(64)
+        self.fn_regs_count = __omni_slice_create(64)
+        self.fn_ops_bufs = __omni_slice_create(64)
+        self.fn_ops_counts = __omni_slice_create(64)
+
+        self.cur_ops = 0
+        self.cur_op_count = 0
+        self.cur_next_reg = 0
+        self.var_names = 0
+        self.var_regs = 0
+        self.var_is_str = 0
+        self.last_expr_is_str = 0
+        return 0
+    }
+
+    fn push_tok(self, kind: int, text: str) -> int {
+        __omni_slice_append(self.tok_kinds, kind)
+        __omni_slice_append(self.tok_texts, text)
+        self.tok_count = self.tok_count + 1
+        return 0
+    }
+
+    fn lex(self) -> int {
+        let i = 0
+        let n = self.src_len
+        while i < n {
+            let c = __omni_str_byte_at(self.src, i)
+            let done = 0
+            if done == 0 && (c == 32 || c == 9 || c == 10 || c == 13) {
+                i = i + 1
+                done = 1
+            }
+            if done == 0 && c == 47 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 47 {
+                while i < n && __omni_str_byte_at(self.src, i) != 10 {
+                    i = i + 1
+                }
+                done = 1
+            }
+            if done == 0 && c == 35 {
+                while i < n && __omni_str_byte_at(self.src, i) != 10 {
+                    i = i + 1
+                }
+                done = 1
+            }
+            if done == 0 && is_alpha(c) == 1 {
+                let start = i
+                while i < n && is_alnum(__omni_str_byte_at(self.src, i)) == 1 {
+                    i = i + 1
+                }
+                let word = __omni_str_slice_step(self.src, start, i, 1, 1, 1)
+                self.push_tok(1, word)
+                done = 1
+            }
+            if done == 0 && is_digit(c) == 1 {
+                let start = i
+                while i < n && is_digit(__omni_str_byte_at(self.src, i)) == 1 {
+                    i = i + 1
+                }
+                let num_s = __omni_str_slice_step(self.src, start, i, 1, 1, 1)
+                self.push_tok(2, num_s)
+                done = 1
+            }
+            if done == 0 && c == 34 {
+                i = i + 1
+                let start = i
+                while i < n && __omni_str_byte_at(self.src, i) != 34 {
+                    i = i + 1
+                }
+                let s_val = __omni_str_slice_step(self.src, start, i, 1, 1, 1)
+                if i < n {
+                    i = i + 1
+                }
+                self.push_tok(3, s_val)
+                done = 1
+            }
+            if done == 0 && c == 45 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 62 {
+                self.push_tok(40, "->")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 61 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 61 {
+                self.push_tok(31, "==")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 33 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 61 {
+                self.push_tok(32, "!=")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 60 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 61 {
+                self.push_tok(34, "<=")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 62 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 61 {
+                self.push_tok(36, ">=")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 38 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 38 {
+                self.push_tok(37, "&&")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 && c == 124 && i + 1 < n && __omni_str_byte_at(self.src, i + 1) == 124 {
+                self.push_tok(38, "||")
+                i = i + 2
+                done = 1
+            }
+            if done == 0 {
+                let k = 0
+                if c == 40 {
+                    k = 10
+                }
+                if c == 41 {
+                    k = 11
+                }
+                if c == 123 {
+                    k = 12
+                }
+                if c == 125 {
+                    k = 13
+                }
+                if c == 44 {
+                    k = 14
+                }
+                if c == 58 {
+                    k = 15
+                }
+                if c == 59 {
+                    k = 16
+                }
+                if c == 46 {
+                    k = 17
+                }
+                if c == 43 {
+                    k = 20
+                }
+                if c == 45 {
+                    k = 21
+                }
+                if c == 42 {
+                    k = 22
+                }
+                if c == 47 {
+                    k = 23
+                }
+                if c == 37 {
+                    k = 24
+                }
+                if c == 61 {
+                    k = 30
+                }
+                if c == 60 {
+                    k = 33
+                }
+                if c == 62 {
+                    k = 35
+                }
+                if k > 0 {
+                    self.push_tok(k, "")
+                }
+                i = i + 1
+            }
+        }
+        __omni_slice_append(self.tok_kinds, 0)
+        __omni_slice_append(self.tok_texts, "")
+        return self.tok_count
+    }
+
+    fn peek_kind(self) -> int {
+        if self.pos >= self.tok_count {
+            return 0
+        }
+        return __omni_slice_get(self.tok_kinds, self.pos)
+    }
+
+    fn peek_text(self) -> int {
+        if self.pos >= self.tok_count {
+            return 0
+        }
+        return __omni_slice_get(self.tok_texts, self.pos)
+    }
+
+    fn peek_at_kind(self, offset: int) -> int {
+        let idx = self.pos + offset
+        if idx >= self.tok_count {
+            return 0
+        }
+        return __omni_slice_get(self.tok_kinds, idx)
+    }
+
+    fn peek_at_text(self, offset: int) -> int {
+        let idx = self.pos + offset
+        if idx >= self.tok_count {
+            return 0
+        }
+        return __omni_slice_get(self.tok_texts, idx)
+    }
+
+    fn advance(self) -> int {
+        let k = self.peek_kind()
+        if self.pos < self.tok_count {
+            self.pos = self.pos + 1
+        }
+        return k
+    }
+
+    fn alloc_reg(self) -> int {
+        let r = self.cur_next_reg
+        self.cur_next_reg = self.cur_next_reg + 1
+        return r
+    }
+
+    fn lookup_var(self, name: int) -> int {
+        let i = __omni_slice_len(self.var_names) - 1
+        while i >= 0 {
+            let vn = __omni_slice_get(self.var_names, i)
+            if __omni_str_eq(vn, name) == 1 {
+                return __omni_slice_get(self.var_regs, i)
+            }
+            i = i - 1
+        }
+        return -1
+    }
+
+    fn lookup_var_is_str(self, name: int) -> int {
+        let i = __omni_slice_len(self.var_names) - 1
+        while i >= 0 {
+            let vn = __omni_slice_get(self.var_names, i)
+            if __omni_str_eq(vn, name) == 1 {
+                return __omni_slice_get(self.var_is_str, i)
+            }
+            i = i - 1
+        }
+        return 0
+    }
+
+    fn lookup_fn(self, name: int) -> int {
+        let i = 0
+        let n = __omni_slice_len(self.fn_names)
+        while i < n {
+            let fn_s = __omni_slice_get(self.fn_names, i)
+            if __omni_str_eq(fn_s, name) == 1 {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn lookup_extern(self, name: int) -> int {
+        let i = 0
+        let n = __omni_slice_len(self.extern_names)
+        while i < n {
+            let ex_s = __omni_slice_get(self.extern_names, i)
+            if __omni_str_eq(ex_s, name) == 1 {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn intern_extern(self, name: str) -> int {
+        let idx = self.lookup_extern(name)
+        if idx >= 0 {
+            return idx
+        }
+        let n = __omni_slice_len(self.extern_names)
+        __omni_slice_append(self.extern_names, name)
+        return n
+    }
+
+    fn lookup_class(self, name: int) -> int {
+        let i = 0
+        let n = __omni_slice_len(self.class_names)
+        while i < n {
+            let cn = __omni_slice_get(self.class_names, i)
+            if __omni_str_eq(cn, name) == 1 {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn lookup_field(self, name: int) -> int {
+        let i = 0
+        let n = __omni_slice_len(self.field_names)
+        while i < n {
+            let fnm = __omni_slice_get(self.field_names, i)
+            if __omni_str_eq(fnm, name) == 1 {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn intern_global_str(self, s: int) -> int {
+        let i = 0
+        let n = __omni_slice_len(self.globals)
+        while i < n {
+            let gs = __omni_slice_get(self.globals, i)
+            if __omni_str_eq(gs, s) == 1 {
+                return i
+            }
+            i = i + 1
+        }
+        __omni_slice_append(self.globals, s)
+        return n
+    }
+
+    fn emit_load_imm(self, dst: int, val: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 1)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u64(self.cur_ops, val)
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_load_global(self, dst: int, gidx: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 2)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u32(self.cur_ops, gidx)
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_mov(self, dst: int, src: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 4)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u16(self.cur_ops, src)
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_binop(self, tag: int, dst: int, a: int, b: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, tag)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u16(self.cur_ops, a)
+        __omni_bytes_push_u16(self.cur_ops, b)
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_icmp(self, cc: int, dst: int, a: int, b: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 27)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u8(self.cur_ops, cc)
+        __omni_bytes_push_u16(self.cur_ops, a)
+        __omni_bytes_push_u16(self.cur_ops, b)
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_jmp(self, target: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 61)
+        let patch_off = __omni_bytes_len(self.cur_ops)
+        __omni_bytes_push_u32(self.cur_ops, target)
+        self.cur_op_count = self.cur_op_count + 1
+        return patch_off
+    }
+
+    fn emit_brif(self, cond: int, true_tgt: int, false_tgt: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 62)
+        __omni_bytes_push_u16(self.cur_ops, cond)
+        let patch_off = __omni_bytes_len(self.cur_ops)
+        __omni_bytes_push_u32(self.cur_ops, true_tgt)
+        __omni_bytes_push_u32(self.cur_ops, false_tgt)
+        self.cur_op_count = self.cur_op_count + 1
+        return patch_off
+    }
+
+    fn emit_ret(self, reg: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 64)
+        __omni_bytes_push_u8(self.cur_ops, 1)
+        __omni_bytes_push_u16(self.cur_ops, reg)
+        self.cur_op_count = self.cur_op_count + 1
+        return 0
+    }
+
+    fn emit_call_internal(self, dst: int, fn_idx: int, args: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 66)
+        __omni_bytes_push_u8(self.cur_ops, 1)
+        __omni_bytes_push_u16(self.cur_ops, dst)
+        __omni_bytes_push_u32(self.cur_ops, fn_idx)
+        let na = __omni_slice_len(args)
+        __omni_bytes_push_u16(self.cur_ops, na)
+        let i = 0
+        while i < na {
+            __omni_bytes_push_u16(self.cur_ops, __omni_slice_get(args, i))
+            i = i + 1
+        }
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn emit_call_extern(self, has_dst: int, dst: int, ext_idx: int, args: int) -> int {
+        __omni_bytes_push_u8(self.cur_ops, 67)
+        __omni_bytes_push_u8(self.cur_ops, has_dst)
+        if has_dst == 1 {
+            __omni_bytes_push_u16(self.cur_ops, dst)
+        }
+        __omni_bytes_push_u32(self.cur_ops, ext_idx)
+        __omni_bytes_push_u8(self.cur_ops, 0)
+        let na = __omni_slice_len(args)
+        __omni_bytes_push_u16(self.cur_ops, na)
+        let i = 0
+        while i < na {
+            __omni_bytes_push_u16(self.cur_ops, __omni_slice_get(args, i))
+            __omni_bytes_push_u8(self.cur_ops, 0)
+            i = i + 1
+        }
+        self.cur_op_count = self.cur_op_count + 1
+        return dst
+    }
+
+    fn parse_postfix(self, base_reg: int) -> int {
+        let cur = base_reg
+        while self.peek_kind() == 17 {
+            self.advance()
+            let mem = self.peek_text()
+            self.advance()
+            if self.peek_kind() == 10 {
+                self.advance()
+                let args = __omni_slice_create(8)
+                __omni_slice_append(args, cur)
+                while self.peek_kind() != 11 && self.peek_kind() != 0 {
+                    let ar = self.parse_expr()
+                    __omni_slice_append(args, ar)
+                    if self.peek_kind() == 14 {
+                        self.advance()
+                    }
+                }
+                if self.peek_kind() == 11 {
+                    self.advance()
+                }
+                let fidx = self.lookup_fn(mem)
+                let dst = self.alloc_reg()
+                self.last_expr_is_str = 0
+                cur = self.emit_call_internal(dst, fidx, args)
+            } else {
+                let fld_idx = self.lookup_field(mem)
+                let idx_r = self.alloc_reg()
+                self.emit_load_imm(idx_r, fld_idx)
+                let gargs = __omni_slice_create(2)
+                __omni_slice_append(gargs, cur)
+                __omni_slice_append(gargs, idx_r)
+                let get_ext = self.intern_extern("__omni_slice_get")
+                let dst = self.alloc_reg()
+                self.last_expr_is_str = 0
+                cur = self.emit_call_extern(1, dst, get_ext, gargs)
+            }
+        }
+        return cur
+    }
+
+    fn parse_primary(self) -> int {
+        let k = self.peek_kind()
+        if k == 2 {
+            let v = __omni_c_str_to_i64(self.peek_text())
+            self.advance()
+            let r = self.alloc_reg()
+            self.last_expr_is_str = 0
+            return self.emit_load_imm(r, v)
+        }
+        if k == 3 {
+            let gidx = self.intern_global_str(self.peek_text())
+            self.advance()
+            let r = self.alloc_reg()
+            self.last_expr_is_str = 1
+            return self.emit_load_global(r, gidx)
+        }
+        if k == 21 {
+            self.advance()
+            let rhs = self.parse_primary()
+            let z = self.alloc_reg()
+            self.emit_load_imm(z, 0)
+            let d = self.alloc_reg()
+            self.last_expr_is_str = 0
+            return self.emit_binop(13, d, z, rhs)
+        }
+        if k == 10 {
+            self.advance()
+            let r = self.parse_expr()
+            if self.peek_kind() == 11 {
+                self.advance()
+            }
+            return self.parse_postfix(r)
+        }
+        if k == 1 {
+            let name = self.peek_text()
+            self.advance()
+            if self.peek_kind() == 10 {
+                self.advance()
+                if self.lookup_class(name) >= 0 {
+                    if self.peek_kind() == 11 {
+                        self.advance()
+                    }
+                    let nf = __omni_slice_len(self.field_names)
+                    let cap_r = self.alloc_reg()
+                    self.emit_load_imm(cap_r, nf)
+                    let cargs = __omni_slice_create(1)
+                    __omni_slice_append(cargs, cap_r)
+                    let create_ext = self.intern_extern("__omni_slice_create")
+                    let obj_r = self.alloc_reg()
+                    self.emit_call_extern(1, obj_r, create_ext, cargs)
+                    let app_ext = self.intern_extern("__omni_slice_append")
+                    let zero_r = self.alloc_reg()
+                    self.emit_load_imm(zero_r, 0)
+                    let fi = 0
+                    while fi < nf {
+                        let aargs = __omni_slice_create(2)
+                        __omni_slice_append(aargs, obj_r)
+                        __omni_slice_append(aargs, zero_r)
+                        self.emit_call_extern(0, 0, app_ext, aargs)
+                        fi = fi + 1
+                    }
+                    self.last_expr_is_str = 0
+                    return self.parse_postfix(obj_r)
+                }
+                let args = __omni_slice_create(8)
+                let first_arg_is_str = 0
+                let argc = 0
+                while self.peek_kind() != 11 && self.peek_kind() != 0 {
+                    let ar = self.parse_expr()
+                    if argc == 0 {
+                        first_arg_is_str = self.last_expr_is_str
+                    }
+                    __omni_slice_append(args, ar)
+                    argc = argc + 1
+                    if self.peek_kind() == 14 {
+                        self.advance()
+                    }
+                }
+                if self.peek_kind() == 11 {
+                    self.advance()
+                }
+                if str_eq_raw(name, "print") == 1 {
+                    let ext_i = 0
+                    if first_arg_is_str == 1 {
+                        ext_i = 1
+                    }
+                    self.emit_call_extern(0, 0, ext_i, args)
+                    let z = self.alloc_reg()
+                    self.last_expr_is_str = 0
+                    return self.emit_load_imm(z, 0)
+                }
+                if str_eq_raw(name, "len") == 1 {
+                    let slen_ext = self.intern_extern("__omni_str_len")
+                    let dst = self.alloc_reg()
+                    self.last_expr_is_str = 0
+                    return self.emit_call_extern(1, dst, slen_ext, args)
+                }
+                let fidx = self.lookup_fn(name)
+                if fidx >= 0 {
+                    let dst = self.alloc_reg()
+                    self.last_expr_is_str = 0
+                    let call_r = self.emit_call_internal(dst, fidx, args)
+                    return self.parse_postfix(call_r)
+                }
+                let eidx = self.lookup_extern(name)
+                if eidx >= 0 {
+                    let dst = self.alloc_reg()
+                    self.last_expr_is_str = 0
+                    let ext_r = self.emit_call_extern(1, dst, eidx, args)
+                    return self.parse_postfix(ext_r)
+                }
+            }
+            let vr = self.lookup_var(name)
+            if vr >= 0 {
+                self.last_expr_is_str = self.lookup_var_is_str(name)
+                return self.parse_postfix(vr)
+            }
+        }
+        let fallback = self.alloc_reg()
+        self.last_expr_is_str = 0
+        return self.emit_load_imm(fallback, 0)
+    }
+
+    fn parse_mul(self) -> int {
+        let lhs = self.parse_primary()
+        while self.peek_kind() == 22 || self.peek_kind() == 23 || self.peek_kind() == 24 {
+            let op = self.advance()
+            let rhs = self.parse_primary()
+            let dst = self.alloc_reg()
+            let tag = 14
+            if op == 23 {
+                tag = 15
+            }
+            if op == 24 {
+                tag = 17
+            }
+            lhs = self.emit_binop(tag, dst, lhs, rhs)
+            self.last_expr_is_str = 0
+        }
+        return lhs
+    }
+
+    fn parse_add(self) -> int {
+        let lhs = self.parse_mul()
+        while self.peek_kind() == 20 || self.peek_kind() == 21 {
+            let op = self.advance()
+            let rhs = self.parse_mul()
+            let dst = self.alloc_reg()
+            let tag = 12
+            if op == 21 {
+                tag = 13
+            }
+            lhs = self.emit_binop(tag, dst, lhs, rhs)
+            self.last_expr_is_str = 0
+        }
+        return lhs
+    }
+
+    fn parse_cmp(self) -> int {
+        let lhs = self.parse_add()
+        let k = self.peek_kind()
+        if k >= 31 && k <= 36 {
+            self.advance()
+            let rhs = self.parse_add()
+            let dst = self.alloc_reg()
+            let cc = 0
+            if k == 31 {
+                cc = 0
+            }
+            if k == 32 {
+                cc = 1
+            }
+            if k == 33 {
+                cc = 2
+            }
+            if k == 34 {
+                cc = 3
+            }
+            if k == 35 {
+                cc = 4
+            }
+            if k == 36 {
+                cc = 5
+            }
+            lhs = self.emit_icmp(cc, dst, lhs, rhs)
+            self.last_expr_is_str = 0
+        }
+        return lhs
+    }
+
+    fn parse_and(self) -> int {
+        let lhs = self.parse_cmp()
+        while self.peek_kind() == 37 {
+            self.advance()
+            let res = self.alloc_reg()
+            self.emit_load_imm(res, 0)
+            let br_patch = self.emit_brif(lhs, 0, 0)
+            let rhs_pc = self.cur_op_count
+            __omni_bytes_patch_u32(self.cur_ops, br_patch, rhs_pc)
+            let rhs = self.parse_cmp()
+            let zero = self.alloc_reg()
+            self.emit_load_imm(zero, 0)
+            self.emit_icmp(1, res, rhs, zero)
+            let done_pc = self.cur_op_count
+            __omni_bytes_patch_u32(self.cur_ops, br_patch + 4, done_pc)
+            lhs = res
+            self.last_expr_is_str = 0
+        }
+        return lhs
+    }
+
+    fn parse_or(self) -> int {
+        let lhs = self.parse_and()
+        while self.peek_kind() == 38 {
+            self.advance()
+            let res = self.alloc_reg()
+            self.emit_load_imm(res, 1)
+            let br_patch = self.emit_brif(lhs, 0, 0)
+            let rhs_pc = self.cur_op_count
+            __omni_bytes_patch_u32(self.cur_ops, br_patch + 4, rhs_pc)
+            let rhs = self.parse_and()
+            let zero = self.alloc_reg()
+            self.emit_load_imm(zero, 0)
+            self.emit_icmp(1, res, rhs, zero)
+            let done_pc = self.cur_op_count
+            __omni_bytes_patch_u32(self.cur_ops, br_patch, done_pc)
+            lhs = res
+            self.last_expr_is_str = 0
+        }
+        return lhs
+    }
+
+    fn parse_expr(self) -> int {
+        return self.parse_or()
+    }
+
+    fn parse_block(self) -> int {
+        if self.peek_kind() == 12 {
+            self.advance()
+        }
+        while self.peek_kind() != 13 && self.peek_kind() != 0 {
+            self.parse_stmt()
+        }
+        if self.peek_kind() == 13 {
+            self.advance()
+        }
+        return 0
+    }
+
+    fn parse_stmt(self) -> int {
+        if self.peek_kind() == 16 {
+            self.advance()
+            return 0
+        }
+        if self.peek_kind() == 1 {
+            let kw = self.peek_text()
+            if str_eq_raw(kw, "let") == 1 || str_eq_raw(kw, "var") == 1 {
+                self.advance()
+                let vname = self.peek_text()
+                self.advance()
+                if self.peek_kind() == 15 {
+                    self.advance()
+                    self.advance()
+                }
+                if self.peek_kind() == 30 {
+                    self.advance()
+                }
+                let val_r = self.parse_expr()
+                let slot = self.alloc_reg()
+                self.emit_mov(slot, val_r)
+                __omni_slice_append(self.var_names, vname)
+                __omni_slice_append(self.var_regs, slot)
+                __omni_slice_append(self.var_is_str, self.last_expr_is_str)
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                return 0
+            }
+            if str_eq_raw(kw, "return") == 1 {
+                self.advance()
+                let r = self.parse_expr()
+                self.emit_ret(r)
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                return 0
+            }
+            if str_eq_raw(kw, "if") == 1 {
+                self.advance()
+                let cond = self.parse_expr()
+                let br_patch = self.emit_brif(cond, 0, 0)
+                let then_pc = self.cur_op_count
+                __omni_bytes_patch_u32(self.cur_ops, br_patch, then_pc)
+                self.parse_block()
+                if self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "else") == 1 {
+                    self.advance()
+                    let end_jmp_patch = self.emit_jmp(0)
+                    let else_pc = self.cur_op_count
+                    __omni_bytes_patch_u32(self.cur_ops, br_patch + 4, else_pc)
+                    self.parse_block()
+                    let after_pc = self.cur_op_count
+                    __omni_bytes_patch_u32(self.cur_ops, end_jmp_patch, after_pc)
+                } else {
+                    let after_pc = self.cur_op_count
+                    __omni_bytes_patch_u32(self.cur_ops, br_patch + 4, after_pc)
+                }
+                return 0
+            }
+            if str_eq_raw(kw, "while") == 1 {
+                self.advance()
+                let cond_pc = self.cur_op_count
+                let cond = self.parse_expr()
+                let br_patch = self.emit_brif(cond, 0, 0)
+                let body_pc = self.cur_op_count
+                __omni_bytes_patch_u32(self.cur_ops, br_patch, body_pc)
+                self.parse_block()
+                self.emit_jmp(cond_pc)
+                let exit_pc = self.cur_op_count
+                __omni_bytes_patch_u32(self.cur_ops, br_patch + 4, exit_pc)
+                return 0
+            }
+            if self.peek_at_kind(1) == 17 && self.peek_at_kind(2) == 1 && self.peek_at_kind(3) == 30 {
+                let obj_name = self.peek_text()
+                let fld_name = self.peek_at_text(2)
+                self.advance()
+                self.advance()
+                self.advance()
+                self.advance()
+                let val_r = self.parse_expr()
+                let obj_r = self.lookup_var(obj_name)
+                let fld_idx = self.lookup_field(fld_name)
+                let idx_r = self.alloc_reg()
+                self.emit_load_imm(idx_r, fld_idx)
+                let sargs = __omni_slice_create(3)
+                __omni_slice_append(sargs, obj_r)
+                __omni_slice_append(sargs, idx_r)
+                __omni_slice_append(sargs, val_r)
+                let set_ext = self.intern_extern("__omni_slice_set")
+                self.emit_call_extern(0, 0, set_ext, sargs)
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                return 0
+            }
+            if self.peek_at_kind(1) == 30 {
+                let vname = self.peek_text()
+                self.advance()
+                self.advance()
+                let val_r = self.parse_expr()
+                let vr = self.lookup_var(vname)
+                if vr >= 0 {
+                    self.emit_mov(vr, val_r)
+                } else {
+                    let slot = self.alloc_reg()
+                    self.emit_mov(slot, val_r)
+                    __omni_slice_append(self.var_names, vname)
+                    __omni_slice_append(self.var_regs, slot)
+                    __omni_slice_append(self.var_is_str, self.last_expr_is_str)
+                }
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                return 0
+            }
+        }
+        self.parse_expr()
+        if self.peek_kind() == 16 {
+            self.advance()
+        }
+        return 0
+    }
+
+    fn parse_fn_def(self) -> int {
+        self.advance()
+        let fname = self.peek_text()
+        self.advance()
+        let fidx = self.lookup_fn(fname)
+
+        self.cur_ops = __omni_bytes_create(256)
+        self.cur_op_count = 0
+        self.cur_next_reg = 0
+        self.var_names = __omni_slice_create(32)
+        self.var_regs = __omni_slice_create(32)
+        self.var_is_str = __omni_slice_create(32)
+
+        let pcount = 0
+        if self.peek_kind() == 10 {
+            self.advance()
+        }
+        while self.peek_kind() != 11 && self.peek_kind() != 0 {
+            let pname = self.peek_text()
+            self.advance()
+            let is_s = 0
+            if self.peek_kind() == 15 {
+                self.advance()
+                if str_eq_raw(self.peek_text(), "str") == 1 {
+                    is_s = 1
+                }
+                self.advance()
+            }
+            let preg = self.alloc_reg()
+            __omni_slice_append(self.var_names, pname)
+            __omni_slice_append(self.var_regs, preg)
+            __omni_slice_append(self.var_is_str, is_s)
+            pcount = pcount + 1
+            if self.peek_kind() == 14 {
+                self.advance()
+            }
+        }
+        if self.peek_kind() == 11 {
+            self.advance()
+        }
+        if self.peek_kind() == 40 {
+            self.advance()
+            self.advance()
+        }
+
+        self.parse_block()
+        let z = self.alloc_reg()
+        self.emit_load_imm(z, 0)
+        self.emit_ret(z)
+
+        __omni_slice_set(self.fn_params_count, fidx, pcount)
+        __omni_slice_set(self.fn_regs_count, fidx, self.cur_next_reg)
+        __omni_slice_set(self.fn_ops_bufs, fidx, self.cur_ops)
+        __omni_slice_set(self.fn_ops_counts, fidx, self.cur_op_count)
+        return 0
+    }
+
+    fn compile_module(self) -> int {
+        self.lex()
+
+        let scan = 0
+        let in_class = 0
+        let brace_depth = 0
+        while scan < self.tok_count {
+            let tk = __omni_slice_get(self.tok_kinds, scan)
+            let adv = 0
+            if tk == 12 {
+                brace_depth = brace_depth + 1
+                scan = scan + 1
+                adv = 1
+            }
+            if adv == 0 && tk == 13 {
+                brace_depth = brace_depth - 1
+                if brace_depth == 0 {
+                    in_class = 0
+                }
+                scan = scan + 1
+                adv = 1
+            }
+            if adv == 0 && tk == 1 {
+                let w = __omni_slice_get(self.tok_texts, scan)
+                if adv == 0 && str_eq_raw(w, "extern") == 1 && scan + 2 < self.tok_count {
+                    let w1 = __omni_slice_get(self.tok_texts, scan + 1)
+                    if str_eq_raw(w1, "fn") == 1 {
+                        let ename = __omni_slice_get(self.tok_texts, scan + 2)
+                        if self.lookup_extern(ename) < 0 {
+                            __omni_slice_append(self.extern_names, ename)
+                        }
+                        scan = scan + 3
+                        adv = 1
+                    }
+                }
+                if adv == 0 && str_eq_raw(w, "class") == 1 && scan + 1 < self.tok_count {
+                    let cname = __omni_slice_get(self.tok_texts, scan + 1)
+                    __omni_slice_append(self.class_names, cname)
+                    in_class = 1
+                    scan = scan + 2
+                    adv = 1
+                }
+                if adv == 0 && str_eq_raw(w, "fn") == 1 && scan + 1 < self.tok_count {
+                    if __omni_slice_get(self.tok_kinds, scan + 1) == 1 {
+                        let fname = __omni_slice_get(self.tok_texts, scan + 1)
+                        if self.lookup_fn(fname) < 0 {
+                            __omni_slice_append(self.fn_names, fname)
+                            __omni_slice_append(self.fn_params_count, 0)
+                            __omni_slice_append(self.fn_regs_count, 0)
+                            __omni_slice_append(self.fn_ops_bufs, 0)
+                            __omni_slice_append(self.fn_ops_counts, 0)
+                        }
+                        scan = scan + 2
+                        adv = 1
+                    }
+                }
+                if adv == 0 && in_class == 1 && brace_depth == 1 && scan + 2 < self.tok_count {
+                    if __omni_slice_get(self.tok_kinds, scan + 1) == 15 {
+                        if self.lookup_field(w) < 0 {
+                            __omni_slice_append(self.field_names, w)
+                        }
+                        scan = scan + 3
+                        adv = 1
+                    }
+                }
+            }
+            if adv == 0 {
+                scan = scan + 1
+            }
+        }
+
+        self.pos = 0
+        while self.peek_kind() != 0 {
+            let handled = 0
+            if handled == 0 && self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "extern") == 1 {
+                while self.peek_kind() != 16 && self.peek_kind() != 0 {
+                    self.advance()
+                }
+                if self.peek_kind() == 16 {
+                    self.advance()
+                }
+                handled = 1
+            }
+            if handled == 0 && self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "class") == 1 {
+                self.advance()
+                self.advance()
+                if self.peek_kind() == 12 {
+                    self.advance()
+                }
+                while self.peek_kind() != 13 && self.peek_kind() != 0 {
+                    if self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "fn") == 1 {
+                        self.parse_fn_def()
+                    } else {
+                        self.advance()
+                    }
+                }
+                if self.peek_kind() == 13 {
+                    self.advance()
+                }
+                handled = 1
+            }
+            if handled == 0 && self.peek_kind() == 1 && str_eq_raw(self.peek_text(), "fn") == 1 {
+                self.parse_fn_def()
+                handled = 1
+            }
+            if handled == 0 {
+                self.advance()
+            }
+        }
+        return 0
+    }
+
+    fn emit_obc_bytes(self) -> int {
+        let out = __omni_bytes_create(4096)
+        __omni_bytes_push_str(out, "OBC1")
+
+        let ng = __omni_slice_len(self.globals)
+        __omni_bytes_push_u32(out, ng)
+        let gi = 0
+        while gi < ng {
+            __omni_bytes_push_u32(out, 1)
+            __omni_bytes_push_str(out, "g")
+            let gval = __omni_slice_get(self.globals, gi)
+            let glen = __omni_str_len(gval)
+            __omni_bytes_push_u32(out, glen + 1)
+            __omni_bytes_push_str(out, gval)
+            __omni_bytes_push_u8(out, 0)
+            gi = gi + 1
+        }
+
+        let ne = __omni_slice_len(self.extern_names)
+        __omni_bytes_push_u32(out, ne)
+        let ei = 0
+        while ei < ne {
+            let ename = __omni_slice_get(self.extern_names, ei)
+            __omni_bytes_push_u32(out, __omni_str_len(ename))
+            __omni_bytes_push_str(out, ename)
+            __omni_bytes_push_u8(out, 0)
+            __omni_bytes_push_u32(out, 0)
+            ei = ei + 1
+        }
+
+        let nf = __omni_slice_len(self.fn_names)
+        __omni_bytes_push_u32(out, nf)
+        let fi = 0
+        while fi < nf {
+            let fname = __omni_slice_get(self.fn_names, fi)
+            __omni_bytes_push_u32(out, __omni_str_len(fname))
+            __omni_bytes_push_str(out, fname)
+            __omni_bytes_push_u16(out, __omni_slice_get(self.fn_params_count, fi))
+            __omni_bytes_push_u16(out, __omni_slice_get(self.fn_regs_count, fi))
+            __omni_bytes_push_u32(out, 0)
+            __omni_bytes_push_u32(out, __omni_slice_get(self.fn_ops_counts, fi))
+            let ops_buf = __omni_slice_get(self.fn_ops_bufs, fi)
+            let olen = __omni_bytes_len(ops_buf)
+            let bi = 0
+            while bi < olen {
+                __omni_bytes_push_u8(out, __omni_bytes_get(ops_buf, bi))
+                bi = bi + 1
+            }
+            __omni_bytes_destroy(ops_buf)
+            fi = fi + 1
+        }
+
+        return out
+    }
+}
+
+fn compile_file(in_path: str, out_path: str) -> int {
+    let source = __omni_fs_read_text(in_path)
+    if __omni_str_len(source) == 0 {
+        print("omnic_stage1: failed to read input file")
+        return 1
+    }
+    let c = Compiler()
+    c.init_compiler(source)
+    c.compile_module()
+    let obc = c.emit_obc_bytes()
+    let wrote = __omni_fs_write_bytes(out_path, obc)
+    __omni_bytes_destroy(obc)
+    print(wrote)
+    return 0
+}
+
+fn main(argv: int) -> int {
+    if __omni_slice_len(argv) < 3 {
+        print("Usage: omnic_stage1 <input.omni> <output.obc>")
+        return 1
+    }
+    let in_p = __omni_slice_get(argv, 1)
+    let out_p = __omni_slice_get(argv, 2)
+    return compile_file(in_p, out_p)
+}
