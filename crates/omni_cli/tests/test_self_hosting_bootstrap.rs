@@ -273,6 +273,89 @@ pub fn main() -> i64 {
                 o2.len(),
                 o3.len()
             );
+
+            // 9. Stage-2 native binary compiles universal core primitives (enum/match, hex/bin, bitwise, arrays, break/continue, record literals)
+            let univ_src = tmp.join("universal_core.omni");
+            let univ_o = tmp.join("universal_core.o");
+            let univ_bin = tmp.join("universal_core_bin");
+            std::fs::write(
+                &univ_src,
+                r#"
+#[derive(Debug, Clone, Copy)]
+pub enum Chip {
+    Rp2040,
+    Rp2350,
+}
+pub struct Profile {
+    pub kind: Chip,
+    pub pll: i64,
+    pub mask: i64,
+}
+impl Profile {
+    pub const fn make_rp2350() -> Self {
+        Self {
+            kind: Chip::Rp2350,
+            pll: (5 << 16) | (2 << 12),
+            mask: (0x0160_3D20 & 0xFFFF) ^ 0b1010_0101,
+        }
+    }
+}
+fn main() -> int {
+    let p = Profile::make_rp2350();
+    let score = 0;
+    match p.kind {
+        Chip::Rp2040 => { score = 10; },
+        Chip::Rp2350 => { score = 40; },
+        _ => { score = 0; },
+    }
+    let arr = [10, 20, 30];
+    arr[1] = 25;
+    arr.push(5);
+    let sum = 0;
+    for i in 0..arr.len() {
+        if i == 2 {
+            continue;
+        }
+        sum += arr[i];
+    }
+    let bits = ((p.pll >> 12) & 0xFF) + (p.mask & 0x0F);
+    let loops = 0;
+    while loops < 100 {
+        if loops == 7 {
+            break;
+        }
+        loops += 1;
+    }
+    print(bits);
+    return score + sum + loops;
+}
+"#,
+            )
+            .unwrap();
+            let eu = Command::new(&stage2_bin)
+                .args([univ_src.to_str().unwrap(), univ_o.to_str().unwrap()])
+                .output()
+                .expect("Stage-2 universal_core compile failed");
+            assert!(eu.status.success(), "Stage-2 failed to compile universal_core.omni");
+            let lu = Command::new("cc")
+                .args([
+                    univ_o.to_str().unwrap(),
+                    rt.to_str().unwrap(),
+                    "-lm",
+                    "-lpthread",
+                    "-ldl",
+                    "-o",
+                    univ_bin.to_str().unwrap(),
+                ])
+                .output()
+                .expect("cc link of universal_core.o failed");
+            assert!(lu.status.success(), "Linking universal_core.o failed");
+            let ru = Command::new(&univ_bin)
+                .output()
+                .expect("Running universal_core_bin failed");
+            assert_eq!(ru.status.code(), Some(87));
+            let ru_out = String::from_utf8_lossy(&ru.stdout);
+            assert!(ru_out.contains("87"), "Expected bitwise result 87, got: {}", ru_out);
         }
     }
 
