@@ -1,4 +1,5 @@
 pub mod cortex_m;
+pub mod cranelift_backend;
 
 use regex::Regex;
 use std::fs;
@@ -162,6 +163,14 @@ impl LlvmVerifier {
             if RpChipProfile::from_target_triple(triple).is_some() {
                 return cortex_m::verify_cortex_m_ir(ir);
             }
+        }
+
+        // Pure-Rust Cranelift verification is the default desktop verifier (`OMNI_BACKEND=clang` opts back into Clang)
+        let force_clang = std::env::var("OMNI_BACKEND")
+            .map(|v| v.eq_ignore_ascii_case("clang"))
+            .unwrap_or(false);
+        if !force_clang || self.clang_path.is_none() {
+            return cranelift_backend::verify_ir_with_cranelift(ir);
         }
 
         let clang_bin = self.require_clang()?;
@@ -369,6 +378,73 @@ impl LlvmVerifier {
         self.compile_ir_to_binary_for_target(ir, out_path, opt_level, extra_c_files, None)
     }
 
+    fn invoke_linker_with_object(
+        &self,
+        obj_path: &Path,
+        out_path: &Path,
+        link_inputs: &[PathBuf],
+        target_triple: Option<&str>,
+    ) -> Result<std::process::Output, VerifyError> {
+        // Use host C linker driver (`cc` / `clang` / `gcc`) strictly as linker for pre-compiled Cranelift `.o` + runtime `.a`
+        let linker_bin: PathBuf = self
+            .clang_path
+            .clone()
+            .or_else(|| {
+                for cand in ["/usr/bin/cc", "/usr/bin/gcc", "cc", "gcc"] {
+                    let p = PathBuf::from(cand);
+                    if p.exists() || Command::new(&p).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+                        return Some(p);
+                    }
+                }
+                None
+            })
+            .ok_or(VerifyError::ClangNotFound)?;
+
+        let mut cmd = Command::new(linker_bin);
+        cmd.arg(obj_path);
+
+        let effective_triple = target_triple.unwrap_or("");
+        let targeting_windows = if effective_triple.is_empty() {
+            cfg!(windows)
+        } else {
+            effective_triple.contains("windows")
+        };
+        let targeting_macos = if effective_triple.is_empty() {
+            cfg!(target_os = "macos")
+        } else {
+            effective_triple.contains("apple") || effective_triple.contains("darwin") || effective_triple.contains("macos")
+        };
+
+        let mut rpath_dirs: Vec<PathBuf> = Vec::new();
+        for extra in link_inputs {
+            let fname = extra.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            let ext = extra.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            cmd.arg(extra);
+            if !targeting_windows && (ext == "so" || ext == "dylib" || fname.contains(".so.")) {
+                if let Some(parent) = extra.parent() {
+                    if Self::is_non_system_lib_dir(parent) && !rpath_dirs.contains(&parent.to_path_buf()) {
+                        rpath_dirs.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        for rdir in &rpath_dirs {
+            cmd.arg(format!("-Wl,-rpath,{}", rdir.display()));
+        }
+        cmd.arg("-o").arg(out_path);
+        if targeting_macos {
+            cmd.arg("-lm");
+        } else if targeting_windows {
+            cmd.arg("-lws2_32");
+            cmd.arg("-ladvapi32");
+            cmd.arg("-luserenv");
+        } else {
+            cmd.arg("-lm");
+            cmd.arg("-lpthread");
+        }
+        cmd.output().map_err(|e| VerifyError::Io(e.to_string()))
+    }
+
     /// Compile LLVM IR text into a standalone native binary parameterized by an optional target triple.
     pub fn compile_ir_to_binary_for_target(
         &self,
@@ -383,6 +459,29 @@ impl LlvmVerifier {
             if let Some(chip) = RpChipProfile::from_target_triple(triple) {
                 return cortex_m::compile_ir_to_rp_firmware(ir, out_path, &chip);
             }
+        }
+
+        let force_clang = std::env::var("OMNI_BACKEND")
+            .map(|v| v.eq_ignore_ascii_case("clang"))
+            .unwrap_or(false);
+        if (!force_clang || self.clang_path.is_none())
+            && !extra_c_files.iter().any(|p| {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                ext.eq_ignore_ascii_case("ll") || ext.eq_ignore_ascii_case("bc")
+            })
+        {
+            let obj_bytes = cranelift_backend::compile_ir_to_object(ir, target_triple, opt_level)?;
+            let temp_dir = std::env::temp_dir();
+            let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_obj = temp_dir.join(format!("omni_clif_{}_{}.o", std::process::id(), unique_id));
+            fs::write(&temp_obj, &obj_bytes).map_err(|e| VerifyError::Io(e.to_string()))?;
+            let output = self.invoke_linker_with_object(&temp_obj, out_path, extra_c_files, target_triple)?;
+            let _ = fs::remove_file(&temp_obj);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                return Err(VerifyError::LinkError(stderr));
+            }
+            return Ok(());
         }
 
         let temp_dir = std::env::temp_dir();
@@ -483,7 +582,8 @@ impl LlvmVerifier {
         }
     }
 
-    /// Directly execute LLVM IR bitcode in-memory / via ephemeral execution path, streaming stdio
+    /// Directly execute LLVM IR bitcode in-memory via `cranelift-jit` (zero disk/linker latency for pure OmniScript)
+    /// or via ephemeral native binary when linking external C/FFI libraries.
     pub fn run_jit(
         &self,
         ir: &str,
@@ -491,6 +591,37 @@ impl LlvmVerifier {
         extra_c_files: &[PathBuf],
         args: &[String],
     ) -> Result<std::process::ExitStatus, VerifyError> {
+        let force_clang = std::env::var("OMNI_BACKEND")
+            .map(|v| v.eq_ignore_ascii_case("clang"))
+            .unwrap_or(false);
+        let only_std_runtime = extra_c_files.iter().all(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains("omni_runtime_native"))
+                .unwrap_or(false)
+        });
+        // In-process Cranelift JIT fast-path when no external C FFI libs, no `exit()`/`_setjmp`, and not forced to clang
+        if !force_clang
+            && only_std_runtime
+            && !ir.contains("call void @exit(")
+            && !ir.contains("call i32 @_setjmp(")
+            && !ir.contains("call i32 @printf(")
+        {
+            let syms = omni_runtime::jit_runtime_symbols();
+            if let Ok(code) = cranelift_backend::jit_execute_ir_with_args(ir, &syms, args) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    return Ok(std::process::ExitStatus::from_raw((code & 0xff) << 8));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::ExitStatusExt;
+                    return Ok(std::process::ExitStatus::from_raw(code as u32));
+                }
+            }
+        }
+
         let temp_dir = std::env::temp_dir();
         let unique_id = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_bin = if cfg!(windows) {

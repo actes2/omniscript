@@ -1,16 +1,11 @@
-use candle_core::quantized::gguf_file;
-use candle_core::quantized::tokenizer::TokenizerFromGguf;
-use candle_core::{Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use thiserror::Error;
-use tokenizers::Tokenizer;
 
 pub mod dataset_generator;
+pub mod gguf_native;
 pub use dataset_generator::{DatasetRecord, SyntheticDatasetGenerator};
+pub use gguf_native::{NativeGgufModel, NativeKvCache};
 
 #[derive(Error, Debug)]
 pub enum EngineError {
@@ -1713,16 +1708,17 @@ pub enum DevicePreference {
     Metal(usize),
 }
 
-/// In-process Candle-based GGUF inference engine executing directly without background daemons.
+/// In-process zero-Candle native GGUF inference engine (AVX2/FMA + batched prefill + native BPE).
 pub struct CandleGgufEngine {
-    model: Mutex<Qwen2Weights>,
-    tokenizer: Tokenizer,
-    pub device: Device,
+    model: NativeGgufModel,
     pub model_path: PathBuf,
     pub system_prompt: String,
     pub sample_len: usize,
     pub eos_token_id: u32,
 }
+
+/// Alias reflecting the zero-Candle native GGUF engine architecture.
+pub type NativeGgufEngine = CandleGgufEngine;
 
 #[cfg(all(feature = "full-build", not(all(target_os = "windows", target_env = "msvc"))))]
 extern "C" {
@@ -1752,103 +1748,32 @@ pub static EMBEDDED_MODEL_WEIGHTS: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(embedded_model_weights);
 
 impl CandleGgufEngine {
-    pub fn new_from_reader<R: std::io::Read + std::io::Seek>(
-        mut reader: R,
-        pref: DevicePreference,
-        label: &str,
-    ) -> Result<Self, EngineError> {
-        let device = match pref {
-            DevicePreference::Cpu => Device::Cpu,
-            DevicePreference::Cuda(ord) => {
-                if !candle_core::utils::cuda_is_available() {
-                    return Err(EngineError::InferenceFailed(
-                        format!("CUDA acceleration requested (device {}), but CUDA is not available or drivers/toolkit are missing", ord)
-                    ));
-                }
-                Device::new_cuda(ord).map_err(|e| {
-                    EngineError::InferenceFailed(format!("Failed to initialize CUDA device {}: {}", ord, e))
-                })?
-            }
-            DevicePreference::Metal(ord) => {
-                if !candle_core::utils::metal_is_available() {
-                    return Err(EngineError::InferenceFailed(
-                        format!("Apple Metal acceleration requested (device {}), but Metal is not available (build with '--features metal' on macOS)", ord)
-                    ));
-                }
-                Device::new_metal(ord).map_err(|e| {
-                    EngineError::InferenceFailed(format!("Failed to initialize Metal device {}: {}", ord, e))
-                })?
-            }
-            DevicePreference::Auto => {
-                if candle_core::utils::cuda_is_available() {
-                    Device::new_cuda(0).unwrap_or(Device::Cpu)
-                } else if candle_core::utils::metal_is_available() {
-                    Device::new_metal(0).unwrap_or(Device::Cpu)
-                } else {
-                    Device::Cpu
-                }
-            }
-        };
-
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed reading GGUF content: {}", e)))?;
-
-        let mut tokenizer = Tokenizer::from_gguf(&content)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed extracting tokenizer from GGUF: {}", e)))?;
-
-        // Ensure ChatML special tokens encode to their single control token IDs (151644 / 151645 / 151643)
-        // matching HuggingFace `AutoTokenizer` during training so `<|im_end|>` stops generation immediately.
-        let special_candidates = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
-        let added: Vec<tokenizers::AddedToken> = special_candidates
-            .iter()
-            .filter(|tok| tokenizer.token_to_id(tok).is_some())
-            .map(|tok| tokenizers::AddedToken::from(*tok, true))
-            .collect();
-        if !added.is_empty() {
-            let _ = tokenizer.add_special_tokens(added);
+    pub fn new_with_device(model_path: PathBuf, _pref: DevicePreference) -> Result<Self, EngineError> {
+        if !model_path.exists() {
+            return Err(EngineError::ModelNotFound(model_path));
         }
-
-        let eos_token_id = content
-            .metadata
-            .get("tokenizer.ggml.eos_token_id")
-            .and_then(|v| match v {
-                gguf_file::Value::U32(id) => Some(*id),
-                gguf_file::Value::I32(id) => Some(*id as u32),
-                _ => None,
-            })
-            .unwrap_or(151645);
-
-        let model = Qwen2Weights::from_gguf(content, &mut reader, &device)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed initializing Qwen2 model from GGUF on {:?}: {}", device, e)))?;
-
+        let model = NativeGgufModel::from_file(&model_path)?;
+        let eos_token_id = model.config.eos_token_id;
         Ok(Self {
-            model: Mutex::new(model),
-            tokenizer,
-            device,
-            model_path: PathBuf::from(label),
+            model,
+            model_path,
             system_prompt: dataset_generator::DEFAULT_IR_SYSTEM_PROMPT.to_string(),
             sample_len: 128,
             eos_token_id,
         })
     }
 
-    pub fn new_with_device(model_path: PathBuf, pref: DevicePreference) -> Result<Self, EngineError> {
-        if !model_path.exists() {
-            return Err(EngineError::ModelNotFound(model_path));
-        }
-
-        let file = std::fs::File::open(&model_path)
-            .map_err(|e| EngineError::InferenceFailed(format!("Failed to open model file: {}", e)))?;
-        let label = model_path.to_string_lossy().to_string();
-        let mut engine = Self::new_from_reader(file, pref, &label)?;
-        engine.model_path = model_path;
-        Ok(engine)
-    }
-
     #[cfg(feature = "full-build")]
-    pub fn new_embedded_with_device(pref: DevicePreference) -> Result<Self, EngineError> {
-        let cursor = std::io::Cursor::new(embedded_model_weights());
-        Self::new_from_reader(cursor, pref, "[embedded:omni-coder.gguf]")
+    pub fn new_embedded_with_device(_pref: DevicePreference) -> Result<Self, EngineError> {
+        let model = NativeGgufModel::from_static_bytes(embedded_model_weights())?;
+        let eos_token_id = model.config.eos_token_id;
+        Ok(Self {
+            model,
+            model_path: PathBuf::from("[embedded:omni-coder.gguf]"),
+            system_prompt: dataset_generator::DEFAULT_IR_SYSTEM_PROMPT.to_string(),
+            sample_len: 128,
+            eos_token_id,
+        })
     }
 
     #[cfg(feature = "full-build")]
@@ -1877,7 +1802,6 @@ impl CandleGgufEngine {
                 }
             }
         }
-
 
         let mut candidate_paths = vec![
             PathBuf::from("models/omni-coder.gguf"),
@@ -1926,11 +1850,11 @@ impl CandleGgufEngine {
     }
 
     pub fn is_cuda(&self) -> bool {
-        matches!(self.device, Device::Cuda(_))
+        false
     }
 
     pub fn is_metal(&self) -> bool {
-        matches!(self.device, Device::Metal(_))
+        false
     }
 
     pub fn with_sample_len(mut self, len: usize) -> Self {
@@ -1939,51 +1863,18 @@ impl CandleGgufEngine {
     }
 
     pub fn generate_raw_text(&self, prompt: &str, max_tokens: usize, temp: f32) -> Result<String, EngineError> {
-        let encoding = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer encode error: {}", e)))?;
-        let tokens = encoding.get_ids();
+        let tokens = self.model.tokenizer.encode(prompt);
+        let mut kv = NativeKvCache::new(&self.model.config, tokens.len() + max_tokens + 4);
+        let mut rng_state: u64 = 299_792_458;
 
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|e| EngineError::InferenceFailed(format!("Mutex poison: {}", e)))?;
-
-        model.clear_kv_cache();
-
-        let sampling = if temp <= 0.05 {
-            Sampling::ArgMax
-        } else {
-            Sampling::All {
-                temperature: temp as f64,
-            }
-        };
-
-        let mut logits_processor = LogitsProcessor::from_sampling(299792458, sampling);
-
-        let input = Tensor::new(tokens, &self.device)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
-            .unsqueeze(0)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-        let logits = model
-            .forward(&input, 0)
-            .map_err(|e| EngineError::InferenceFailed(format!("Model forward prefill failed: {}", e)))?;
-        let logits = logits
-            .squeeze(0)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-        let mut next_token = logits_processor
-            .sample(&logits)
-            .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
-
-        let mut generated_tokens = Vec::new();
+        let logits = self.model.forward_prefill_batch(&tokens, 0, &mut kv);
+        let mut next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
 
         let is_stop_token = |t: u32| -> bool {
             t == self.eos_token_id || t == 151645 || t == 151643
         };
 
+        let mut generated_tokens = Vec::new();
         if !is_stop_token(next_token) {
             generated_tokens.push(next_token);
         }
@@ -1992,44 +1883,24 @@ impl CandleGgufEngine {
             if is_stop_token(next_token) {
                 break;
             }
-
-            let input = Tensor::new(&[next_token], &self.device)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
-                .unsqueeze(0)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-            let logits = model
-                .forward(&input, tokens.len() + step)
-                .map_err(|e| EngineError::InferenceFailed(format!("Model forward step failed: {}", e)))?;
-            let logits = logits
-                .squeeze(0)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-            next_token = logits_processor
-                .sample(&logits)
-                .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
-
+            let logits = self.model.forward_token(next_token, tokens.len() + step, &mut kv, true);
+            next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
             if is_stop_token(next_token) {
                 break;
             }
             generated_tokens.push(next_token);
         }
 
-        let raw_output = self
-            .tokenizer
-            .decode(&generated_tokens, true)
-            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
-
-        Ok(raw_output)
+        Ok(self.model.tokenizer.decode(&generated_tokens))
     }
 }
 
 pub fn cuda_is_available() -> bool {
-    candle_core::utils::cuda_is_available()
+    false
 }
 
 pub fn metal_is_available() -> bool {
-    candle_core::utils::metal_is_available()
+    false
 }
 
 impl InferenceEngine for CandleGgufEngine {
@@ -2044,11 +1915,7 @@ impl InferenceEngine for CandleGgufEngine {
             self.system_prompt, prompt_body
         );
 
-        let encoding = self
-            .tokenizer
-            .encode(formatted_prompt, true)
-            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer encode error: {}", e)))?;
-        let tokens = encoding.get_ids();
+        let tokens = self.model.tokenizer.encode(&formatted_prompt);
         let verbose_synth = std::env::var_os("OMNI_VERBOSE").is_some();
         let synth_start = std::time::Instant::now();
         if verbose_synth {
@@ -2056,45 +1923,17 @@ impl InferenceEngine for CandleGgufEngine {
             eprintln!("     [Synth] Prefilling {} tokens for intent: '{}'", tokens.len(), preview);
         }
 
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|e| EngineError::InferenceFailed(format!("Mutex poison: {}", e)))?;
+        let mut kv = NativeKvCache::new(&self.model.config, tokens.len() + self.sample_len + 4);
+        let mut rng_state: u64 = 299_792_458;
 
-        model.clear_kv_cache();
-
-        let sampling = if temp <= 0.05 {
-            Sampling::ArgMax
-        } else {
-            Sampling::All {
-                temperature: temp as f64,
-            }
-        };
-
-        let mut logits_processor = LogitsProcessor::from_sampling(299792458, sampling);
-
-        let input = Tensor::new(tokens, &self.device)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
-            .unsqueeze(0)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-        let logits = model
-            .forward(&input, 0)
-            .map_err(|e| EngineError::InferenceFailed(format!("Model forward prefill failed: {}", e)))?;
-        let logits = logits
-            .squeeze(0)
-            .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-        let mut next_token = logits_processor
-            .sample(&logits)
-            .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
-
-        let mut generated_tokens = Vec::new();
+        let logits = self.model.forward_prefill_batch(&tokens, 0, &mut kv);
+        let mut next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
 
         let is_stop_token = |t: u32| -> bool {
             t == self.eos_token_id || t == 151645 || t == 151643
         };
 
+        let mut generated_tokens = Vec::new();
         if !is_stop_token(next_token) {
             generated_tokens.push(next_token);
         }
@@ -2103,23 +1942,8 @@ impl InferenceEngine for CandleGgufEngine {
             if is_stop_token(next_token) {
                 break;
             }
-
-            let input = Tensor::new(&[next_token], &self.device)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?
-                .unsqueeze(0)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-            let logits = model
-                .forward(&input, tokens.len() + step)
-                .map_err(|e| EngineError::InferenceFailed(format!("Model forward step failed: {}", e)))?;
-            let logits = logits
-                .squeeze(0)
-                .map_err(|e| EngineError::InferenceFailed(e.to_string()))?;
-
-            next_token = logits_processor
-                .sample(&logits)
-                .map_err(|e| EngineError::InferenceFailed(format!("Sample failed: {}", e)))?;
-
+            let logits = self.model.forward_token(next_token, tokens.len() + step, &mut kv, true);
+            next_token = NativeGgufModel::sample_token(&logits, temp, &mut rng_state);
             if is_stop_token(next_token) {
                 break;
             }
@@ -2127,56 +1951,52 @@ impl InferenceEngine for CandleGgufEngine {
 
             // Early-stopping on explicit ChatML / task delimiters, blank-line block termination, or basic-block terminator
             if generated_tokens.len() >= 6 && step % 2 == 0 {
-                if let Ok(curr_str) = self.tokenizer.decode(&generated_tokens, false) {
-                    if curr_str.contains("<|im_end|>")
-                        || curr_str.contains("</omni_ir_task>")
-                        || curr_str.contains("<|im_start|>")
-                    {
-                        break;
-                    }
-                    if let Some((completed_lines, _tail)) = curr_str.rsplit_once('\n') {
-                        let clean_probe = sanitize_llvm_ir(completed_lines);
-                        let has_llvm_instr = clean_probe.lines().any(|l| {
-                            let t = l.trim();
-                            !t.is_empty()
-                                && !t.starts_with(';')
-                                && (t.starts_with("call ")
-                                    || t.starts_with("store ")
-                                    || t.contains(" = ")
-                                    || t.starts_with("ret "))
-                        });
-                        let has_completed_terminator = clean_probe.lines().any(|l| {
-                            let t = l.trim();
-                            t.starts_with("ret ") || t == "unreachable"
-                        });
-                        let has_satisfied_store = envelope
-                            .yield_expectation
-                            .as_deref()
-                            .and_then(|ye| ye.rsplit(" to ").next())
-                            .filter(|dst| dst.starts_with('%'))
-                            .map(|dst| {
-                                clean_probe.lines().any(|l| {
-                                    let t = l.trim();
-                                    !t.starts_with(';')
-                                        && t.starts_with("store ")
-                                        && t.contains(',')
-                                        && t.contains('*')
-                                        && t.contains(dst)
-                                })
+                let curr_str = self.model.tokenizer.decode(&generated_tokens);
+                if curr_str.contains("<|im_end|>")
+                    || curr_str.contains("</omni_ir_task>")
+                    || curr_str.contains("<|im_start|>")
+                {
+                    break;
+                }
+                if let Some((completed_lines, _tail)) = curr_str.rsplit_once('\n') {
+                    let clean_probe = sanitize_llvm_ir(completed_lines);
+                    let has_llvm_instr = clean_probe.lines().any(|l| {
+                        let t = l.trim();
+                        !t.is_empty()
+                            && !t.starts_with(';')
+                            && (t.starts_with("call ")
+                                || t.starts_with("store ")
+                                || t.contains(" = ")
+                                || t.starts_with("ret "))
+                    });
+                    let has_completed_terminator = clean_probe.lines().any(|l| {
+                        let t = l.trim();
+                        t.starts_with("ret ") || t == "unreachable"
+                    });
+                    let has_satisfied_store = envelope
+                        .yield_expectation
+                        .as_deref()
+                        .and_then(|ye| ye.rsplit(" to ").next())
+                        .filter(|dst| dst.starts_with('%'))
+                        .map(|dst| {
+                            clean_probe.lines().any(|l| {
+                                let t = l.trim();
+                                !t.starts_with(';')
+                                    && t.starts_with("store ")
+                                    && t.contains(',')
+                                    && t.contains('*')
+                                    && t.contains(dst)
                             })
-                            .unwrap_or(false);
-                        if has_llvm_instr && (curr_str.contains("\n\n") || has_completed_terminator || has_satisfied_store) {
-                            break;
-                        }
+                        })
+                        .unwrap_or(false);
+                    if has_llvm_instr && (curr_str.contains("\n\n") || has_completed_terminator || has_satisfied_store) {
+                        break;
                     }
                 }
             }
         }
 
-        let raw_output = self
-            .tokenizer
-            .decode(&generated_tokens, true)
-            .map_err(|e| EngineError::InferenceFailed(format!("Tokenizer decode error: {}", e)))?;
+        let raw_output = self.model.tokenizer.decode(&generated_tokens);
 
         if verbose_synth {
             eprintln!(

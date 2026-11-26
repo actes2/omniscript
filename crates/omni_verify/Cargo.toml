@@ -11,3 +11,11 @@ thiserror.workspace = true
 regex.workspace = true
 tracing.workspace = true
 serde.workspace = true
+omni_runtime = { path = "../omni_runtime" }
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-module = "0.116"
+cranelift-object = "0.116"
+cranelift-jit = "0.116"
+cranelift-native = "0.116"
+target-lexicon = "0.13"

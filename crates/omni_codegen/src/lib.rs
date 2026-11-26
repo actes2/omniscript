@@ -2354,7 +2354,9 @@ impl<'a> CodeGenerator<'a> {
         // Expose in-scope user functions & extern/HAL declarations so the LLM can dynamically
         // target real available symbols in the current module/platform without hardcoded aliases.
         let mut avail_sigs: Vec<String> = Vec::new();
-        for fn_sym in &scope_tree.known_functions {
+        let mut sorted_fns: Vec<&String> = scope_tree.known_functions.iter().collect();
+        sorted_fns.sort();
+        for fn_sym in sorted_fns {
             if fn_sym != "main" && fn_sym != &ctx_snapshot.enclosing_fn {
                 let ret_str = match scope_tree.fn_return_types.get(fn_sym) {
                     Some(IrType::Ptr) => "i8*",
@@ -13743,5 +13745,58 @@ fn main() -> int {
         assert!(pico_ir.contains("declare i8* @ws_poll()"), "IR:\n{}", pico_ir);
         assert!(pico_ir.contains("declare i64 @gpio_init(i64)"), "IR:\n{}", pico_ir);
         assert!(pico_ir.contains("declare i64 @custom_sensor_read(i64)"), "IR:\n{}", pico_ir);
+    }
+
+    #[test]
+    fn test_deterministic_ssa_ir_emission_byte_identical() {
+        let parser = OmniParser::new();
+        let src = r#"
+extern fn ext_alpha(a: int, b: int) -> int;
+extern fn ext_beta(msg: str) -> str;
+
+class Accumulator {
+    total: int
+    scale: int
+
+    fn add(self, x: int) -> int {
+        self.total = self.total + x * self.scale
+        return self.total
+    }
+}
+
+fn fib(n: int) -> int {
+    if n <= 1 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+def main():
+    let acc = Accumulator(10, 2)
+    let r = acc.add(5)
+    let f = fib(6)
+    let m = {"alpha": r, "beta": f}
+    let arr = [r, f, ext_alpha(1, 2)]
+    let closure = |k| k + r
+    print(ext_beta("ok"))
+    return closure(arr[0]) + m["beta"]
+"#;
+        let engine = MockSynthesisEngine::new();
+        let baseline_mod = parser.parse_module("det_test", src);
+        let baseline_ir = CodeGenerator::new(&engine)
+            .generate_module_ir(&baseline_mod, 0.0)
+            .expect("baseline IR generation");
+
+        for run in 0..8 {
+            let m = parser.parse_module("det_test", src);
+            let ir = CodeGenerator::new(&engine)
+                .generate_module_ir(&m, 0.0)
+                .expect("repeated IR generation");
+            assert_eq!(
+                baseline_ir, ir,
+                "SSA IR drifted on run {} — nondeterministic emission detected!",
+                run
+            );
+        }
     }
 }
