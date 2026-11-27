@@ -1417,9 +1417,19 @@ impl CType {
 }
 
 #[derive(Debug, Clone)]
+struct CBitfieldInfo {
+    storage_idx: usize,
+    storage_ty: CType,
+    bit_offset: u8,
+    bit_width: u8,
+    logical_ty: CType,
+}
+
+#[derive(Debug, Clone)]
 struct CStructDef {
     _name: String,
     fields: Vec<(String, CType, usize)>, // (field_name, type, byte_offset)
+    bitfields: HashMap<String, CBitfieldInfo>,
     size: usize,
     align: usize,
 }
@@ -1470,6 +1480,7 @@ enum CStmt {
         ty: CType,
         is_static: bool,
         init: Option<CInit>,
+        vla_len: Option<CExpr>,
     },
     Expr(CExpr),
     Return(Option<CExpr>),
@@ -1522,6 +1533,7 @@ enum CExpr {
     Member(Box<CExpr>, String, bool), // (base, field, is_arrow)
     SizeofType(CType),
     SizeofExpr(Box<CExpr>),
+    CompoundLit(CType, Box<CInit>),
 }
 
 // ============================================================================
@@ -1971,7 +1983,7 @@ impl CParser {
         };
 
         if self.eat_sym("{") {
-            let mut fields = Vec::new();
+            let mut raw_fields: Vec<(String, CType, Option<u8>)> = Vec::new();
             while !self.eat_sym("}") {
                 if matches!(self.peek(), CTok::Eof) {
                     return Err("c_frontend: unterminated struct/union body".to_string());
@@ -1980,13 +1992,20 @@ impl CParser {
                     continue;
                 }
                 let (_, _, _, fbase) = self.parse_decl_specifiers()?;
+                // Handle anonymous inner `struct { ... };` or `union { ... };`
+                if self.eat_sym(";") {
+                    raw_fields.push((String::new(), fbase, None));
+                    continue;
+                }
                 loop {
                     let (fname, fty, _) = self.parse_declarator(fbase.clone())?;
-                    // Ignore optional bitfield width `: N`
-                    if self.eat_sym(":") {
-                        let _ = self.parse_expr_no_comma()?;
-                    }
-                    fields.push((fname, fty));
+                    let bf_width = if self.eat_sym(":") {
+                        let w_expr = self.parse_expr_no_comma()?;
+                        Some(self.eval_const_expr(&w_expr).unwrap_or(1).clamp(0, 64) as u8)
+                    } else {
+                        None
+                    };
+                    raw_fields.push((fname, fty, bf_width));
                     if self.eat_sym(",") {
                         continue;
                     }
@@ -1998,31 +2017,78 @@ impl CParser {
             if is_union {
                 let mut max_size = 1usize;
                 let mut max_align = 1usize;
-                for (_, fty) in &fields {
-                    max_size = max_size.max(self.sizeof_type(fty));
-                    max_align = max_align.max(self.alignof_type(fty));
+                let mut ufields = Vec::new();
+                for (fname, fty, _) in raw_fields {
+                    max_size = max_size.max(self.sizeof_type(&fty));
+                    max_align = max_align.max(self.alignof_type(&fty));
+                    ufields.push((fname, fty));
                 }
                 let aligned_size = (max_size + max_align - 1) & !(max_align - 1);
                 self.unions.insert(
                     tag.clone(),
                     CUnionDef {
                         _name: tag.clone(),
-                        fields,
+                        fields: ufields,
                         size: aligned_size.max(1),
                         align: max_align,
                     },
                 );
             } else {
-                let mut laid_out = Vec::new();
+                let mut laid_out: Vec<(String, CType, usize)> = Vec::new();
+                let mut bitfields: HashMap<String, CBitfieldInfo> = HashMap::new();
                 let mut offset = 0usize;
                 let mut max_align = 1usize;
-                for (fname, fty) in fields {
-                    let fa = self.alignof_type(&fty).max(1);
-                    let fs = self.sizeof_type(&fty);
-                    max_align = max_align.max(fa);
-                    offset = (offset + fa - 1) & !(fa - 1);
-                    laid_out.push((fname, fty, offset));
-                    offset += fs;
+                // Track active bitfield storage unit: (storage_field_idx, storage_ty, used_bits, unit_bits)
+                let mut active_bf: Option<(usize, CType, u8, u8)> = None;
+
+                for (fname, fty, bf_opt) in raw_fields {
+                    if let Some(width) = bf_opt {
+                        let unit_bits = if fty.int_bits() > 32 { 64u8 } else { 32u8 };
+                        let unit_ty = CType::Int {
+                            bits: unit_bits,
+                            signed: false,
+                        };
+                        if width == 0 {
+                            active_bf = None;
+                            continue;
+                        }
+                        let (s_idx, s_ty, bit_off) = match active_bf.clone() {
+                            Some((idx, sty, used, cap)) if used + width <= cap && cap == unit_bits => {
+                                active_bf = Some((idx, sty.clone(), used + width, cap));
+                                (idx, sty, used)
+                            }
+                            _ => {
+                                let fa = (unit_bits as usize) / 8;
+                                max_align = max_align.max(fa);
+                                offset = (offset + fa - 1) & !(fa - 1);
+                                let idx = laid_out.len();
+                                laid_out.push((format!("__bf_unit_{}", idx), unit_ty.clone(), offset));
+                                offset += fa;
+                                active_bf = Some((idx, unit_ty.clone(), width, unit_bits));
+                                (idx, unit_ty, 0)
+                            }
+                        };
+                        if !fname.is_empty() {
+                            bitfields.insert(
+                                fname,
+                                CBitfieldInfo {
+                                    storage_idx: s_idx,
+                                    storage_ty: s_ty,
+                                    bit_offset: bit_off,
+                                    bit_width: width,
+                                    logical_ty: fty,
+                                },
+                            );
+                        }
+                    } else {
+                        active_bf = None;
+                        let fa = self.alignof_type(&fty).max(1);
+                        let fs = self.sizeof_type(&fty);
+                        max_align = max_align.max(fa);
+                        offset = (offset + fa - 1) & !(fa - 1);
+                        laid_out.push((fname, fty, offset));
+                        offset += fs;
+                    }
                 }
                 let total_size = ((offset + max_align - 1) & !(max_align - 1)).max(1);
                 self.structs.insert(
@@ -2030,6 +2096,7 @@ impl CParser {
                     CStructDef {
                         _name: tag.clone(),
                         fields: laid_out,
+                        bitfields,
                         size: total_size,
                         align: max_align,
                     },
@@ -2083,39 +2150,69 @@ impl CParser {
         Ok(CType::Int { bits: 32, signed: true })
     }
 
-    /// Parses a C declarator. Returns `(name, type, Option<(params, variadic, ret_ty)>)`.
+    /// Parses a C declarator (including spiral declarators like `int (*p)[4]`,
+    /// `int (*ops[4])(int, int)`, `int (*get_op(int))(int, int)`).
     fn parse_declarator(
         &mut self,
-        mut ty: CType,
+        ty: CType,
     ) -> Result<(String, CType, Option<(Vec<(String, CType)>, bool, CType)>), String> {
+        let (name, full_ty, fn_info, _) = self.parse_declarator_ext(ty)?;
+        Ok((name, full_ty, fn_info))
+    }
+
+    fn parse_declarator_ext(
+        &mut self,
+        mut ty: CType,
+    ) -> Result<(String, CType, Option<(Vec<(String, CType)>, bool, CType)>, Option<CExpr>), String> {
         while self.eat_sym("*") {
             while self.eat_kw("const") || self.eat_kw("volatile") {}
             ty = CType::Ptr(Box::new(ty));
         }
 
-        // Function pointer declarator: `ret (*name)(params...)`
-        if self.eat_sym("(") {
-            if self.eat_sym("*") {
-                let name = match self.peek().clone() {
-                    CTok::Ident(s) => {
-                        self.bump();
-                        s
+        // Grouped inner declarator `(...)`: e.g. `int (*p)[4]`, `int (*ops[4])(int)`, `int (*get_op(int))(int)`
+        if matches!(self.peek(), CTok::Sym("("))
+            && !matches!(self.peek_at(1), CTok::Sym(")"))
+            && !self.is_type_token(self.peek_at(1))
+        {
+            self.bump(); // consume '('
+            // Capture the inner declarator tokens up to the matching ')'
+            let inner_start = self.pos;
+            let mut depth = 1usize;
+            while !matches!(self.peek(), CTok::Eof) {
+                if matches!(self.peek(), CTok::Sym("(")) {
+                    depth += 1;
+                } else if matches!(self.peek(), CTok::Sym(")")) {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
                     }
-                    _ => String::new(),
-                };
-                self.expect_sym(")")?;
-                self.expect_sym("(")?;
-                let (params, variadic) = self.parse_param_list()?;
-                let fn_ptr = CType::FuncPtr {
-                    ret: Box::new(ty),
-                    params: params.into_iter().map(|(_, t)| t).collect(),
-                    variadic,
-                };
-                return Ok((name, fn_ptr, None));
+                }
+                self.bump();
             }
-            let (name, inner_ty, inner_fn) = self.parse_declarator(ty)?;
+            let inner_end = self.pos;
             self.expect_sym(")")?;
-            return Ok((name, inner_ty, inner_fn));
+
+            // Parse outer suffixes (`[N]` or `(params...)`) and apply them to `ty` FIRST
+            let mut outer_is_fn = false;
+            let (outer_ty, _) = self.parse_declarator_suffixes(ty, &mut outer_is_fn)?;
+
+            // Save position after outer suffixes, then parse the inner declarator wrapping `outer_ty`
+            let after_outer = self.pos;
+            let mut sub = self.toks[inner_start..inner_end].to_vec();
+            sub.push(CTok::Eof);
+            let saved_toks = std::mem::replace(&mut self.toks, sub);
+            self.pos = 0;
+            // If outer was a function `(params...)`, a single `*` inside `(*name)` produces a FuncPtr directly
+            let inner_res = if outer_is_fn && matches!(self.peek(), CTok::Sym("*")) {
+                self.bump();
+                while self.eat_kw("const") || self.eat_kw("volatile") {}
+                self.parse_declarator_ext(outer_ty)
+            } else {
+                self.parse_declarator_ext(outer_ty)
+            };
+            self.toks = saved_toks;
+            self.pos = after_outer;
+            return inner_res;
         }
 
         let name = match self.peek().clone() {
@@ -2126,7 +2223,7 @@ impl CParser {
             _ => String::new(),
         };
 
-        // Function parameter list
+        // Direct function parameter list
         if self.eat_sym("(") {
             let (params, variadic) = self.parse_param_list()?;
             let fn_ty = CType::FuncPtr {
@@ -2134,26 +2231,83 @@ impl CParser {
                 params: params.iter().map(|(_, t)| t.clone()).collect(),
                 variadic,
             };
-            return Ok((name, fn_ty, Some((params, variadic, ty))));
+            return Ok((name, fn_ty, Some((params, variadic, ty)), None));
         }
 
-        // Array dimensions `[N]` (multi-dimensional folded right-to-left)
-        let mut dims = Vec::new();
+        let mut is_fn = false;
+        let (final_ty, vla_len) = self.parse_declarator_suffixes(ty, &mut is_fn)?;
+        Ok((name, final_ty, None, vla_len))
+    }
+
+    fn is_type_token(&self, tok: &CTok) -> bool {
+        match tok {
+            CTok::Ident(s) => {
+                matches!(
+                    s.as_str(),
+                    "void"
+                        | "char"
+                        | "short"
+                        | "int"
+                        | "long"
+                        | "float"
+                        | "double"
+                        | "signed"
+                        | "unsigned"
+                        | "_Bool"
+                        | "struct"
+                        | "union"
+                        | "enum"
+                        | "const"
+                        | "volatile"
+                ) || self.typedefs.contains_key(s)
+            }
+            _ => false,
+        }
+    }
+
+    fn parse_declarator_suffixes(
+        &mut self,
+        mut ty: CType,
+        is_fn: &mut bool,
+    ) -> Result<(CType, Option<CExpr>), String> {
+        if self.eat_sym("(") {
+            let (params, variadic) = self.parse_param_list()?;
+            *is_fn = true;
+            return Ok((
+                CType::FuncPtr {
+                    ret: Box::new(ty),
+                    params: params.into_iter().map(|(_, t)| t).collect(),
+                    variadic,
+                },
+                None,
+            ));
+        }
+
+        let mut dims: Vec<Result<usize, CExpr>> = Vec::new();
         while self.eat_sym("[") {
             if self.eat_sym("]") {
-                dims.push(0usize);
+                dims.push(Ok(0));
             } else {
                 let sz_expr = self.parse_expr_no_comma()?;
-                let n = self.eval_const_expr(&sz_expr).unwrap_or(1).max(0) as usize;
                 self.expect_sym("]")?;
-                dims.push(n);
+                if let Some(n) = self.eval_const_expr(&sz_expr) {
+                    dims.push(Ok(n.max(0) as usize));
+                } else {
+                    dims.push(Err(sz_expr));
+                }
             }
         }
+        let mut vla_out: Option<CExpr> = None;
         for d in dims.into_iter().rev() {
-            ty = CType::Array(Box::new(ty), d);
+            match d {
+                Ok(n) => ty = CType::Array(Box::new(ty), n),
+                Err(e) => {
+                    vla_out = Some(e);
+                    ty = CType::Ptr(Box::new(ty));
+                }
+            }
         }
-
-        Ok((name, ty, None))
+        Ok((ty, vla_out))
     }
 
     fn parse_param_list(&mut self) -> Result<(Vec<(String, CType)>, bool), String> {
@@ -2367,7 +2521,7 @@ impl CParser {
         }
         let mut decls = Vec::new();
         loop {
-            let (name, mut full_ty, _) = self.parse_declarator(base_ty.clone())?;
+            let (name, mut full_ty, _, vla_len) = self.parse_declarator_ext(base_ty.clone())?;
             if is_typedef {
                 if !name.is_empty() {
                     self.typedefs.insert(name, full_ty);
@@ -2391,6 +2545,7 @@ impl CParser {
                     ty: full_ty,
                     is_static,
                     init,
+                    vla_len,
                 });
             }
             if self.eat_sym(",") {
@@ -2578,8 +2733,21 @@ impl CParser {
             let saved = self.pos;
             self.bump();
             if self.is_type_start() {
-                if let Ok(ty) = self.parse_type_name() {
+                if let Ok(mut ty) = self.parse_type_name() {
                     if self.eat_sym(")") {
+                        // C99 Compound Literal: `(TypeName){ ... }`
+                        if matches!(self.peek(), CTok::Sym("{")) {
+                            let init = self.parse_initializer()?;
+                            if let CType::Array(elem, 0) = &ty {
+                                let n = match &init {
+                                    CInit::List(v) => v.len(),
+                                    CInit::Expr(CExpr::Str(b)) => b.len() + 1,
+                                    _ => 1,
+                                };
+                                ty = CType::Array(elem.clone(), n);
+                            }
+                            return self.parse_postfix_on(CExpr::CompoundLit(ty, Box::new(init)));
+                        }
                         let inner = self.parse_cast()?;
                         return Ok(CExpr::Cast(ty, Box::new(inner)));
                     }
@@ -2617,7 +2785,11 @@ impl CParser {
     }
 
     fn parse_postfix(&mut self) -> Result<CExpr, String> {
-        let mut expr = self.parse_primary()?;
+        let expr = self.parse_primary()?;
+        self.parse_postfix_on(expr)
+    }
+
+    fn parse_postfix_on(&mut self, mut expr: CExpr) -> Result<CExpr, String> {
         loop {
             if self.eat_sym("[") {
                 let idx = self.parse_expr()?;
@@ -2710,6 +2882,10 @@ struct CLlvmLowerer {
     globals: HashMap<String, CType>,
     str_lits: Vec<(String, Vec<u8>)>,
     static_locals_ir: String,
+    cur_allocas: String,
+    vla_scopes: Vec<Vec<String>>,
+    switch_cases: Vec<HashMap<i64, String>>,
+    switch_defaults: Vec<Option<String>>,
     tmp_seq: usize,
     lbl_seq: usize,
     static_seq: usize,
@@ -2740,6 +2916,10 @@ impl CLlvmLowerer {
             globals: HashMap::new(),
             str_lits: Vec::new(),
             static_locals_ir: String::new(),
+            cur_allocas: String::new(),
+            vla_scopes: Vec::new(),
+            switch_cases: Vec::new(),
+            switch_defaults: Vec::new(),
             tmp_seq: 0,
             lbl_seq: 0,
             static_seq: 0,
@@ -2980,12 +3160,8 @@ impl CLlvmLowerer {
                     len, len, gname
                 )
             }
-            (CType::Ptr(_), CInit::Expr(e)) => {
-                if let Some(0) = self.eval_const_i64(e) {
-                    "null".to_string()
-                } else {
-                    "null".to_string()
-                }
+            (CType::Ptr(_) | CType::FuncPtr { .. }, CInit::Expr(e)) => {
+                self.format_const_ptr_expr(ty, e)
             }
             (CType::Array(elem, n), CInit::List(items)) => {
                 let ety = self.llvm_ty(elem);
@@ -3018,6 +3194,81 @@ impl CLlvmLowerer {
                 }
             }
             _ => "zeroinitializer".to_string(),
+        }
+    }
+
+    fn format_const_ptr_expr(&mut self, dst_ty: &CType, e: &CExpr) -> String {
+        match e {
+            CExpr::Str(bytes) => {
+                let gname = self.intern_str(bytes);
+                let len = bytes.len() + 1;
+                format!(
+                    "getelementptr inbounds ([{} x i8], [{} x i8]* @{}, i64 0, i64 0)",
+                    len, len, gname
+                )
+            }
+            CExpr::Var(nm) => {
+                if self.func_sigs.contains_key(nm) {
+                    if !self.defined_fns.contains(nm) {
+                        self.called_ext_fns.insert(nm.clone());
+                    }
+                    return format!("@{}", nm);
+                }
+                if let Some(gty) = self.globals.get(nm).cloned() {
+                    if let CType::Array(elem, n) = gty {
+                        let arr_lty = format!("[{} x {}]", n, self.llvm_ty(&elem));
+                        return format!(
+                            "getelementptr inbounds ({}, {}* @{}, i64 0, i64 0)",
+                            arr_lty, arr_lty, nm
+                        );
+                    }
+                    return format!("@{}", nm);
+                }
+                "null".to_string()
+            }
+            CExpr::Unary("&", inner) => {
+                if let CExpr::Var(nm) = inner.as_ref() {
+                    if self.func_sigs.contains_key(nm) {
+                        if !self.defined_fns.contains(nm) {
+                            self.called_ext_fns.insert(nm.clone());
+                        }
+                        return format!("@{}", nm);
+                    }
+                    if let Some(gty) = self.globals.get(nm).cloned() {
+                        let src_ptr_ty = format!("{}*", self.llvm_ty(&gty));
+                        let dst_lty = self.llvm_ty(dst_ty);
+                        if src_ptr_ty == dst_lty {
+                            return format!("@{}", nm);
+                        }
+                        return format!("bitcast ({} @{} to {})", src_ptr_ty, nm, dst_lty);
+                    }
+                }
+                "null".to_string()
+            }
+            CExpr::Binary(op @ ("+" | "-"), a, b) => {
+                if let Some(mut off) = self.eval_const_i64(b) {
+                    if *op == "-" {
+                        off = -off;
+                    }
+                    let base = self.format_const_ptr_expr(dst_ty, a);
+                    if base != "null" {
+                        if let CType::Ptr(elem) = dst_ty {
+                            let elty = if matches!(elem.as_ref(), CType::Void) {
+                                "i8".to_string()
+                            } else {
+                                self.llvm_ty(elem)
+                            };
+                            return format!(
+                                "getelementptr inbounds ({}, {}* {}, i64 {})",
+                                elty, elty, base, off
+                            );
+                        }
+                    }
+                }
+                "null".to_string()
+            }
+            CExpr::Cast(_, inner) => self.format_const_ptr_expr(dst_ty, inner),
+            _ => "null".to_string(),
         }
     }
 
@@ -3063,6 +3314,9 @@ impl CLlvmLowerer {
         body: &[CStmt],
     ) -> Result<String, String> {
         let mut allocas = String::new();
+        self.cur_allocas.clear();
+        self.vla_scopes.clear();
+        self.vla_scopes.push(Vec::new());
         let mut ir = String::new();
         let mut scopes: Vec<HashMap<String, LocalSlot>> = vec![HashMap::new()];
         let mut loop_stack: Vec<(String, String)> = Vec::new(); // (break_lbl, cont_lbl)
@@ -3104,6 +3358,7 @@ impl CLlvmLowerer {
         }
 
         if !terminated {
+            self.emit_free_all_vlas(&mut ir);
             if matches!(ret, CType::Void) {
                 let _ = writeln!(ir, "  ret void");
             } else {
@@ -3111,6 +3366,7 @@ impl CLlvmLowerer {
                 let _ = writeln!(ir, "  ret {} {}", self.llvm_ty(ret), z);
             }
         }
+        self.vla_scopes.clear();
 
         let linkage = if is_static { "internal " } else { "" };
         let mut out = String::new();
@@ -3124,9 +3380,40 @@ impl CLlvmLowerer {
         );
         let _ = writeln!(out, "entry:");
         out.push_str(&allocas);
+        out.push_str(&self.cur_allocas);
         out.push_str(&ir);
         let _ = writeln!(out, "}}");
         Ok(out)
+    }
+
+    fn emit_free_vla_list(&mut self, ptrs: &[String], ir: &mut String) {
+        if ptrs.is_empty() {
+            return;
+        }
+        self.ensure_stdlib_decl("free", CType::Void, vec![CType::Ptr(Box::new(CType::Void))]);
+        for p in ptrs.iter().rev() {
+            let _ = writeln!(ir, "  call void @free(i8* {})", p);
+        }
+    }
+
+    fn emit_free_all_vlas(&mut self, ir: &mut String) {
+        let all: Vec<String> = self
+            .vla_scopes
+            .iter()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
+        self.emit_free_vla_list(&all, ir);
+    }
+
+    fn ensure_stdlib_decl(&mut self, name: &str, ret: CType, params: Vec<CType>) {
+        if !self.defined_fns.contains(name) {
+            self.called_ext_fns.insert(name.to_string());
+            self.func_sigs.entry(name.to_string()).or_insert(CFuncSig {
+                ret,
+                params,
+                variadic: false,
+            });
+        }
     }
 
     fn zero_val(&self, ty: &CType) -> &'static str {
@@ -3173,6 +3460,26 @@ impl CLlvmLowerer {
                 *terminated = false;
                 return self.emit_stmt(inner, fn_ret, allocas, ir, scopes, loop_stack, terminated);
             }
+            CStmt::Case(v) => {
+                if let Some(lbl) = self.switch_cases.last().and_then(|m| m.get(v)).cloned() {
+                    if !*terminated {
+                        let _ = writeln!(ir, "  br label %{}", lbl);
+                    }
+                    let _ = writeln!(ir, "{}:", lbl);
+                    *terminated = false;
+                }
+                return Ok(());
+            }
+            CStmt::Default => {
+                if let Some(Some(lbl)) = self.switch_defaults.last().cloned() {
+                    if !*terminated {
+                        let _ = writeln!(ir, "  br label %{}", lbl);
+                    }
+                    let _ = writeln!(ir, "{}:", lbl);
+                    *terminated = false;
+                }
+                return Ok(());
+            }
             _ if *terminated => return Ok(()),
             _ => {}
         }
@@ -3181,8 +3488,13 @@ impl CLlvmLowerer {
             CStmt::Empty => {}
             CStmt::Block(stmts) => {
                 scopes.push(HashMap::new());
+                self.vla_scopes.push(Vec::new());
                 for s in stmts {
                     self.emit_stmt(s, fn_ret, allocas, ir, scopes, loop_stack, terminated)?;
+                }
+                let vla_ptrs = self.vla_scopes.pop().unwrap_or_default();
+                if !*terminated {
+                    self.emit_free_vla_list(&vla_ptrs, ir);
                 }
                 scopes.pop();
             }
@@ -3191,8 +3503,48 @@ impl CLlvmLowerer {
                 ty,
                 is_static,
                 init,
+                vla_len,
             } => {
-                if *is_static {
+                if let Some(len_expr) = vla_len {
+                    // C99 VLA: `T arr[n]` -> heap-backed dynamic allocation with RAII scope free
+                    let elem_ty = match ty {
+                        CType::Ptr(inner) => inner.as_ref().clone(),
+                        other => other.clone(),
+                    };
+                    let elem_sz = self.sizeof_type(&elem_ty).max(1);
+                    let (nv, nty) = self.emit_expr(len_expr, ir, scopes)?;
+                    let n64 = self.emit_cast(&nv, &nty, &CType::Int { bits: 64, signed: false }, ir);
+                    let bytes = self.next_tmp();
+                    let _ = writeln!(ir, "  {} = mul i64 {}, {}", bytes, n64, elem_sz);
+                    self.ensure_stdlib_decl(
+                        "malloc",
+                        CType::Ptr(Box::new(CType::Void)),
+                        vec![CType::Int { bits: 64, signed: false }],
+                    );
+                    let raw_ptr = self.next_tmp();
+                    let _ = writeln!(ir, "  {} = call i8* @malloc(i64 {})", raw_ptr, bytes);
+                    let lty = self.llvm_ty(ty);
+                    let typed_ptr = if lty == "i8*" {
+                        raw_ptr.clone()
+                    } else {
+                        let bc = self.next_tmp();
+                        let _ = writeln!(ir, "  {} = bitcast i8* {} to {}", bc, raw_ptr, lty);
+                        bc
+                    };
+                    let slot = self.next_tmp();
+                    let _ = writeln!(allocas, "  {} = alloca {}", slot, lty);
+                    let _ = writeln!(ir, "  store {} {}, {}* {}", lty, typed_ptr, lty, slot);
+                    if let Some(sc) = self.vla_scopes.last_mut() {
+                        sc.push(raw_ptr);
+                    }
+                    scopes.last_mut().unwrap().insert(
+                        name.clone(),
+                        LocalSlot {
+                            reg: slot,
+                            ty: ty.clone(),
+                        },
+                    );
+                } else if *is_static {
                     self.static_seq += 1;
                     let gname = format!("__omni_cstatic_{}_{}", self.static_seq, name);
                     let init_str = self.format_const_init(ty, init.as_ref());
@@ -3234,12 +3586,15 @@ impl CLlvmLowerer {
                     if let Some(e) = opt_e {
                         let _ = self.emit_expr(e, ir, scopes)?;
                     }
+                    self.emit_free_all_vlas(ir);
                     let _ = writeln!(ir, "  ret void");
                 } else if let Some(e) = opt_e {
                     let (v, vty) = self.emit_expr(e, ir, scopes)?;
                     let cv = self.emit_cast(&v, &vty, fn_ret, ir);
+                    self.emit_free_all_vlas(ir);
                     let _ = writeln!(ir, "  ret {} {}", self.llvm_ty(fn_ret), cv);
                 } else {
+                    self.emit_free_all_vlas(ir);
                     let _ = writeln!(ir, "  ret {} {}", self.llvm_ty(fn_ret), self.zero_val(fn_ret));
                 }
                 *terminated = true;
@@ -3362,50 +3717,32 @@ impl CLlvmLowerer {
                 let sv64 = self.emit_cast(&sv, &sty, &CType::Int { bits: 64, signed: true }, ir);
                 let l_end = self.next_lbl("sw_end");
                 let mut case_lbls: Vec<(i64, String)> = Vec::new();
+                let mut case_map: HashMap<i64, String> = HashMap::new();
                 let mut default_lbl: Option<String> = None;
 
-                // Pre-assign labels to top-level Case / Default entries in the switch body
-                let mut stmt_lbls: Vec<Option<String>> = Vec::with_capacity(body.len());
-                for s in body {
-                    match s {
-                        CStmt::Case(v) => {
-                            let l = self.next_lbl("sw_case");
-                            case_lbls.push((*v, l.clone()));
-                            stmt_lbls.push(Some(l));
-                        }
-                        CStmt::Default => {
-                            let l = self.next_lbl("sw_default");
-                            default_lbl = Some(l.clone());
-                            stmt_lbls.push(Some(l));
-                        }
-                        _ => stmt_lbls.push(None),
-                    }
-                }
-                let def_target = default_lbl.unwrap_or_else(|| l_end.clone());
+                // Recursively collect all Case / Default labels (supporting Duff's device & nested blocks!)
+                self.collect_switch_targets(body, &mut case_lbls, &mut case_map, &mut default_lbl);
+
+                let def_target = default_lbl.clone().unwrap_or_else(|| l_end.clone());
                 let _ = writeln!(ir, "  switch i64 {}, label %{} [", sv64, def_target);
                 for (v, l) in &case_lbls {
                     let _ = writeln!(ir, "    i64 {}, label %{}", v, l);
                 }
                 let _ = writeln!(ir, "  ]");
 
-                // Push switch break target (preserving enclosing loop's continue target if any)
                 let cont_target = loop_stack
                     .last()
                     .map(|(_, c)| c.clone())
                     .unwrap_or_else(|| l_end.clone());
                 loop_stack.push((l_end.clone(), cont_target));
+                self.switch_cases.push(case_map);
+                self.switch_defaults.push(default_lbl);
                 let mut cur_term = true;
-                for (s, lbl_opt) in body.iter().zip(stmt_lbls.into_iter()) {
-                    if let Some(l) = lbl_opt {
-                        if !cur_term {
-                            let _ = writeln!(ir, "  br label %{}", l);
-                        }
-                        let _ = writeln!(ir, "{}:", l);
-                        cur_term = false;
-                    } else {
-                        self.emit_stmt(s, fn_ret, allocas, ir, scopes, loop_stack, &mut cur_term)?;
-                    }
+                for s in body {
+                    self.emit_stmt(s, fn_ret, allocas, ir, scopes, loop_stack, &mut cur_term)?;
                 }
+                self.switch_cases.pop();
+                self.switch_defaults.pop();
                 loop_stack.pop();
                 if !cur_term {
                     let _ = writeln!(ir, "  br label %{}", l_end);
@@ -3413,7 +3750,7 @@ impl CLlvmLowerer {
                 let _ = writeln!(ir, "{}:", l_end);
                 *terminated = false;
             }
-            CStmt::Case(_) | CStmt::Default => {}
+            CStmt::Case(_) | CStmt::Default => unreachable!(),
             CStmt::Break => {
                 if let Some((brk, _)) = loop_stack.last() {
                     let _ = writeln!(ir, "  br label %{}", brk);
@@ -3513,6 +3850,212 @@ impl CLlvmLowerer {
         Ok(())
     }
 
+    fn collect_switch_targets(
+        &mut self,
+        stmts: &[CStmt],
+        case_lbls: &mut Vec<(i64, String)>,
+        case_map: &mut HashMap<i64, String>,
+        default_lbl: &mut Option<String>,
+    ) {
+        for s in stmts {
+            match s {
+                CStmt::Case(v) => {
+                    let l = self.next_lbl("sw_case");
+                    case_lbls.push((*v, l.clone()));
+                    case_map.insert(*v, l);
+                }
+                CStmt::Default => {
+                    let l = self.next_lbl("sw_default");
+                    *default_lbl = Some(l);
+                }
+                CStmt::Block(inner) => {
+                    self.collect_switch_targets(inner, case_lbls, case_map, default_lbl);
+                }
+                CStmt::If { then_s, else_s, .. } => {
+                    self.collect_switch_targets(std::slice::from_ref(then_s.as_ref()), case_lbls, case_map, default_lbl);
+                    if let Some(es) = else_s {
+                        self.collect_switch_targets(std::slice::from_ref(es.as_ref()), case_lbls, case_map, default_lbl);
+                    }
+                }
+                CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+                    self.collect_switch_targets(std::slice::from_ref(body.as_ref()), case_lbls, case_map, default_lbl);
+                }
+                CStmt::Label(_, inner) => {
+                    self.collect_switch_targets(std::slice::from_ref(inner.as_ref()), case_lbls, case_map, default_lbl);
+                }
+                // Do NOT descend into nested `Switch` (its cases belong to the inner switch)
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve_member_in_agg(
+        &mut self,
+        base_ptr: &str,
+        base_ty: &CType,
+        field: &str,
+        ir: &mut String,
+    ) -> Option<(String, CType)> {
+        match base_ty {
+            CType::Struct(nm) => {
+                let sd = self.structs.get(nm)?.clone();
+                if let Some((idx, (_, fty, _))) = sd.fields.iter().enumerate().find(|(_, (fnm, _, _))| fnm == field) {
+                    let gep = self.next_tmp();
+                    let _ = writeln!(
+                        ir,
+                        "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}",
+                        gep, nm, nm, base_ptr, idx
+                    );
+                    return Some((gep, fty.clone()));
+                }
+                // Search anonymous inner struct/union fields recursively
+                for (idx, (fnm, fty, _)) in sd.fields.iter().enumerate() {
+                    if fnm.is_empty() && matches!(fty, CType::Struct(_) | CType::Union(_)) {
+                        let mut sub_ir = String::new();
+                        let gep = self.next_tmp();
+                        let _ = writeln!(
+                            sub_ir,
+                            "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}",
+                            gep, nm, nm, base_ptr, idx
+                        );
+                        if let Some(found) = self.resolve_member_in_agg(&gep, fty, field, &mut sub_ir) {
+                            ir.push_str(&sub_ir);
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            CType::Union(nm) => {
+                let ud = self.unions.get(nm)?.clone();
+                if let Some((_, fty)) = ud.fields.iter().find(|(fnm, _)| fnm == field) {
+                    let cast = self.next_tmp();
+                    let flty = self.llvm_ty(fty);
+                    let _ = writeln!(
+                        ir,
+                        "  {} = bitcast %union.{}* {} to {}*",
+                        cast, nm, base_ptr, flty
+                    );
+                    return Some((cast, fty.clone()));
+                }
+                for (fnm, fty) in &ud.fields {
+                    if fnm.is_empty() && matches!(fty, CType::Struct(_) | CType::Union(_)) {
+                        let mut sub_ir = String::new();
+                        let cast = self.next_tmp();
+                        let flty = self.llvm_ty(fty);
+                        let _ = writeln!(
+                            sub_ir,
+                            "  {} = bitcast %union.{}* {} to {}*",
+                            cast, nm, base_ptr, flty
+                        );
+                        if let Some(found) = self.resolve_member_in_agg(&cast, fty, field, &mut sub_ir) {
+                            ir.push_str(&sub_ir);
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_bitfield_in_agg(
+        &mut self,
+        base_ptr: &str,
+        base_ty: &CType,
+        field: &str,
+        ir: &mut String,
+    ) -> Option<(String, CBitfieldInfo)> {
+        if let CType::Struct(nm) = base_ty {
+            let sd = self.structs.get(nm)?.clone();
+            if let Some(bf) = sd.bitfields.get(field).cloned() {
+                let gep = self.next_tmp();
+                let _ = writeln!(
+                    ir,
+                    "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}",
+                    gep, nm, nm, base_ptr, bf.storage_idx
+                );
+                return Some((gep, bf));
+            }
+        }
+        None
+    }
+
+    fn emit_bitfield_load(&mut self, storage_ptr: &str, bf: &CBitfieldInfo, ir: &mut String) -> (String, CType) {
+        let slty = self.llvm_ty(&bf.storage_ty);
+        let sbits = bf.storage_ty.int_bits();
+        let raw = self.next_tmp();
+        let _ = writeln!(ir, "  {} = load {}, {}* {}", raw, slty, slty, storage_ptr);
+        let shifted = if bf.bit_offset > 0 {
+            let t = self.next_tmp();
+            let _ = writeln!(ir, "  {} = lshr {} {}, {}", t, slty, raw, bf.bit_offset);
+            t
+        } else {
+            raw
+        };
+        let mask: u64 = if bf.bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bf.bit_width) - 1
+        };
+        let masked = self.next_tmp();
+        let _ = writeln!(ir, "  {} = and {} {}, {}", masked, slty, shifted, mask);
+        let extracted = if bf.logical_ty.is_signed() && bf.bit_width < sbits {
+            let sh = sbits - bf.bit_width;
+            let t1 = self.next_tmp();
+            let t2 = self.next_tmp();
+            let _ = writeln!(ir, "  {} = shl {} {}, {}", t1, slty, masked, sh);
+            let _ = writeln!(ir, "  {} = ashr {} {}, {}", t2, slty, t1, sh);
+            t2
+        } else {
+            masked
+        };
+        let out = self.emit_cast(&extracted, &bf.storage_ty, &bf.logical_ty, ir);
+        (out, bf.logical_ty.clone())
+    }
+
+    fn emit_bitfield_store(
+        &mut self,
+        storage_ptr: &str,
+        bf: &CBitfieldInfo,
+        val: &str,
+        val_ty: &CType,
+        ir: &mut String,
+    ) -> (String, CType) {
+        let slty = self.llvm_ty(&bf.storage_ty);
+        let mask: u64 = if bf.bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bf.bit_width) - 1
+        };
+        let clear_mask = !(mask.wrapping_shl(bf.bit_offset as u32));
+        let cur = self.next_tmp();
+        let _ = writeln!(ir, "  {} = load {}, {}* {}", cur, slty, slty, storage_ptr);
+        let cleared = self.next_tmp();
+        let clear_lit = if bf.storage_ty.int_bits() == 64 {
+            format!("{}", clear_mask as i64)
+        } else {
+            format!("{}", clear_mask as i32)
+        };
+        let _ = writeln!(ir, "  {} = and {} {}, {}", cleared, slty, cur, clear_lit);
+        let v_s = self.emit_cast(val, val_ty, &bf.storage_ty, ir);
+        let v_m = self.next_tmp();
+        let _ = writeln!(ir, "  {} = and {} {}, {}", v_m, slty, v_s, mask);
+        let v_sh = if bf.bit_offset > 0 {
+            let t = self.next_tmp();
+            let _ = writeln!(ir, "  {} = shl {} {}, {}", t, slty, v_m, bf.bit_offset);
+            t
+        } else {
+            v_m
+        };
+        let combined = self.next_tmp();
+        let _ = writeln!(ir, "  {} = or {} {}, {}", combined, slty, cleared, v_sh);
+        let _ = writeln!(ir, "  store {} {}, {}* {}", slty, combined, slty, storage_ptr);
+        let ret_v = self.emit_cast(val, val_ty, &bf.logical_ty, ir);
+        (ret_v, bf.logical_ty.clone())
+    }
+
     /// Computes the address (lvalue pointer) of an expression and its pointee `CType`.
     fn emit_lvalue(
         &mut self,
@@ -3569,6 +4112,13 @@ impl CLlvmLowerer {
                     _ => Err(format!("c_frontend: cannot index non-pointer type {:?}", bty)),
                 }
             }
+            CExpr::CompoundLit(ty, init) => {
+                let slot = self.next_tmp();
+                let lty = self.llvm_ty(ty);
+                let _ = writeln!(self.cur_allocas, "  {} = alloca {}", slot, lty);
+                self.emit_local_init(&slot, ty, init, ir, scopes)?;
+                Ok((slot, ty.clone()))
+            }
             CExpr::Member(base, field, is_arrow) => {
                 let (base_ptr, base_ty) = if *is_arrow {
                     let (pv, pty) = self.emit_expr(base, ir, scopes)?;
@@ -3579,49 +4129,8 @@ impl CLlvmLowerer {
                 } else {
                     self.emit_lvalue(base, ir, scopes)?
                 };
-                match base_ty {
-                    CType::Struct(nm) => {
-                        let sd = self
-                            .structs
-                            .get(&nm)
-                            .cloned()
-                            .ok_or_else(|| format!("c_frontend: unknown struct '{}'", nm))?;
-                        let (idx, (_, fty, _)) = sd
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (fnm, _, _))| fnm == field)
-                            .ok_or_else(|| format!("c_frontend: struct '{}' has no field '{}'", nm, field))?;
-                        let gep = self.next_tmp();
-                        let _ = writeln!(
-                            ir,
-                            "  {} = getelementptr inbounds %struct.{}, %struct.{}* {}, i32 0, i32 {}",
-                            gep, nm, nm, base_ptr, idx
-                        );
-                        Ok((gep, fty.clone()))
-                    }
-                    CType::Union(nm) => {
-                        let ud = self
-                            .unions
-                            .get(&nm)
-                            .cloned()
-                            .ok_or_else(|| format!("c_frontend: unknown union '{}'", nm))?;
-                        let (_, fty) = ud
-                            .fields
-                            .iter()
-                            .find(|(fnm, _)| fnm == field)
-                            .ok_or_else(|| format!("c_frontend: union '{}' has no field '{}'", nm, field))?;
-                        let cast = self.next_tmp();
-                        let flty = self.llvm_ty(fty);
-                        let _ = writeln!(
-                            ir,
-                            "  {} = bitcast %union.{}* {} to {}*",
-                            cast, nm, base_ptr, flty
-                        );
-                        Ok((cast, fty.clone()))
-                    }
-                    _ => Err(format!("c_frontend: member access on non-struct/union {:?}", base_ty)),
-                }
+                self.resolve_member_in_agg(&base_ptr, &base_ty, field, ir)
+                    .ok_or_else(|| format!("c_frontend: {:?} has no field '{}'", base_ty, field))
             }
             _ => Err(format!("c_frontend: expression is not an assignable lvalue: {:?}", expr)),
         }
@@ -3806,7 +4315,26 @@ impl CLlvmLowerer {
                 let _ = writeln!(ir, "  store {} {}, {}* {}", lty, next, lty, addr);
                 Ok((cur, ty))
             }
-            CExpr::Index(_, _) | CExpr::Member(_, _, _) => {
+            CExpr::CompoundLit(ty, init) => {
+                let slot = self.next_tmp();
+                let lty = self.llvm_ty(ty);
+                let _ = writeln!(self.cur_allocas, "  {} = alloca {}", slot, lty);
+                self.emit_local_init(&slot, ty, init, ir, scopes)?;
+                if let CType::Array(elem, n) = ty {
+                    let arr_lty = format!("[{} x {}]", n, self.llvm_ty(elem));
+                    let gep = self.next_tmp();
+                    let _ = writeln!(
+                        ir,
+                        "  {} = getelementptr inbounds {}, {}* {}, i64 0, i64 0",
+                        gep, arr_lty, arr_lty, slot
+                    );
+                    return Ok((gep, CType::Ptr(elem.clone())));
+                }
+                let tmp = self.next_tmp();
+                let _ = writeln!(ir, "  {} = load {}, {}* {}", tmp, lty, lty, slot);
+                Ok((tmp, ty.clone()))
+            }
+            CExpr::Index(_, _) => {
                 let (addr, ty) = self.emit_lvalue(expr, ir, scopes)?;
                 if let CType::Array(elem, n) = &ty {
                     let arr_lty = format!("[{} x {}]", n, self.llvm_ty(elem));
@@ -3823,8 +4351,86 @@ impl CLlvmLowerer {
                 let _ = writeln!(ir, "  {} = load {}, {}* {}", tmp, lty, lty, addr);
                 Ok((tmp, ty))
             }
+            CExpr::Member(base, field, is_arrow) => {
+                let (base_ptr, base_ty) = if *is_arrow {
+                    let (pv, pty) = self.emit_expr(base, ir, scopes)?;
+                    match pty {
+                        CType::Ptr(inner) => (pv, *inner),
+                        _ => return Err(format!("c_frontend: '->' requires pointer, got {:?}", pty)),
+                    }
+                } else {
+                    self.emit_lvalue(base, ir, scopes)?
+                };
+                if let Some((sptr, bf)) = self.resolve_bitfield_in_agg(&base_ptr, &base_ty, field, ir) {
+                    return Ok(self.emit_bitfield_load(&sptr, &bf, ir));
+                }
+                let (addr, ty) = self
+                    .resolve_member_in_agg(&base_ptr, &base_ty, field, ir)
+                    .ok_or_else(|| format!("c_frontend: {:?} has no field '{}'", base_ty, field))?;
+                if let CType::Array(elem, n) = &ty {
+                    let arr_lty = format!("[{} x {}]", n, self.llvm_ty(elem));
+                    let gep = self.next_tmp();
+                    let _ = writeln!(
+                        ir,
+                        "  {} = getelementptr inbounds {}, {}* {}, i64 0, i64 0",
+                        gep, arr_lty, arr_lty, addr
+                    );
+                    return Ok((gep, CType::Ptr(elem.clone())));
+                }
+                let tmp = self.next_tmp();
+                let lty = self.llvm_ty(&ty);
+                let _ = writeln!(ir, "  {} = load {}, {}* {}", tmp, lty, lty, addr);
+                Ok((tmp, ty))
+            }
             CExpr::Assign(op, lhs_e, rhs_e) => {
+                // Bitfield assignment support (`s.flags = 5`, `p->bits += 1`)
+                if let CExpr::Member(base, field, is_arrow) = lhs_e.as_ref() {
+                    let mut probe_ir = String::new();
+                    let (base_ptr, base_ty) = if *is_arrow {
+                        let (pv, pty) = self.emit_expr(base, &mut probe_ir, scopes)?;
+                        match pty {
+                            CType::Ptr(inner) => (pv, *inner),
+                            _ => return Err(format!("c_frontend: '->' requires pointer, got {:?}", pty)),
+                        }
+                    } else {
+                        self.emit_lvalue(base, &mut probe_ir, scopes)?
+                    };
+                    if let Some((sptr, bf)) = self.resolve_bitfield_in_agg(&base_ptr, &base_ty, field, &mut probe_ir) {
+                        ir.push_str(&probe_ir);
+                        let (rv, rty) = self.emit_expr(rhs_e, ir, scopes)?;
+                        let (new_v, new_ty) = if *op == "=" {
+                            (rv, rty)
+                        } else {
+                            let (cur_v, cur_ty) = self.emit_bitfield_load(&sptr, &bf, ir);
+                            let bin_op = &op[..op.len() - 1];
+                            self.emit_binary_vals(bin_op, &cur_v, &cur_ty, &rv, &rty, ir)?
+                        };
+                        return Ok(self.emit_bitfield_store(&sptr, &bf, &new_v, &new_ty, ir));
+                    }
+                }
                 let (addr, lty_c) = self.emit_lvalue(lhs_e, ir, scopes)?;
+                // Large struct/union copy assignment via `@memcpy`
+                if *op == "=" && matches!(lty_c, CType::Struct(_) | CType::Union(_)) && self.sizeof_type(&lty_c) > 16 {
+                    if let Ok((src_addr, _)) = self.emit_lvalue(rhs_e, ir, scopes) {
+                        let sz = self.sizeof_type(&lty_c);
+                        let lty = self.llvm_ty(&lty_c);
+                        let dst_i8 = self.next_tmp();
+                        let src_i8 = self.next_tmp();
+                        let _ = writeln!(ir, "  {} = bitcast {}* {} to i8*", dst_i8, lty, addr);
+                        let _ = writeln!(ir, "  {} = bitcast {}* {} to i8*", src_i8, lty, src_addr);
+                        self.ensure_stdlib_decl(
+                            "memcpy",
+                            CType::Ptr(Box::new(CType::Void)),
+                            vec![
+                                CType::Ptr(Box::new(CType::Void)),
+                                CType::Ptr(Box::new(CType::Void)),
+                                CType::Int { bits: 64, signed: false },
+                            ],
+                        );
+                        let _ = writeln!(ir, "  call i8* @memcpy(i8* {}, i8* {}, i64 {})", dst_i8, src_i8, sz);
+                        return Ok(("0".to_string(), CType::Void));
+                    }
+                }
                 let lty = self.llvm_ty(&lty_c);
                 let new_val = if *op == "=" {
                     let (rv, rty) = self.emit_expr(rhs_e, ir, scopes)?;

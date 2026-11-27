@@ -39,6 +39,7 @@ struct GlobalConst {
     name: String, // without leading `@`
     bytes: Vec<u8>,
     writable: bool,
+    relocs: Vec<(u32, String, i64)>, // (byte_offset, target_sym, byte_addend)
 }
 
 #[derive(Debug, Clone)]
@@ -290,25 +291,108 @@ fn parse_llvm_module(ir: &str, ptr_bytes: u32) -> Result<ParsedModule, VerifyErr
                             name: gname,
                             bytes: decode_llvm_c_string(raw_s),
                             writable,
+                            relocs: Vec::new(),
                         });
                     }
                 } else {
-                    // Scalar or zeroinitializer global: e.g. `@x = internal global i32 0, align 4`
+                    // Scalar, array, pointer, or zeroinitializer global
                     let after_kw = rhs
                         .split_once(" global ")
                         .or_else(|| rhs.split_once(" constant "))
                         .map(|(_, r)| r.trim())
                         .unwrap_or("i64 0");
-                    let head = after_kw.split(',').next().unwrap_or("i64 0").trim();
-                    let (ty_s, init_s) = head.split_once(' ').unwrap_or((head, "0"));
+                    // Strip trailing `, align N` only at top-level bracket/paren depth 0
+                    let head = {
+                        let mut depth = 0i32;
+                        let mut cut = after_kw.len();
+                        for (idx, ch) in after_kw.char_indices() {
+                            match ch {
+                                '[' | '(' | '{' => depth += 1,
+                                ']' | ')' | '}' => depth -= 1,
+                                ',' if depth == 0 => {
+                                    cut = idx;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        after_kw[..cut].trim()
+                    };
+                    // Split leading LLVM type from initializer at top-level space
+                    let (ty_s, init_s) = if head.starts_with('[') {
+                        if let Some(rb) = head.find(']') {
+                            (head[..=rb].trim(), head[rb + 1..].trim())
+                        } else {
+                            (head, "zeroinitializer")
+                        }
+                    } else if let Some(star_fn) = head.find(")*") {
+                        (head[..star_fn + 2].trim(), head[star_fn + 2..].trim())
+                    } else {
+                        head.split_once(' ').unwrap_or((head, "0"))
+                    };
                     let (sz, _) = llvm_type_size_align(ty_s.trim(), &structs, ptr_bytes);
                     let mut bytes = vec![0u8; sz.max(4) as usize];
-                    if let Ok(iv) = init_s.trim().parse::<i64>() {
+                    let mut relocs = Vec::new();
+                    let init_trim = init_s.trim();
+                    if ty_s.trim().starts_with('[') && init_trim.starts_with('[') && init_trim.ends_with(']') {
+                        // Array literal: `[ i32 10, i32 20, ... ]`
+                        let inner = &init_trim[1..init_trim.len() - 1];
+                        let mut byte_off = 0usize;
+                        for elem in split_top_level_commas(inner) {
+                            let et = elem.trim();
+                            if et.is_empty() {
+                                continue;
+                            }
+                            let (ety, eval) = et.split_once(' ').unwrap_or(("i32", et));
+                            let (esz, _) = llvm_type_size_align(ety.trim(), &structs, ptr_bytes);
+                            let esz_u = esz.max(1) as usize;
+                            if let Ok(iv) = eval.trim().parse::<i64>() {
+                                let le = iv.to_le_bytes();
+                                let n = esz_u.min(8).min(bytes.len().saturating_sub(byte_off));
+                                bytes[byte_off..byte_off + n].copy_from_slice(&le[..n]);
+                            }
+                            byte_off += esz_u;
+                        }
+                    } else if let Some(sym) = init_trim.strip_prefix('@') {
+                        // Direct symbol pointer: `@op_add` or `@g_var`
+                        let clean_sym = sym.split_whitespace().next().unwrap_or(sym).to_string();
+                        relocs.push((0, clean_sym, 0));
+                    } else if init_trim.starts_with("getelementptr") {
+                        // Constant GEP: `getelementptr inbounds (i32, i32* getelementptr inbounds ([4 x i32], [4 x i32]* @g_vals, i64 0, i64 0), i64 2)`
+                        if let Some(at_pos) = init_trim.find('@') {
+                            let after_at = &init_trim[at_pos + 1..];
+                            let sym: String = after_at
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                                .collect();
+                            // Extract outer element stride & trailing index if present
+                            let mut addend: i64 = 0;
+                            if let (Some(lp), Some(rp)) = (init_trim.find('('), init_trim.rfind(')')) {
+                                let outer_args = split_top_level_commas(&init_trim[lp + 1..rp]);
+                                if outer_args.len() >= 3 {
+                                    let outer_ty = outer_args[0].trim();
+                                    let last_idx = outer_args.last().unwrap().trim();
+                                    if let Some((_, idx_s)) = last_idx.split_once(' ') {
+                                        if let Ok(idx_v) = idx_s.trim().parse::<i64>() {
+                                            let (stride, _) = llvm_type_size_align(outer_ty, &structs, ptr_bytes);
+                                            addend = idx_v * (stride as i64);
+                                        }
+                                    }
+                                }
+                            }
+                            relocs.push((0, sym, addend));
+                        }
+                    } else if let Ok(iv) = init_trim.parse::<i64>() {
                         let le = iv.to_le_bytes();
                         let n = bytes.len().min(8);
                         bytes[..n].copy_from_slice(&le[..n]);
                     }
-                    globals.push(GlobalConst { name: gname, bytes, writable });
+                    globals.push(GlobalConst {
+                        name: gname,
+                        bytes,
+                        writable,
+                        relocs,
+                    });
                 }
             }
             continue;
@@ -995,7 +1079,8 @@ impl<'a, M: Module> LowerCtx<'a, M> {
 
             // `alloca <ty>[, align N]`
             if let Some(rest) = rhs.strip_prefix("alloca ") {
-                let ty_s = rest.split(',').next().unwrap_or("i64").trim();
+                let parts = split_top_level_commas(rest);
+                let ty_s = parts.first().copied().unwrap_or("i64").trim();
                 let (sz, align) = llvm_type_size_align(ty_s, &self.parsed.structs, self.ptr_bytes);
                 let align_shift = align.max(1).trailing_zeros().min(4) as u8;
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -1339,8 +1424,13 @@ impl<'a, M: Module> LowerCtx<'a, M> {
         let (ret_ty_s, callee_tok) = head
             .rsplit_once(' ')
             .ok_or_else(|| syntax_err(line_no, format!("Malformed call head: {}", call_str)))?;
-        // Strip variadic signature `(i8*, ...)` if present before `@printf`
-        let ret_ty_clean = ret_ty_s.split('(').next().unwrap_or(ret_ty_s).trim();
+        // Strip variadic signature `(i8*, ...)` if present before `@printf`,
+        // but preserve function-pointer return types like `i32 (i32, i32)*`!
+        let ret_ty_clean = if ret_ty_s.trim().ends_with('*') {
+            ret_ty_s.trim()
+        } else {
+            ret_ty_s.split('(').next().unwrap_or(ret_ty_s).trim()
+        };
         let ret_clif = llvm_type_to_clif(ret_ty_clean, self.ptr_ty);
 
         let mut arg_vals = Vec::new();
@@ -1482,16 +1572,11 @@ fn compile_into_module<M: Module>(
     let ptr_bytes = module.target_config().pointer_bytes() as u32;
     let call_conv = module.target_config().default_call_conv;
 
-    // 1. Declare & define all global string/byte constants & mutable globals
+    // 1. Pre-declare all global string/byte constants & mutable globals
     let mut data_ids: HashMap<String, DataId> = HashMap::new();
     for g in &parsed.globals {
         let did = module
             .declare_data(&g.name, Linkage::Local, g.writable, false)
-            .map_err(|e| VerifyError::LinkError(e.to_string()))?;
-        let mut dd = DataDescription::new();
-        dd.define(g.bytes.clone().into_boxed_slice());
-        module
-            .define_data(did, &dd)
             .map_err(|e| VerifyError::LinkError(e.to_string()))?;
         data_ids.insert(g.name.clone(), did);
     }
@@ -1586,6 +1671,25 @@ fn compile_into_module<M: Module>(
             .declare_function(&f.name, linkage, &sig)
             .map_err(|e| VerifyError::LinkError(e.to_string()))?;
         func_ids.insert(f.name.clone(), (fid, sig));
+    }
+
+    // 3b. Now define all global data objects (with data & function-pointer relocations resolved!)
+    for g in &parsed.globals {
+        let did = data_ids[&g.name];
+        let mut dd = DataDescription::new();
+        dd.define(g.bytes.clone().into_boxed_slice());
+        for (off, target_sym, addend) in &g.relocs {
+            if let Some(&target_did) = data_ids.get(target_sym) {
+                let gv = module.declare_data_in_data(target_did, &mut dd);
+                dd.write_data_addr(*off, gv, *addend);
+            } else if let Some(&(target_fid, _)) = func_ids.get(target_sym) {
+                let fv = module.declare_func_in_data(target_fid, &mut dd);
+                dd.write_function_addr(*off, fv);
+            }
+        }
+        module
+            .define_data(did, &dd)
+            .map_err(|e| VerifyError::LinkError(e.to_string()))?;
     }
 
     // 4. Lower and define each function body
