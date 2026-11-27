@@ -473,6 +473,27 @@ impl OmniParser {
             (p, None)
         };
         let p_trimmed = p_no_default.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        // Python/JS/Ruby variadic parameters: `**kwargs` (map) and `*args` / `...args` (slice)
+        if let Some(kw_rest) = p_trimmed.strip_prefix("**") {
+            let raw = kw_rest.split(':').next().unwrap_or(kw_rest).trim();
+            let name: String = raw.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+            return ParamDef {
+                name: if name.is_empty() { "kwargs".to_string() } else { name },
+                type_hint: Some("omni_kwargs".to_string()),
+                default_val: None,
+            };
+        }
+        if let Some(va_rest) = p_trimmed.strip_prefix('*').or_else(|| p_trimmed.strip_prefix("...")) {
+            let raw = va_rest.split(':').next().unwrap_or(va_rest).trim();
+            if !raw.is_empty() {
+                let name: String = raw.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+                return ParamDef {
+                    name: if name.is_empty() { "args".to_string() } else { name },
+                    type_hint: Some("omni_varargs".to_string()),
+                    default_val: None,
+                };
+            }
+        }
         if p_trimmed == "self" || p_trimmed == "this" {
             return ParamDef {
                 name: p_trimmed.to_string(),

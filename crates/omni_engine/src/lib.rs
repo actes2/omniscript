@@ -355,7 +355,7 @@ impl SsaContextEnvelope {
         }
         out.push_str("  <platform_abi>\n");
         out.push_str("    Full LLVM IR instruction set is active. You may emit standard 'declare' prototypes for external platform C ABI calls if not present in runtime declarations.\n");
-        out.push_str("    Core runtime intrinsics: i8* @__omni_input(i8* prompt), void @__omni_print_str(i8*), void @__omni_print_int(i64), i32 @getchar(), i32 @putchar(i32), @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), i8* @__omni_str_concat(i8*, i8*), i8* @__omni_int_to_str(i64).\n");
+        out.push_str("    Core runtime intrinsics: i8* @__omni_input(i8* prompt), void @__omni_print_str(i8*), void @__omni_print_int(i64), i32 @getchar(), i32 @putchar(i32), @__omni_slice_create(i64), @__omni_slice_append(i8*, i64), @__omni_slice_get(i8*, i64), @__omni_slice_len(i8*), @__omni_slice_print(i8*), i8* @__omni_map_to_json(i8*), void @__omni_map_print(i8*), @__omni_random_int(), @__omni_random_range(i64, i64), i8* @__omni_str_concat(i8*, i8*), i8* @__omni_int_to_str(i64).\n");
         if !available_syms.is_empty() {
             let joined = available_syms
                 .into_iter()

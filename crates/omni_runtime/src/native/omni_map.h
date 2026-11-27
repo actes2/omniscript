@@ -5,12 +5,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define OMNI_MAP_VAL_INT    0
+#define OMNI_MAP_VAL_STR    1
+#define OMNI_MAP_VAL_FLOAT  2
+#define OMNI_MAP_VAL_SLICE  3
+#define OMNI_MAP_VAL_MAP    4
+#define OMNI_MAP_VAL_BOOL   5
+#define OMNI_MAP_VAL_NULL   6
+
 typedef struct {
     char* key;
     int64_t val;
     uint64_t hash;
     bool occupied;
     bool deleted;
+    uint8_t val_kind;
 } OmniMapBucket;
 
 #define OMNI_MAP_MAGIC 0x4D4150214F4D4EFFULL
@@ -48,5 +57,21 @@ void __omni_map_set_int(OmniMap* map, int64_t key, int64_t val);
 int64_t __omni_map_get_int(OmniMap* map, int64_t key);
 bool __omni_map_contains_int(OmniMap* map, int64_t key);
 void __omni_map_delete_int(OmniMap* map, int64_t key);
+
+// Typed value storage & dynamic inspection/serialization helpers
+void __omni_map_set_typed(OmniMap* map, const char* key, int64_t val, int64_t kind);
+void __omni_map_set_int_typed(OmniMap* map, int64_t key, int64_t val, int64_t kind);
+int64_t __omni_map_get_kind(OmniMap* map, const char* key);
+int64_t __omni_map_get_int_kind(OmniMap* map, int64_t key);
+void __omni_map_print_val(OmniMap* map, const char* key);
+void __omni_map_print_int_val(OmniMap* map, int64_t key);
+void __omni_map_print(OmniMap* map);
+char* __omni_map_to_json(OmniMap* map);
+void* __omni_map_keys(OmniMap* map);
+void* __omni_map_values(OmniMap* map);
+int64_t __omni_map_get_or(OmniMap* map, const char* key, int64_t default_val);
+int64_t __omni_map_setdefault_typed(OmniMap* map, const char* key, int64_t default_val, int64_t kind);
+void __omni_map_update(OmniMap* dst, OmniMap* src);
+int64_t __omni_map_pop(OmniMap* map, const char* key, int64_t default_val);
 
 #endif // OMNI_MAP_H

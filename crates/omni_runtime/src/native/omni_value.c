@@ -209,6 +209,10 @@ void __omni_print_str_raw(const char* s) {
 }
 
 void __omni_print_int(int64_t v) {
+    if (v == -581005069656919553LL || v == -581005069656919554LL) {
+        puts("null");
+        return;
+    }
     printf("%lld\n", (long long)v);
 }
 

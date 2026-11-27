@@ -4615,6 +4615,7 @@ fn emit_collections_and_arenas(
     asm.end_function(base_vma)?;
 
     // `__omni_map_set(i8* m=r0, i8* key=r1, i64 val=r2:r3)`
+    asm.begin_function("__omni_map_set_typed");
     asm.begin_function("__omni_map_set");
     {
         asm.emit_push((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7), true);
@@ -4950,6 +4951,7 @@ fn emit_collections_and_arenas(
     asm.end_function(base_vma)?;
 
     // `__omni_map_set_int(i8* m=r0, i64 key=r2:r3, i64 val=[entry_sp+0..8])`
+    asm.begin_function("__omni_map_set_int_typed");
     asm.begin_function("__omni_map_set_int");
     {
         asm.emit_push((1 << 4) | (1 << 5) | (1 << 6), true); // 16 bytes pushed

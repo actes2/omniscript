@@ -180,6 +180,20 @@ declare void @__omni_map_set_int(i8*, i64, i64)
 declare i64 @__omni_map_get_int(i8*, i64)
 declare i1 @__omni_map_contains_int(i8*, i64)
 declare void @__omni_map_delete_int(i8*, i64)
+declare void @__omni_map_set_typed(i8*, i8*, i64, i64)
+declare void @__omni_map_set_int_typed(i8*, i64, i64, i64)
+declare i64 @__omni_map_get_kind(i8*, i8*)
+declare i64 @__omni_map_get_int_kind(i8*, i64)
+declare void @__omni_map_print_val(i8*, i8*)
+declare void @__omni_map_print_int_val(i8*, i64)
+declare void @__omni_map_print(i8*)
+declare i8* @__omni_map_to_json(i8*)
+declare i8* @__omni_map_keys(i8*)
+declare i8* @__omni_map_values(i8*)
+declare i64 @__omni_map_get_or(i8*, i8*, i64)
+declare i64 @__omni_map_setdefault_typed(i8*, i8*, i64, i64)
+declare void @__omni_map_update(i8*, i8*)
+declare i64 @__omni_map_pop(i8*, i8*, i64)
 
 ; Perceus Refcounting & Fat Closures (`{ fn_ptr, env_ptr }`)
 declare i8* @__omni_rc_retain(i8*)
@@ -356,6 +370,20 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         fn __omni_map_get_int(m: *mut u8, k: i64) -> i64;
         fn __omni_map_contains_int(m: *mut u8, k: i64) -> bool;
         fn __omni_map_delete_int(m: *mut u8, k: i64);
+        fn __omni_map_set_typed(m: *mut u8, k: *const i8, v: i64, kind: i64);
+        fn __omni_map_set_int_typed(m: *mut u8, k: i64, v: i64, kind: i64);
+        fn __omni_map_get_kind(m: *mut u8, k: *const i8) -> i64;
+        fn __omni_map_get_int_kind(m: *mut u8, k: i64) -> i64;
+        fn __omni_map_print_val(m: *mut u8, k: *const i8);
+        fn __omni_map_print_int_val(m: *mut u8, k: i64);
+        fn __omni_map_print(m: *mut u8);
+        fn __omni_map_to_json(m: *mut u8) -> *mut i8;
+        fn __omni_map_keys(m: *mut u8) -> *mut u8;
+        fn __omni_map_values(m: *mut u8) -> *mut u8;
+        fn __omni_map_get_or(m: *mut u8, k: *const i8, default_val: i64) -> i64;
+        fn __omni_map_setdefault_typed(m: *mut u8, k: *const i8, default_val: i64, kind: i64) -> i64;
+        fn __omni_map_update(dst: *mut u8, src: *mut u8);
+        fn __omni_map_pop(m: *mut u8, k: *const i8, default_val: i64) -> i64;
 
         fn __omni_rc_retain(p: *mut u8) -> *mut u8;
         fn __omni_rc_release(p: *mut u8);
@@ -505,6 +533,20 @@ pub fn jit_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         ("__omni_map_get_int", __omni_map_get_int as *const u8),
         ("__omni_map_contains_int", __omni_map_contains_int as *const u8),
         ("__omni_map_delete_int", __omni_map_delete_int as *const u8),
+        ("__omni_map_set_typed", __omni_map_set_typed as *const u8),
+        ("__omni_map_set_int_typed", __omni_map_set_int_typed as *const u8),
+        ("__omni_map_get_kind", __omni_map_get_kind as *const u8),
+        ("__omni_map_get_int_kind", __omni_map_get_int_kind as *const u8),
+        ("__omni_map_print_val", __omni_map_print_val as *const u8),
+        ("__omni_map_print_int_val", __omni_map_print_int_val as *const u8),
+        ("__omni_map_print", __omni_map_print as *const u8),
+        ("__omni_map_to_json", __omni_map_to_json as *const u8),
+        ("__omni_map_keys", __omni_map_keys as *const u8),
+        ("__omni_map_values", __omni_map_values as *const u8),
+        ("__omni_map_get_or", __omni_map_get_or as *const u8),
+        ("__omni_map_setdefault_typed", __omni_map_setdefault_typed as *const u8),
+        ("__omni_map_update", __omni_map_update as *const u8),
+        ("__omni_map_pop", __omni_map_pop as *const u8),
         ("__omni_rc_retain", __omni_rc_retain as *const u8),
         ("__omni_rc_release", __omni_rc_release as *const u8),
         ("__omni_closure_create", __omni_closure_create as *const u8),

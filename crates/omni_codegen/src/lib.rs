@@ -160,9 +160,16 @@ pub fn is_string_type_hint(type_hint: &str) -> bool {
         || STRING_HINT_SUBSTRINGS.iter().any(|tok| tl.contains(tok))
 }
 
+/// Universal bottom sentinels for untyped `i64` slots:
+/// - `OMNI_UNSET_SENTINEL`: caller omitted a parameter -> substitute default in callee prologue.
+/// - `OMNI_NULL_SENTINEL`: explicit `None` / `null` / `nil` / `undefined` in an `i64` slot,
+///   distinct from integer `0` and boolean `false`, yet falsy in `eval_cond`.
+pub const OMNI_UNSET_SENTINEL: i64 = -581005069656919554;
+pub const OMNI_NULL_SENTINEL: i64 = -581005069656919553;
+
 #[inline]
 fn is_null_literal(expr: &str) -> bool {
-    matches!(expr.trim(), "null" | "nil" | "None")
+    matches!(expr.trim(), "null" | "nil" | "None" | "undefined")
 }
 
 fn classify_type_token(tok: &str, class_fields: &HashMap<String, HashMap<String, usize>>) -> IrType {
@@ -400,6 +407,10 @@ pub struct ScopeTree {
     pub valid_extmod_prefixes: HashSet<String>,
     pub has_open_ns_import: bool,
     pub collection_elem_types: HashMap<String, String>,
+    /// Per-key static value types for heterogeneous maps: `(map_var, key_str) -> "str" | "f64" | "i64" | "slice" | "map"`.
+    pub map_key_types: HashMap<(String, String), String>,
+    /// `@property` method-backed attributes per class: `class_name -> { prop_method_name, ... }`.
+    pub class_properties: HashMap<String, HashSet<String>>,
     pub enum_variants: HashMap<String, (String, usize)>,
     pub known_functions: HashSet<String>,
     pub extern_fns: HashMap<String, (Vec<IrType>, Option<IrType>)>,
@@ -432,6 +443,8 @@ impl ScopeTree {
             valid_extmod_prefixes: HashSet::new(),
             has_open_ns_import: false,
             collection_elem_types: HashMap::new(),
+            map_key_types: HashMap::new(),
+            class_properties: HashMap::new(),
             enum_variants: HashMap::new(),
             known_functions: HashSet::new(),
             extern_fns: HashMap::new(),
@@ -753,7 +766,7 @@ impl ScopeTree {
                 && !matches!(
                     id.as_str(),
                     "let" | "mut" | "var" | "val" | "def" | "fn" | "func" | "return"
-                        | "true" | "false" | "True" | "False" | "None" | "null" | "nil"
+                        | "true" | "false" | "True" | "False" | "None" | "null" | "nil" | "undefined"
                         | "int" | "float" | "double" | "str" | "string" | "new" | "and" | "or" | "not"
                         | "len" | "ord" | "chr" | "list" | "make" | "range" | "print" | "byte" | "unsafe" | "Pointer"
                 )
@@ -1056,6 +1069,23 @@ impl<'a> CodeGenerator<'a> {
         (false, None)
     }
 
+    #[inline]
+    fn elem_tag_to_map_kind(tag: &str) -> i64 {
+        if tag.contains("omni_map") || tag == "map" {
+            4
+        } else if tag.contains("omni_slice") || tag == "slice" {
+            3
+        } else if tag == "str" || tag.contains("string") || tag == "i8*" {
+            1
+        } else if tag == "f64" || tag == "double" || tag == "float" {
+            2
+        } else if tag == "bool" || tag == "i1" {
+            5
+        } else {
+            0
+        }
+    }
+
     /// Coerces a raw 64-bit slot loaded from `@__omni_slice_get` / `@__omni_map_get` back into
     /// its preserved `TypedValue` (`F64` via `bitcast`, `StructPtr` / `Ptr` via `inttoptr`, or `I64`).
     fn unpack_raw_elem_bits(
@@ -1109,14 +1139,27 @@ impl<'a> CodeGenerator<'a> {
         temp_counter: &mut usize,
     ) -> Vec<String> {
         if let Some(pdefs) = param_defs_opt {
+            let varargs_idx = pdefs.iter().position(|p| p.type_hint.as_deref() == Some("omni_varargs"));
+            let kwargs_idx = pdefs.iter().position(|p| p.type_hint.as_deref() == Some("omni_kwargs"));
             let target_slots = pdefs.len().max(min_abi_slots);
             let alloc_slots = target_slots.max(raw_args.len());
             let mut slot_exprs: Vec<Option<String>> = vec![None; alloc_slots];
+            let mut extra_varargs: Vec<String> = Vec::new();
+            let mut extra_kwargs: Vec<(String, String)> = Vec::new();
+            let mut forwarded_kwargs: Vec<String> = Vec::new();
             let mut next_pos = 0usize;
 
             for a in raw_args {
                 let trimmed_a = a.trim();
+                // Forwarded `**map_expr` into `**kwargs`
+                if let Some(fw) = trimmed_a.strip_prefix("**") {
+                    if kwargs_idx.is_some() {
+                        forwarded_kwargs.push(fw.trim().to_string());
+                        continue;
+                    }
+                }
                 let mut matched_kw_idx = None;
+                let mut unmatched_kw: Option<(String, String)> = None;
                 let mut kw_rhs = "";
                 if !trimmed_a.starts_with('"') && !trimmed_a.starts_with('\'') {
                     if let Some((lhs, rhs)) = trimmed_a.split_once('=') {
@@ -1131,21 +1174,35 @@ impl<'a> CodeGenerator<'a> {
                             if let Some(p_idx) = pdefs.iter().position(|p| p.name == lhs_t) {
                                 matched_kw_idx = Some(p_idx);
                                 kw_rhs = rhs.trim();
+                            } else if kwargs_idx.is_some() {
+                                unmatched_kw = Some((lhs_t.to_string(), rhs.trim().to_string()));
                             }
                         }
                     }
                 }
 
-                if let Some(p_idx) = matched_kw_idx {
+                if let Some((k, v)) = unmatched_kw {
+                    extra_kwargs.push((k, v));
+                } else if let Some(p_idx) = matched_kw_idx {
                     if p_idx < slot_exprs.len() {
                         slot_exprs[p_idx] = Some(kw_rhs.to_string());
                     }
                 } else {
-                    while next_pos < slot_exprs.len() && slot_exprs[next_pos].is_some() {
+                    while next_pos < slot_exprs.len()
+                        && (slot_exprs[next_pos].is_some()
+                            || Some(next_pos) == varargs_idx
+                            || Some(next_pos) == kwargs_idx)
+                    {
                         next_pos += 1;
                     }
                     let clean = Self::strip_kwarg_prefix(trimmed_a);
-                    if next_pos < slot_exprs.len() {
+                    let pos_limit = varargs_idx.or(kwargs_idx).unwrap_or(slot_exprs.len());
+                    if next_pos < pos_limit {
+                        slot_exprs[next_pos] = Some(clean.to_string());
+                        next_pos += 1;
+                    } else if varargs_idx.is_some() {
+                        extra_varargs.push(clean.to_string());
+                    } else if next_pos < slot_exprs.len() {
                         slot_exprs[next_pos] = Some(clean.to_string());
                         next_pos += 1;
                     }
@@ -1166,22 +1223,106 @@ impl<'a> CodeGenerator<'a> {
             };
             let mut out = Vec::with_capacity(target_slots);
             for idx in 0..target_slots {
-                if let Some(ref expr_s) = slot_exprs[idx] {
-                    let mut tv = self.eval_typed(expr_s, ir, scope_tree, string_constants, temp_counter);
-                    if param_expects_f64(idx) && tv.ty != IrType::F64 {
-                        let fv = self.coerce_to_f64(tv, ir, temp_counter);
-                        tv = TypedValue { reg: fv, ty: IrType::F64 };
+                if Some(idx) == varargs_idx {
+                    let cap = extra_varargs.len().max(4);
+                    let sl = format!("%va_slice_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_slice_create(i64 {})\n", sl, cap));
+                    for va_e in &extra_varargs {
+                        let tv = self.eval_typed(va_e, ir, scope_tree, string_constants, temp_counter);
+                        let vbits = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
+                        ir.push_str(&format!("  call void @__omni_slice_append(i8* {}, i64 {})\n", sl, vbits));
                     }
-                    out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
+                    let sl_i64 = format!("%va_i64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", sl_i64, sl));
+                    out.push(sl_i64);
+                } else if Some(idx) == kwargs_idx {
+                    let cap = (extra_kwargs.len() + 4).max(8);
+                    let mp = format!("%kw_map_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = call i8* @__omni_map_create(i64 {})\n", mp, cap));
+                    for fw_e in &forwarded_kwargs {
+                        let fw_ptr = if let Some(fb) = scope_tree.resolve(fw_e.trim()).cloned() {
+                            if fb.type_hint.contains("omni_map") {
+                                let mld = format!("%kw_fw_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", mld, fb.llvm_ptr));
+                                mld
+                            } else {
+                                let fw_tv = self.eval_typed(fw_e, ir, scope_tree, string_constants, temp_counter);
+                                self.coerce_to_ptr(fw_tv, ir, temp_counter)
+                            }
+                        } else {
+                            let fw_tv = self.eval_typed(fw_e, ir, scope_tree, string_constants, temp_counter);
+                            self.coerce_to_ptr(fw_tv, ir, temp_counter)
+                        };
+                        ir.push_str(&format!("  call void @__omni_map_update(i8* {}, i8* {})\n", mp, fw_ptr));
+                    }
+                    for (k, v) in &extra_kwargs {
+                        let vtv = self.eval_typed(v, ir, scope_tree, string_constants, temp_counter);
+                        let vtag = Self::infer_elem_tag_from_expr(v, &vtv.ty, scope_tree);
+                        let vkind = Self::elem_tag_to_map_kind(&vtag);
+                        let vbits = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
+                        if let Some((cn, len)) = Self::find_string_constant(string_constants, k) {
+                            let kp = format!("%kw_k_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!(
+                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                kp, len, len, cn, mp, kp, vbits, vkind
+                            ));
+                        }
+                    }
+                    let mp_i64 = format!("%kw_i64_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = ptrtoint i8* {} to i64\n", mp_i64, mp));
+                    out.push(mp_i64);
+                } else if let Some(ref expr_s) = slot_exprs[idx] {
+                    let p_expects_ptr = pdefs.get(idx).and_then(|p| p.type_hint.as_deref()).map(|th| {
+                        let c = th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim();
+                        scope_tree.class_fields.contains_key(c)
+                            || is_string_type_hint(c)
+                            || c == "str"
+                            || c.contains("slice")
+                            || c.contains("list")
+                            || c.contains("map")
+                            || c.contains("dict")
+                            || c.contains("chan")
+                    }).unwrap_or(false);
+                    if is_null_literal(expr_s.trim()) && !p_expects_ptr && !param_expects_f64(idx) {
+                        out.push(OMNI_NULL_SENTINEL.to_string());
+                    } else {
+                        let mut tv = self.eval_typed(expr_s, ir, scope_tree, string_constants, temp_counter);
+                        if param_expects_f64(idx) && tv.ty != IrType::F64 {
+                            let fv = self.coerce_to_f64(tv, ir, temp_counter);
+                            tv = TypedValue { reg: fv, ty: IrType::F64 };
+                        }
+                        out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
+                    }
                 } else if let Some(def_s) = pdefs.get(idx).and_then(|p| p.default_val.as_ref()) {
-                    let mut tv = self.eval_typed(def_s.trim(), ir, scope_tree, string_constants, temp_counter);
-                    if param_expects_f64(idx) && tv.ty != IrType::F64 {
-                        let fv = self.coerce_to_f64(tv, ir, temp_counter);
-                        tv = TypedValue { reg: fv, ty: IrType::F64 };
+                    let p_expects_ptr = pdefs.get(idx).and_then(|p| p.type_hint.as_deref()).map(|th| {
+                        let c = th.trim().trim_start_matches('*').trim_start_matches('&').trim_end_matches('*').trim();
+                        scope_tree.class_fields.contains_key(c)
+                            || is_string_type_hint(c)
+                            || c == "str"
+                            || c.contains("slice")
+                            || c.contains("list")
+                            || c.contains("map")
+                            || c.contains("dict")
+                            || c.contains("chan")
+                    }).unwrap_or(false);
+                    if is_null_literal(def_s.trim()) && !p_expects_ptr && !param_expects_f64(idx) {
+                        out.push(OMNI_NULL_SENTINEL.to_string());
+                    } else {
+                        let mut tv = self.eval_typed(def_s.trim(), ir, scope_tree, string_constants, temp_counter);
+                        if param_expects_f64(idx) && tv.ty != IrType::F64 {
+                            let fv = self.coerce_to_f64(tv, ir, temp_counter);
+                            tv = TypedValue { reg: fv, ty: IrType::F64 };
+                        }
+                        out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
                     }
-                    out.push(self.coerce_to_raw_i64_bits(tv, ir, temp_counter));
                 } else {
-                    out.push("-581005069656919554".to_string());
+                    out.push(OMNI_UNSET_SENTINEL.to_string());
                 }
             }
             out
@@ -1567,6 +1708,7 @@ impl<'a> CodeGenerator<'a> {
         inner_scope.class_field_types = outer_scope.class_field_types.clone();
         inner_scope.class_field_order = outer_scope.class_field_order.clone();
         inner_scope.class_decorators = outer_scope.class_decorators.clone();
+        inner_scope.class_properties = outer_scope.class_properties.clone();
         inner_scope.class_type_ids = outer_scope.class_type_ids.clone();
         inner_scope.c_module_aliases = outer_scope.c_module_aliases.clone();
         inner_scope.valid_extmod_prefixes = outer_scope.valid_extmod_prefixes.clone();
@@ -2801,6 +2943,34 @@ impl<'a> CodeGenerator<'a> {
                         }
                         i += 1;
                     }
+                } else if chars[i] == '.' && i + 1 < chars.len() && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] != '(' || j == chars.len() {
+                        let prop: String = chars[start..j].iter().collect();
+                        CodeGenerator::intern_string(string_constants, counter, &prop);
+                    }
+                } else if chars[i] == '='
+                    && i > 0
+                    && (i + 1 >= chars.len() || chars[i + 1] != '=')
+                    && !matches!(chars[i - 1], '=' | '!' | '<' | '>' | '+' | '-' | '*' | '/' | ':' | '&' | '|' | '^')
+                {
+                    // Intern keyword argument names (`timeout=5`) for `**kwargs` map packing
+                    let mut end = i;
+                    while end > 0 && chars[end - 1].is_whitespace() {
+                        end -= 1;
+                    }
+                    let mut start = end;
+                    while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || chars[start - 1] == '_') {
+                        start -= 1;
+                    }
+                    if start < end && (chars[start].is_ascii_alphabetic() || chars[start] == '_') {
+                        let kw: String = chars[start..end].iter().collect();
+                        CodeGenerator::intern_string(string_constants, counter, &kw);
+                    }
                 }
                 i += 1;
             }
@@ -2839,8 +3009,16 @@ impl<'a> CodeGenerator<'a> {
                     scan_text(index_expr, string_constants, counter);
                     scan_text(val_expr, string_constants, counter);
                 }
-                Statement::Assign { expr, .. }
-                | Statement::TupleUnpack { expr, .. }
+                Statement::Assign { target, expr, .. } => {
+                    if let Some((_, prop)) = target.split_once('.') {
+                        let p = prop.trim();
+                        if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            scan_text(&format!("\"{}\"", p), string_constants, counter);
+                        }
+                    }
+                    scan_text(expr, string_constants, counter);
+                }
+                Statement::TupleUnpack { expr, .. }
                 | Statement::ListAppend { expr, .. }
                 | Statement::ChanSend { expr, .. } => {
                     scan_text(expr, string_constants, counter);
@@ -3323,6 +3501,24 @@ impl<'a> CodeGenerator<'a> {
                 tern_ptr, cond_v, tr_p, fa_p
             ));
             return tern_ptr;
+        }
+
+        // Universal `repr(x)` in string context: maps -> JSON representation, others -> eval_str_ptr
+        if trimmed.starts_with("repr(") && trimmed.ends_with(')') && !scope_tree.known_functions.contains("repr") {
+            let inner = trimmed[5..trimmed.len() - 1].trim();
+            if let Some(b) = scope_tree.resolve(inner) {
+                if b.type_hint.contains("omni_map") {
+                    let ld = format!("%repr_m_{}", *temp_counter);
+                    let js = format!("%repr_js_{}", *temp_counter);
+                    *temp_counter += 2;
+                    ir.push_str(&format!(
+                        "  {} = load i8*, i8** {}\n  {} = call i8* @__omni_map_to_json(i8* {})\n",
+                        ld, b.llvm_ptr, js, ld
+                    ));
+                    return js;
+                }
+            }
+            return self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
         }
 
         // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
@@ -4065,14 +4261,16 @@ impl<'a> CodeGenerator<'a> {
                                 let ks = args[0].value.slice(full_expr).trim();
                                 let vs = args[1].value.slice(full_expr).trim();
                                 let vtv = self.eval_typed(vs, ir, scope_tree, string_constants, temp_counter);
+                                let vtag = Self::infer_elem_tag_from_expr(vs, &vtv.ty, scope_tree);
+                                let vkind = Self::elem_tag_to_map_kind(&vtag);
                                 let v64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
                                 if Self::is_string_expr(ks, scope_tree) {
                                     let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
-                                    ir.push_str(&format!("  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n", ld, kp, v64));
+                                    ir.push_str(&format!("  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n", ld, kp, v64, vkind));
                                 } else {
                                     let ktv = self.eval_typed(ks, ir, scope_tree, string_constants, temp_counter);
                                     let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
-                                    ir.push_str(&format!("  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n", ld, k64, v64));
+                                    ir.push_str(&format!("  call void @__omni_map_set_int_typed(i8* {}, i64 {}, i64 {}, i64 {})\n", ld, k64, v64, vkind));
                                 }
                                 return Some(TypedValue { reg: "0".to_string(), ty: IrType::I64 });
                             }
@@ -4082,7 +4280,21 @@ impl<'a> CodeGenerator<'a> {
                                 *temp_counter += 2;
                                 ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
                                 let ks = args[0].value.slice(full_expr).trim();
-                                if Self::is_string_expr(ks, scope_tree) {
+                                let mut per_key_tag: Option<String> = None;
+                                if (ks.starts_with('"') && ks.ends_with('"')) || (ks.starts_with('\'') && ks.ends_with('\'')) {
+                                    let kt = &ks[1..ks.len() - 1];
+                                    per_key_tag = scope_tree.map_key_types.get(&(target_s.to_string(), kt.to_string())).cloned();
+                                }
+                                if args.len() == 2 && Self::is_string_expr(ks, scope_tree) {
+                                    let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
+                                    let ds = args[1].value.slice(full_expr).trim();
+                                    let dtv = self.eval_typed(ds, ir, scope_tree, string_constants, temp_counter);
+                                    let dtag = Self::infer_elem_tag_from_expr(ds, &dtv.ty, scope_tree);
+                                    let d64 = self.coerce_to_raw_i64_bits(dtv, ir, temp_counter);
+                                    ir.push_str(&format!("  {} = call i64 @__omni_map_get_or(i8* {}, i8* {}, i64 {})\n", r, ld, kp, d64));
+                                    let etag = per_key_tag.as_deref().or(Some(dtag.as_str()));
+                                    return Some(Self::unpack_raw_elem_bits(r, etag, ir, temp_counter));
+                                } else if Self::is_string_expr(ks, scope_tree) {
                                     let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
                                     ir.push_str(&format!("  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n", r, ld, kp));
                                 } else {
@@ -4090,6 +4302,79 @@ impl<'a> CodeGenerator<'a> {
                                     let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
                                     ir.push_str(&format!("  {} = call i64 @__omni_map_get_int(i8* {}, i64 {})\n", r, ld, k64));
                                 }
+                                let etag = per_key_tag.as_deref().or_else(|| scope_tree.collection_elem_types.get(target_s).map(|s| s.as_str()));
+                                return Some(Self::unpack_raw_elem_bits(r, etag, ir, temp_counter));
+                            }
+                            "keys" if args.is_empty() => {
+                                let ld = format!("%abd_mp_ld_{}", *temp_counter);
+                                let r = format!("%abd_mp_keys_{}", *temp_counter);
+                                *temp_counter += 2;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n  {} = call i8* @__omni_map_keys(i8* {})\n  call void @__omni_c_return_ptr(i8* {})\n", ld, b.llvm_ptr, r, ld, r));
+                                return Some(TypedValue { reg: r, ty: IrType::Ptr });
+                            }
+                            "values" if args.is_empty() => {
+                                let ld = format!("%abd_mp_ld_{}", *temp_counter);
+                                let r = format!("%abd_mp_vals_{}", *temp_counter);
+                                *temp_counter += 2;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n  {} = call i8* @__omni_map_values(i8* {})\n  call void @__omni_c_return_ptr(i8* {})\n", ld, b.llvm_ptr, r, ld, r));
+                                return Some(TypedValue { reg: r, ty: IrType::Ptr });
+                            }
+                            "update" if args.len() == 1 => {
+                                let ld = format!("%abd_mp_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                let other_s = args[0].value.slice(full_expr).trim();
+                                let optr = if let Some(ob) = scope_tree.resolve(other_s).cloned() {
+                                    if ob.type_hint.contains("omni_map") {
+                                        let old = format!("%abd_mp_oth_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", old, ob.llvm_ptr));
+                                        old
+                                    } else {
+                                        let otv = self.eval_typed(other_s, ir, scope_tree, string_constants, temp_counter);
+                                        self.coerce_to_ptr(otv, ir, temp_counter)
+                                    }
+                                } else {
+                                    let otv = self.eval_typed(other_s, ir, scope_tree, string_constants, temp_counter);
+                                    self.coerce_to_ptr(otv, ir, temp_counter)
+                                };
+                                ir.push_str(&format!("  call void @__omni_map_update(i8* {}, i8* {})\n", ld, optr));
+                                return Some(TypedValue { reg: "0".to_string(), ty: IrType::I64 });
+                            }
+                            "setdefault" if !args.is_empty() && args.len() <= 2 => {
+                                let ld = format!("%abd_mp_ld_{}", *temp_counter);
+                                let r = format!("%abd_mp_sd_{}", *temp_counter);
+                                *temp_counter += 2;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                let ks = args[0].value.slice(full_expr).trim();
+                                let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
+                                let (d64, dkind, dtag) = if args.len() == 2 {
+                                    let ds = args[1].value.slice(full_expr).trim();
+                                    let dtv = self.eval_typed(ds, ir, scope_tree, string_constants, temp_counter);
+                                    let tag = Self::infer_elem_tag_from_expr(ds, &dtv.ty, scope_tree);
+                                    let k = Self::elem_tag_to_map_kind(&tag);
+                                    (self.coerce_to_raw_i64_bits(dtv, ir, temp_counter), k, tag)
+                                } else {
+                                    ("0".to_string(), 0, "i64".to_string())
+                                };
+                                ir.push_str(&format!("  {} = call i64 @__omni_map_setdefault_typed(i8* {}, i8* {}, i64 {}, i64 {})\n", r, ld, kp, d64, dkind));
+                                return Some(Self::unpack_raw_elem_bits(r, Some(dtag.as_str()), ir, temp_counter));
+                            }
+                            "pop" if !args.is_empty() && args.len() <= 2 => {
+                                let ld = format!("%abd_mp_ld_{}", *temp_counter);
+                                let r = format!("%abd_mp_pop_{}", *temp_counter);
+                                *temp_counter += 2;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                let ks = args[0].value.slice(full_expr).trim();
+                                let kp = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
+                                let d64 = if args.len() == 2 {
+                                    let ds = args[1].value.slice(full_expr).trim();
+                                    let dtv = self.eval_typed(ds, ir, scope_tree, string_constants, temp_counter);
+                                    self.coerce_to_raw_i64_bits(dtv, ir, temp_counter)
+                                } else {
+                                    "0".to_string()
+                                };
+                                ir.push_str(&format!("  {} = call i64 @__omni_map_pop(i8* {}, i8* {}, i64 {})\n", r, ld, kp, d64));
                                 let etag = scope_tree.collection_elem_types.get(target_s).map(|s| s.as_str());
                                 return Some(Self::unpack_raw_elem_bits(r, etag, ir, temp_counter));
                             }
@@ -4635,17 +4920,19 @@ impl<'a> CodeGenerator<'a> {
                         let ks = k.slice(trimmed);
                         let vs = v.slice(trimmed);
                         let vtv = self.eval_typed(vs, ir, scope_tree, string_constants, temp_counter);
+                        let vtag = Self::infer_elem_tag_from_expr(vs, &vtv.ty, scope_tree);
+                        let vkind = Self::elem_tag_to_map_kind(&vtag);
                         let vbits = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
                         if Self::is_string_expr(ks, scope_tree)
                             || (ks.starts_with('"') && ks.ends_with('"'))
                             || (ks.starts_with('\'') && ks.ends_with('\''))
                         {
                             let kptr = self.eval_str_ptr(ks, ir, scope_tree, string_constants, temp_counter);
-                            ir.push_str(&format!("  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n", map_res, kptr, vbits));
+                            ir.push_str(&format!("  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n", map_res, kptr, vbits, vkind));
                         } else {
                             let ktv = self.eval_typed(ks, ir, scope_tree, string_constants, temp_counter);
                             let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
-                            ir.push_str(&format!("  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n", map_res, k64, vbits));
+                            ir.push_str(&format!("  call void @__omni_map_set_int_typed(i8* {}, i64 {}, i64 {}, i64 {})\n", map_res, k64, vbits, vkind));
                         }
                     }
                     ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", map_res));
@@ -4691,10 +4978,15 @@ impl<'a> CodeGenerator<'a> {
                         if is_map {
                             let val_res = format!("%map_get_{}", *temp_counter);
                             *temp_counter += 1;
+                            let mut per_key_tag: Option<String> = None;
                             if (idx_expr.starts_with('"') && idx_expr.ends_with('"'))
                                 || (idx_expr.starts_with('\'') && idx_expr.ends_with('\''))
                             {
                                 let text = &idx_expr[1..idx_expr.len() - 1];
+                                per_key_tag = scope_tree
+                                    .map_key_types
+                                    .get(&(target_s.to_string(), text.to_string()))
+                                    .cloned();
                                 if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
                                     let str_ptr = format!("%str_ptr_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -4726,7 +5018,8 @@ impl<'a> CodeGenerator<'a> {
                                     val_res, loaded, idx_64
                                 ));
                             }
-                            return Self::unpack_raw_elem_bits(val_res, elem_tag.as_deref(), ir, temp_counter);
+                            let eff_tag = per_key_tag.as_deref().or(elem_tag.as_deref());
+                            return Self::unpack_raw_elem_bits(val_res, eff_tag, ir, temp_counter);
                         } else {
                             let idx_tv = self.eval_typed(idx_expr, ir, scope_tree, string_constants, temp_counter);
                             let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
@@ -4881,6 +5174,84 @@ impl<'a> CodeGenerator<'a> {
                             }
                         }
                     }
+                    // `@property` method-backed attribute access on class instances: `obj.prop` -> `__omni_method_C_prop(obj)`
+                    if !has_struct_field {
+                        if let Some(b) = scope_tree.resolve(target_s) {
+                            if b.type_hint.starts_with("%struct.") {
+                                let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                                if scope_tree.class_properties.get(cls).map(|s| s.contains(field)).unwrap_or(false) {
+                                    let def_cls = scope_tree
+                                        .method_defining_class
+                                        .get(&(cls.to_string(), field.clone()))
+                                        .map(|s| s.as_str())
+                                        .unwrap_or(cls);
+                                    let sld = format!("%prop_self_{}", *temp_counter);
+                                    let sraw = format!("%prop_sraw_{}", *temp_counter);
+                                    let ret64 = format!("%prop_ret_{}", *temp_counter);
+                                    *temp_counter += 3;
+                                    ir.push_str(&format!(
+                                        "  {} = load %struct.{}*, %struct.{}** {}\n  {} = bitcast %struct.{}* {} to i8*\n  {} = call i64 @__omni_method_{}_{}(i8* {}, i64 0, i64 0, i64 0, i64 0, i64 0)\n",
+                                        sld, cls, cls, b.llvm_ptr, sraw, cls, sld, ret64, def_cls, field, sraw
+                                    ));
+                                    let m_ret = scope_tree
+                                        .method_return_types
+                                        .get(&(cls.to_string(), field.clone()))
+                                        .cloned()
+                                        .unwrap_or(IrType::I64);
+                                    return match m_ret {
+                                        IrType::F64 => {
+                                            let f = format!("%prop_f64_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = bitcast i64 {} to double\n", f, ret64));
+                                            TypedValue { reg: f, ty: IrType::F64 }
+                                        }
+                                        IrType::Ptr => {
+                                            let p = format!("%prop_ptr_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = inttoptr i64 {} to i8*\n  call void @__omni_c_return_ptr(i8* {})\n", p, ret64, p));
+                                            TypedValue { reg: p, ty: IrType::Ptr }
+                                        }
+                                        _ => TypedValue { reg: ret64, ty: IrType::I64 },
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    // JS/Lua/Python-style property access on maps: `foo.name` -> `foo["name"]`
+                    if !has_struct_field {
+                        if let Some(b) = scope_tree.resolve(target_s) {
+                            if b.type_hint.contains("omni_map") {
+                                let ld = format!("%map_prop_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                                let val_res = format!("%map_prop_get_{}", *temp_counter);
+                                *temp_counter += 1;
+                                if let Some((const_name, len)) = Self::find_string_constant(string_constants, field) {
+                                    let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                                    *temp_counter += 1;
+                                    ir.push_str(&format!(
+                                        "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                        str_ptr, len, len, const_name
+                                    ));
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_map_get(i8* {}, i8* {})\n",
+                                        val_res, ld, str_ptr
+                                    ));
+                                } else {
+                                    ir.push_str(&format!(
+                                        "  {} = call i64 @__omni_map_get(i8* {}, i8* null)\n",
+                                        val_res, ld
+                                    ));
+                                }
+                                let per_key = scope_tree
+                                    .map_key_types
+                                    .get(&(target_s.to_string(), field.clone()))
+                                    .map(|s| s.as_str())
+                                    .or_else(|| scope_tree.collection_elem_types.get(target_s).map(|s| s.as_str()));
+                                return Self::unpack_raw_elem_bits(val_res, per_key, ir, temp_counter);
+                            }
+                        }
+                    }
                     if !matches!(target.node, ExprAst::Ident(_)) {
                         let target_tv = self.eval_typed(target_s, ir, scope_tree, string_constants, temp_counter);
                         if let IrType::StructPtr(cls_name) = target_tv.ty {
@@ -4987,6 +5358,118 @@ impl<'a> CodeGenerator<'a> {
                 tern_reg, cond_v, tr_i, fa_i
             ));
             return TypedValue { reg: tern_reg, ty: IrType::I64 };
+        }
+
+        // Universal formatting & introspection builtins: `repr(x)`, `isinstance(x, T)`, `hasattr(o, k)`, `getattr(o, k[, default])`
+        if trimmed.starts_with("repr(") && trimmed.ends_with(')') && !scope_tree.known_functions.contains("repr") {
+            let inner = trimmed[5..trimmed.len() - 1].trim();
+            if let Some(b) = scope_tree.resolve(inner) {
+                if b.type_hint.contains("omni_map") {
+                    let ld = format!("%repr_m_{}", *temp_counter);
+                    let js = format!("%repr_js_{}", *temp_counter);
+                    *temp_counter += 2;
+                    ir.push_str(&format!(
+                        "  {} = load i8*, i8** {}\n  {} = call i8* @__omni_map_to_json(i8* {})\n  call void @__omni_c_return_ptr(i8* {})\n",
+                        ld, b.llvm_ptr, js, ld, js
+                    ));
+                    return TypedValue { reg: js, ty: IrType::Ptr };
+                }
+            }
+            let sp = self.eval_str_ptr(inner, ir, scope_tree, string_constants, temp_counter);
+            ir.push_str(&format!("  call void @__omni_c_return_ptr(i8* {})\n", sp));
+            return TypedValue { reg: sp, ty: IrType::Ptr };
+        }
+        if trimmed.starts_with("isinstance(") && trimmed.ends_with(')') && !scope_tree.known_functions.contains("isinstance") {
+            let inner = trimmed[11..trimmed.len() - 1].trim();
+            let parts = OmniParser::split_respecting_quotes(inner, ',');
+            if parts.len() == 2 {
+                let obj_s = parts[0].trim();
+                let ty_s = parts[1].trim().trim_matches(|c| c == '(' || c == ')');
+                let obj_hint = scope_tree.resolve(obj_s).map(|b| b.type_hint.clone()).unwrap_or_default();
+                let obj_is_str = Self::is_string_expr(obj_s, scope_tree) || is_string_type_hint(&obj_hint);
+                let obj_is_map = obj_hint.contains("omni_map");
+                let obj_is_slice = obj_hint.contains("omni_slice");
+                let obj_is_float = is_float_type_hint(&obj_hint) || parse_polyglot_f64(obj_s).is_some();
+                let obj_cls = obj_hint.strip_prefix("%struct.").map(|s| s.trim_end_matches('*'));
+                let matched = ty_s.split(',').any(|t| {
+                    let tc = t.trim();
+                    match tc {
+                        "dict" | "map" | "Map" => obj_is_map,
+                        "list" | "tuple" | "slice" | "Array" => obj_is_slice,
+                        "str" | "string" | "String" | "bytes" => obj_is_str && !obj_is_map && !obj_is_slice,
+                        "float" | "double" | "f64" | "f32" => obj_is_float,
+                        "int" | "i64" | "i32" | "bool" => !obj_is_str && !obj_is_map && !obj_is_slice && !obj_is_float && obj_cls.is_none(),
+                        other => obj_cls == Some(other),
+                    }
+                });
+                return TypedValue { reg: if matched { "1" } else { "0" }.to_string(), ty: IrType::I64 };
+            }
+        }
+        if trimmed.starts_with("hasattr(") && trimmed.ends_with(')') && !scope_tree.known_functions.contains("hasattr") {
+            let inner = trimmed[8..trimmed.len() - 1].trim();
+            let parts = OmniParser::split_respecting_quotes(inner, ',');
+            if parts.len() == 2 {
+                let obj_s = parts[0].trim();
+                let attr_s = parts[1].trim();
+                if let Some(b) = scope_tree.resolve(obj_s) {
+                    if b.type_hint.contains("omni_map") {
+                        let ld = format!("%ha_ld_{}", *temp_counter);
+                        let r1 = format!("%ha_r1_{}", *temp_counter);
+                        let r64 = format!("%ha_r64_{}", *temp_counter);
+                        *temp_counter += 3;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                        let kp = self.eval_str_ptr(attr_s, ir, scope_tree, string_constants, temp_counter);
+                        ir.push_str(&format!("  {} = call i1 @__omni_map_contains(i8* {}, i8* {})\n  {} = zext i1 {} to i64\n", r1, ld, kp, r64, r1));
+                        return TypedValue { reg: r64, ty: IrType::I64 };
+                    }
+                    if b.type_hint.starts_with("%struct.") {
+                        let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        let aname = attr_s.trim_matches('"').trim_matches('\'');
+                        let exists = scope_tree.class_fields.get(cls).map(|m| m.contains_key(aname)).unwrap_or(false)
+                            || scope_tree.class_properties.get(cls).map(|s| s.contains(aname)).unwrap_or(false)
+                            || scope_tree.method_defining_class.contains_key(&(cls.to_string(), aname.to_string()));
+                        return TypedValue { reg: if exists { "1" } else { "0" }.to_string(), ty: IrType::I64 };
+                    }
+                }
+            }
+        }
+        if trimmed.starts_with("getattr(") && trimmed.ends_with(')') && !scope_tree.known_functions.contains("getattr") {
+            let inner = trimmed[8..trimmed.len() - 1].trim();
+            let parts = OmniParser::split_respecting_quotes(inner, ',');
+            if parts.len() == 2 || parts.len() == 3 {
+                let obj_s = parts[0].trim();
+                let attr_s = parts[1].trim();
+                if let Some(b) = scope_tree.resolve(obj_s) {
+                    if b.type_hint.contains("omni_map") {
+                        let ld = format!("%ga_ld_{}", *temp_counter);
+                        let r = format!("%ga_r_{}", *temp_counter);
+                        *temp_counter += 2;
+                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", ld, b.llvm_ptr));
+                        let kp = self.eval_str_ptr(attr_s, ir, scope_tree, string_constants, temp_counter);
+                        let (d64, dtag) = if parts.len() == 3 {
+                            let ds = parts[2].trim();
+                            let dtv = self.eval_typed(ds, ir, scope_tree, string_constants, temp_counter);
+                            let tag = Self::infer_elem_tag_from_expr(ds, &dtv.ty, scope_tree);
+                            (self.coerce_to_raw_i64_bits(dtv, ir, temp_counter), Some(tag))
+                        } else {
+                            ("0".to_string(), None)
+                        };
+                        ir.push_str(&format!("  {} = call i64 @__omni_map_get_or(i8* {}, i8* {}, i64 {})\n", r, ld, kp, d64));
+                        return Self::unpack_raw_elem_bits(r, dtag.as_deref(), ir, temp_counter);
+                    }
+                    if b.type_hint.starts_with("%struct.") {
+                        let aname = attr_s.trim_matches('"').trim_matches('\'');
+                        let cls = b.type_hint.trim_start_matches("%struct.").trim_end_matches('*');
+                        let has_f = scope_tree.class_fields.get(cls).map(|m| m.contains_key(aname)).unwrap_or(false)
+                            || scope_tree.class_properties.get(cls).map(|s| s.contains(aname)).unwrap_or(false);
+                        if has_f {
+                            return self.eval_typed(&format!("{}.{}", obj_s, aname), ir, scope_tree, string_constants, temp_counter);
+                        } else if parts.len() == 3 {
+                            return self.eval_typed(parts[2].trim(), ir, scope_tree, string_constants, temp_counter);
+                        }
+                    }
+                }
+            }
         }
 
         // Polyglot string casts: Python `str(x)`, JS `String(x)`, Lua `tostring(x)`
@@ -6604,7 +7087,20 @@ impl<'a> CodeGenerator<'a> {
                             }
                             _ => {
                                 let v64 = self.coerce_to_i64(tv, ir, temp_counter);
-                                ir.push_str(&format!("  {} = icmp {} i64 {}, 0\n", cond_var, predicate, v64));
+                                let is_n = format!("%null_s1_{}", *temp_counter);
+                                let is_u = format!("%null_s2_{}", *temp_counter);
+                                *temp_counter += 2;
+                                if predicate == "eq" {
+                                    ir.push_str(&format!(
+                                        "  {} = icmp eq i64 {}, {}\n  {} = icmp eq i64 {}, {}\n  {} = or i1 {}, {}\n",
+                                        is_n, v64, OMNI_NULL_SENTINEL, is_u, v64, OMNI_UNSET_SENTINEL, cond_var, is_n, is_u
+                                    ));
+                                } else {
+                                    ir.push_str(&format!(
+                                        "  {} = icmp ne i64 {}, {}\n  {} = icmp ne i64 {}, {}\n  {} = and i1 {}, {}\n",
+                                        is_n, v64, OMNI_NULL_SENTINEL, is_u, v64, OMNI_UNSET_SENTINEL, cond_var, is_n, is_u
+                                    ));
+                                }
                             }
                         }
                         return cond_var;
@@ -6773,7 +7269,20 @@ impl<'a> CodeGenerator<'a> {
                     }
                     _ => {
                         let v64 = self.coerce_to_i64(tv, ir, temp_counter);
-                        ir.push_str(&format!("  {} = icmp {} i64 {}, 0\n", cond_var, predicate, v64));
+                        let is_n = format!("%null_s1_{}", *temp_counter);
+                        let is_u = format!("%null_s2_{}", *temp_counter);
+                        *temp_counter += 2;
+                        if predicate == "eq" {
+                            ir.push_str(&format!(
+                                "  {} = icmp eq i64 {}, {}\n  {} = icmp eq i64 {}, {}\n  {} = or i1 {}, {}\n",
+                                is_n, v64, OMNI_NULL_SENTINEL, is_u, v64, OMNI_UNSET_SENTINEL, cond_var, is_n, is_u
+                            ));
+                        } else {
+                            ir.push_str(&format!(
+                                "  {} = icmp ne i64 {}, {}\n  {} = icmp ne i64 {}, {}\n  {} = and i1 {}, {}\n",
+                                is_n, v64, OMNI_NULL_SENTINEL, is_u, v64, OMNI_UNSET_SENTINEL, cond_var, is_n, is_u
+                            ));
+                        }
                     }
                 }
                 return cond_var;
@@ -6865,7 +7374,16 @@ impl<'a> CodeGenerator<'a> {
                 ));
             }
             IrType::Ptr => {
-                ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", cond_var, tv.reg));
+                if Self::is_string_expr(trimmed, scope_tree) {
+                    let slen = format!("%str_tlen_{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!(
+                        "  {} = call i64 @__omni_str_len(i8* {})\n  {} = icmp ne i64 {}, 0\n",
+                        slen, tv.reg, cond_var, slen
+                    ));
+                } else {
+                    ir.push_str(&format!("  {} = icmp ne i8* {}, null\n", cond_var, tv.reg));
+                }
             }
             IrType::StructPtr(cls) => {
                 ir.push_str(&format!(
@@ -6876,7 +7394,15 @@ impl<'a> CodeGenerator<'a> {
             IrType::I1 => return tv.reg,
             _ => {
                 let v64 = self.coerce_to_i64(tv, ir, temp_counter);
-                ir.push_str(&format!("  {} = icmp ne i64 {}, 0\n", cond_var, v64));
+                let nz = format!("%tr_nz_{}", *temp_counter);
+                let nn = format!("%tr_nn_{}", *temp_counter);
+                let nu = format!("%tr_nu_{}", *temp_counter);
+                let n1 = format!("%tr_n1_{}", *temp_counter);
+                *temp_counter += 4;
+                ir.push_str(&format!(
+                    "  {} = icmp ne i64 {}, 0\n  {} = icmp ne i64 {}, {}\n  {} = icmp ne i64 {}, {}\n  {} = and i1 {}, {}\n  {} = and i1 {}, {}\n",
+                    nz, v64, nn, v64, OMNI_NULL_SENTINEL, nu, v64, OMNI_UNSET_SENTINEL, n1, nz, nn, cond_var, n1, nu
+                ));
             }
         }
         cond_var
@@ -7232,6 +7758,22 @@ impl<'a> CodeGenerator<'a> {
                                     ir.push_str(&format!("  store i64 {}, i64* {}\n", store_val, gep));
                                     continue;
                                 }
+                            } else if b.type_hint.contains("omni_map") {
+                                // Universal JS/Python-style object/map property assignment (`foo.name = val`)
+                                let tv = self.eval_typed(trimmed_expr, ir, scope_tree, string_constants, temp_counter);
+                                let elem_tag = Self::infer_elem_tag_from_expr(trimmed_expr, &tv.ty, scope_tree);
+                                let vkind = Self::elem_tag_to_map_kind(&elem_tag);
+                                let v64 = self.coerce_to_raw_i64_bits(tv, ir, temp_counter);
+                                let m_ld = format!("%map_ps_ld_{}", *temp_counter);
+                                *temp_counter += 1;
+                                ir.push_str(&format!("  {} = load i8*, i8** {}\n", m_ld, b.llvm_ptr));
+                                let kp = self.eval_str_ptr(&format!("\"{}\"", fld), ir, scope_tree, string_constants, temp_counter);
+                                ir.push_str(&format!(
+                                    "  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                    m_ld, kp, v64, vkind
+                                ));
+                                scope_tree.map_key_types.insert((rec.to_string(), fld.to_string()), elem_tag);
+                                continue;
                             }
                         }
                     }
@@ -8059,6 +8601,31 @@ impl<'a> CodeGenerator<'a> {
                                 ir.push_str(&format!("  store %struct.{}* {}, %struct.{}** {}\n", cls, tv.reg, cls, alloca_ptr));
                             }
                             IrType::Ptr => {
+                                if is_null_literal(trimmed_expr)
+                                    && existing_target.as_ref().map(|b| b.type_hint == "i64").unwrap_or(true)
+                                {
+                                    // Untyped `x = None / null / nil / undefined` -> uniform `OMNI_NULL_SENTINEL` in `i64` slot
+                                    // so `x is None` is distinct from `x == 0` / `x == false` and later `x = 42` stays valid.
+                                    let alloca_ptr = if let Some(eb) = existing_target {
+                                        eb.llvm_ptr
+                                    } else {
+                                        let ptr = format!("%var_{}_{}", target, *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = alloca i64\n", ptr));
+                                        scope_tree.insert(
+                                            target.clone(),
+                                            SymbolBinding {
+                                                name: target.clone(),
+                                                llvm_ptr: ptr.clone(),
+                                                type_hint: "i64".to_string(),
+                                                is_scoped: *is_scoped_decl,
+                                            },
+                                        );
+                                        ptr
+                                    };
+                                    ir.push_str(&format!("  store i64 {}, i64* {}\n", OMNI_NULL_SENTINEL, alloca_ptr));
+                                    continue;
+                                }
                                 if let Some((lam_ps, lam_body)) = OmniParser::try_parse_lambda_expr(trimmed_expr) {
                                     scope_tree.fn_param_defs.insert(target.clone(), lam_ps.clone());
                                     let mut lmap = Self::build_param_ir_types(&lam_ps, &scope_tree.class_fields);
@@ -8105,9 +8672,12 @@ impl<'a> CodeGenerator<'a> {
                                 } else if trimmed_expr.contains(".split(")
                                     || trimmed_expr.ends_with(".chars()")
                                     || trimmed_expr.ends_with(".toCharArray()")
+                                    || trimmed_expr.ends_with(".keys()")
                                     || (trimmed_expr.starts_with("list(") && trimmed_expr.ends_with(')'))
                                 {
                                     ("i8* (omni_slice)".to_string(), Some("str".to_string()))
+                                } else if trimmed_expr.ends_with(".values()") {
+                                    ("i8* (omni_slice)".to_string(), None)
                                 } else if let Ok(ast) = OmniParser::parse_expr(trimmed_expr) {
                                     if let ExprAst::Slice { ref target, .. } = ast.node {
                                         let ts = target.slice(trimmed_expr).trim();
@@ -8746,6 +9316,72 @@ impl<'a> CodeGenerator<'a> {
                             ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
                             ir.push_str(&format!("  call void @__omni_slice_print(i8* {})\n", loaded));
                             continue;
+                        }
+                        if b.type_hint.contains("omni_map") {
+                            let loaded = format!("%map_print_ld_{}", *temp_counter);
+                            *temp_counter += 1;
+                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                            ir.push_str(&format!("  call void @__omni_map_print(i8* {})\n", loaded));
+                            continue;
+                        }
+                    }
+                    // Runtime-tagged heterogeneous map lookup printing: `print(foo["id"])`, `print(foo["name"])`, `print(foo.name)`, `print(foo[0])`
+                    if let Ok(parsed_print) = OmniParser::parse_expr(clean_var) {
+                        match parsed_print.node {
+                            ExprAst::Index { ref target, ref index } => {
+                                let ts = target.slice(clean_var).trim();
+                                let ix = index.slice(clean_var).trim();
+                                if let Some(b) = scope_tree.resolve(ts) {
+                                    if b.type_hint.contains("omni_map") {
+                                        let loaded = format!("%map_pv_ld_{}", *temp_counter);
+                                        *temp_counter += 1;
+                                        ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                                        if (ix.starts_with('"') && ix.ends_with('"'))
+                                            || (ix.starts_with('\'') && ix.ends_with('\''))
+                                            || Self::is_string_expr(ix, scope_tree)
+                                        {
+                                            let kp = self.eval_str_ptr(ix, ir, scope_tree, string_constants, temp_counter);
+                                            ir.push_str(&format!(
+                                                "  call void @__omni_map_print_val(i8* {}, i8* {})\n",
+                                                loaded, kp
+                                            ));
+                                        } else {
+                                            let ktv = self.eval_typed(ix, ir, scope_tree, string_constants, temp_counter);
+                                            let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
+                                            ir.push_str(&format!(
+                                                "  call void @__omni_map_print_int_val(i8* {}, i64 {})\n",
+                                                loaded, k64
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            ExprAst::Member { ref target, ref field }
+                                if !matches!(field.as_str(), "length" | "Length" | "Count") =>
+                            {
+                                let ts = target.slice(clean_var).trim();
+                                if let Some(b) = scope_tree.resolve(ts) {
+                                    if b.type_hint.contains("omni_map") {
+                                        if let Some((const_name, len)) = Self::find_string_constant(string_constants, field) {
+                                            let loaded = format!("%map_pm_ld_{}", *temp_counter);
+                                            let str_ptr = format!("%str_ptr_{}", *temp_counter);
+                                            *temp_counter += 1;
+                                            ir.push_str(&format!("  {} = load i8*, i8** {}\n", loaded, b.llvm_ptr));
+                                            ir.push_str(&format!(
+                                                "  {} = getelementptr inbounds [{} x i8], [{} x i8]* {}, i64 0, i64 0\n",
+                                                str_ptr, len, len, const_name
+                                            ));
+                                            ir.push_str(&format!(
+                                                "  call void @__omni_map_print_val(i8* {}, i8* {})\n",
+                                                loaded, str_ptr
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
 
@@ -9458,10 +10094,11 @@ impl<'a> CodeGenerator<'a> {
                     if let Some((col_loaded, is_map_target)) = resolved_col {
                         let vtv = self.eval_typed(val_expr, ir, scope_tree, string_constants, temp_counter);
                         let val_etag = Self::infer_elem_tag_from_expr(val_expr, &vtv.ty, scope_tree);
+                        let val_kind = Self::elem_tag_to_map_kind(&val_etag);
                         if scope_tree.resolve(target).is_some()
                             && (val_etag != "i64" || !scope_tree.collection_elem_types.contains_key(target))
                         {
-                            scope_tree.collection_elem_types.insert(target.clone(), val_etag);
+                            scope_tree.collection_elem_types.insert(target.clone(), val_etag.clone());
                         }
                         let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
@@ -9471,6 +10108,7 @@ impl<'a> CodeGenerator<'a> {
                                 || (trimmed_idx.starts_with('\'') && trimmed_idx.ends_with('\''))
                             {
                                 let text = &trimmed_idx[1..trimmed_idx.len() - 1];
+                                scope_tree.map_key_types.insert((target.clone(), text.to_string()), val_etag);
                                 if let Some((const_name, len)) = Self::find_string_constant(string_constants, text) {
                                     let str_ptr = format!("%str_ptr_{}", *temp_counter);
                                     *temp_counter += 1;
@@ -9479,22 +10117,22 @@ impl<'a> CodeGenerator<'a> {
                                         str_ptr, len, len, const_name
                                     ));
                                     ir.push_str(&format!(
-                                        "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
-                                        col_loaded, str_ptr, val_64
+                                        "  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                        col_loaded, str_ptr, val_64, val_kind
                                     ));
                                 }
                             } else if Self::is_string_expr(trimmed_idx, scope_tree) {
                                 let str_ptr = self.eval_str_ptr(trimmed_idx, ir, scope_tree, string_constants, temp_counter);
                                 ir.push_str(&format!(
-                                    "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
-                                    col_loaded, str_ptr, val_64
+                                    "  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                    col_loaded, str_ptr, val_64, val_kind
                                 ));
                             } else {
                                 let idx_tv = self.eval_typed(index_expr, ir, scope_tree, string_constants, temp_counter);
                                 let idx_64 = self.coerce_to_i64(idx_tv, ir, temp_counter);
                                 ir.push_str(&format!(
-                                    "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
-                                    col_loaded, idx_64, val_64
+                                    "  call void @__omni_map_set_int_typed(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                    col_loaded, idx_64, val_64, val_kind
                                 ));
                             }
                         } else {
@@ -9531,33 +10169,36 @@ impl<'a> CodeGenerator<'a> {
                     let mut inferred_map_elem: Option<String> = None;
                     for (k, v) in entries {
                         let vtv = self.eval_typed(v, ir, scope_tree, string_constants, temp_counter);
+                        let vtag = Self::infer_elem_tag_from_expr(v, &vtv.ty, scope_tree);
+                        let vkind = Self::elem_tag_to_map_kind(&vtag);
                         if inferred_map_elem.is_none() {
-                            inferred_map_elem = Some(Self::infer_elem_tag_from_expr(v, &vtv.ty, scope_tree));
+                            inferred_map_elem = Some(vtag.clone());
                         }
                         let val_64 = self.coerce_to_raw_i64_bits(vtv, ir, temp_counter);
 
                         if let Some(int_str) = k.strip_prefix("\x01int:") {
                             let k64 = int_str.parse::<i64>().unwrap_or(0);
                             ir.push_str(&format!(
-                                "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
-                                map_res, k64, val_64
+                                "  call void @__omni_map_set_int_typed(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                map_res, k64, val_64, vkind
                             ));
                         } else if let Some(kb) = scope_tree.resolve(k) {
                             if is_string_type_hint(&kb.type_hint) {
                                 let kp = self.eval_str_ptr(k, ir, scope_tree, string_constants, temp_counter);
                                 ir.push_str(&format!(
-                                    "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
-                                    map_res, kp, val_64
+                                    "  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                    map_res, kp, val_64, vkind
                                 ));
                             } else {
                                 let ktv = self.eval_typed(k, ir, scope_tree, string_constants, temp_counter);
                                 let k64 = self.coerce_to_i64(ktv, ir, temp_counter);
                                 ir.push_str(&format!(
-                                    "  call void @__omni_map_set_int(i8* {}, i64 {}, i64 {})\n",
-                                    map_res, k64, val_64
+                                    "  call void @__omni_map_set_int_typed(i8* {}, i64 {}, i64 {}, i64 {})\n",
+                                    map_res, k64, val_64, vkind
                                 ));
                             }
                         } else if let Some((const_name, len)) = Self::find_string_constant(string_constants, k) {
+                            scope_tree.map_key_types.insert((target.clone(), k.clone()), vtag);
                             let str_ptr = format!("%str_ptr_{}", *temp_counter);
                             *temp_counter += 1;
                             ir.push_str(&format!(
@@ -9565,8 +10206,8 @@ impl<'a> CodeGenerator<'a> {
                                 str_ptr, len, len, const_name
                             ));
                             ir.push_str(&format!(
-                                "  call void @__omni_map_set(i8* {}, i8* {}, i64 {})\n",
-                                map_res, str_ptr, val_64
+                                "  call void @__omni_map_set_typed(i8* {}, i8* {}, i64 {}, i64 {})\n",
+                                map_res, str_ptr, val_64, vkind
                             ));
                         }
                     }
@@ -11250,6 +11891,26 @@ impl<'a> CodeGenerator<'a> {
                     sgep, clen, clen, cn, si64, sgep
                 ));
                 si64
+            } else if is_null_literal(dt) {
+                let th_is_ptr = clean_th
+                    .map(|th| {
+                        class_fields_map.contains_key(th)
+                            || is_string_type_hint(th)
+                            || th == "str"
+                            || th == "omni_kwargs"
+                            || th == "omni_varargs"
+                            || th.contains("slice")
+                            || th.contains("list")
+                            || th.contains("map")
+                            || th.contains("dict")
+                            || th.contains("chan")
+                    })
+                    .unwrap_or(false);
+                if th_is_ptr || th_is_float {
+                    "0".to_string()
+                } else {
+                    OMNI_NULL_SENTINEL.to_string()
+                }
             } else if let Some(iv) = Self::parse_default_i64(&param.default_val) {
                 if th_is_float
                     && !is_null_literal(dt)
@@ -11315,6 +11976,44 @@ impl<'a> CodeGenerator<'a> {
                         name: param.name.clone(),
                         llvm_ptr: ptr,
                         type_hint: format!("%struct.{}*", th),
+                        is_scoped: true,
+                    },
+                );
+                return;
+            }
+            if th == "omni_kwargs" || th == "dict" || th == "map" || th == "Map" || th == "HashMap" {
+                let mp = format!("%param_map_{}_{}", param.name, *temp_counter);
+                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+                *temp_counter += 2;
+                functions_ir.push_str(&format!(
+                    "  {} = inttoptr i64 {} to i8*\n  {} = alloca i8*\n  store i8* {}, i8** {}\n",
+                    mp, clean_reg, ptr, mp, ptr
+                ));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: "i8* (omni_map)".to_string(),
+                        is_scoped: true,
+                    },
+                );
+                return;
+            }
+            if th == "omni_varargs" {
+                let sp = format!("%param_va_{}_{}", param.name, *temp_counter);
+                let ptr = format!("%param_{}_{}", param.name, *temp_counter);
+                *temp_counter += 2;
+                functions_ir.push_str(&format!(
+                    "  {} = inttoptr i64 {} to i8*\n  {} = alloca i8*\n  store i8* {}, i8** {}\n",
+                    sp, clean_reg, ptr, sp, ptr
+                ));
+                scope_tree.insert(
+                    param.name.clone(),
+                    SymbolBinding {
+                        name: param.name.clone(),
+                        llvm_ptr: ptr,
+                        type_hint: "i8* (omni_slice)".to_string(),
                         is_scoped: true,
                     },
                 );
@@ -11850,10 +12549,17 @@ impl<'a> CodeGenerator<'a> {
         let mut method_defining_map: HashMap<(String, String), String> = HashMap::new();
         let mut method_return_types_map: HashMap<(String, String), IrType> = HashMap::new();
         let mut method_param_defs_map: HashMap<(String, String), Vec<omni_parser::ParamDef>> = HashMap::new();
+        let mut class_properties_map: HashMap<String, HashSet<String>> = HashMap::new();
         for cls in &module.structs_and_classes {
             let self_ft_opt = class_field_types_map.get(&cls.name);
             for m in &cls.methods {
                 method_defining_map.insert((cls.name.clone(), m.name.clone()), cls.name.clone());
+                if m.annotations.iter().any(|a| {
+                    let t = a.target_expr.trim();
+                    t == "property" || t == "cached_property" || t.ends_with(".property") || t.ends_with(".cached_property")
+                }) {
+                    class_properties_map.entry(cls.name.clone()).or_default().insert(m.name.clone());
+                }
                 let skip_n = if m
                     .params
                     .first()
@@ -11897,6 +12603,9 @@ impl<'a> CodeGenerator<'a> {
                             }
                             if let Some(base_pd) = method_param_defs_map.get(&(b.clone(), m.name.clone())).cloned() {
                                 method_param_defs_map.entry((cls.name.clone(), m.name.clone())).or_insert(base_pd);
+                            }
+                            if class_properties_map.get(&b).map(|s| s.contains(&m.name)).unwrap_or(false) {
+                                class_properties_map.entry(cls.name.clone()).or_default().insert(m.name.clone());
                             }
                         }
                         for bb in &base_cls.base_classes {
@@ -12172,6 +12881,7 @@ impl<'a> CodeGenerator<'a> {
                 scope_tree.class_field_types = class_field_types_map.clone();
                 scope_tree.class_field_order = class_field_order_map.clone();
                 scope_tree.class_decorators = class_decorators_map.clone();
+                scope_tree.class_properties = class_properties_map.clone();
                 scope_tree.class_type_ids = class_type_ids_map.clone();
                 scope_tree.c_module_aliases = c_module_aliases_set.clone();
                 scope_tree.valid_extmod_prefixes = valid_extmod_prefixes.clone();
@@ -12368,6 +13078,7 @@ impl<'a> CodeGenerator<'a> {
             scope_tree.class_field_types = class_field_types_map.clone();
             scope_tree.class_field_order = class_field_order_map.clone();
             scope_tree.class_decorators = class_decorators_map.clone();
+            scope_tree.class_properties = class_properties_map.clone();
             scope_tree.class_type_ids = class_type_ids_map.clone();
             scope_tree.c_module_aliases = c_module_aliases_set.clone();
             scope_tree.valid_extmod_prefixes = valid_extmod_prefixes.clone();
@@ -12587,6 +13298,7 @@ impl<'a> CodeGenerator<'a> {
         synth_scope.class_field_types = class_field_types_map.clone();
         synth_scope.class_field_order = class_field_order_map.clone();
         synth_scope.class_decorators = class_decorators_map.clone();
+        synth_scope.class_properties = class_properties_map.clone();
         synth_scope.class_type_ids = class_type_ids_map.clone();
         synth_scope.method_defining_class = method_defining_map.clone();
         synth_scope.method_param_defs = method_param_defs_map.clone();
