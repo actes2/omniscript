@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "omni_cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "omni_codegen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "omni_engine",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "omni_engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "omni_mem"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "omni_parser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "omni_mem",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "omni_preamble"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "omni_runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "omni_verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
