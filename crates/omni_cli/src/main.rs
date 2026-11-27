@@ -753,7 +753,16 @@ fn compile_source(
                         .with_platform(target_platform.clone());
                     let slice = driller.drill(&full_path);
                     for src in slice.local_sources {
-                        if !foreign_c_files.contains(&src) {
+                        let s_ext = src
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if s_ext == "h" || s_ext == "hpp" {
+                            if !all_dependency_files.contains(&src) {
+                                all_dependency_files.push(src);
+                            }
+                        } else if !foreign_c_files.contains(&src) {
                             foreign_c_files.push(src);
                         }
                     }

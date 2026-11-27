@@ -110,13 +110,41 @@ pub fn bitcode_bytes_to_ll_text(bc_bytes: &[u8], target_triple: &str) -> Result<
     ll
 }
 
-/// Lower `.c` / `.cc` / `.cpp` source directly to textual LLVM IR via `clang -S -emit-llvm -O2`.
+/// Lower `.c` / `.h` source directly to textual LLVM IR using OmniScript's pure-Rust C99
+/// frontend (zero `clang` required). Falls back to host `clang -S -emit-llvm -O2` only for
+/// C++ sources (`.cc`/`.cpp`/`.cxx`) or exotic GNU/MSVC extensions if `clang` is available.
 pub fn compile_c_source_to_ll_text(
     src_path: &Path,
     include_dirs: &[PathBuf],
     target_triple: &str,
 ) -> Result<String, String> {
-    let clang = find_clang_executable().ok_or("Clang compiler not found on host")?;
+    let ext = src_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_cpp = matches!(ext.as_str(), "cc" | "cpp" | "cxx" | "hpp");
+    let force_clang = std::env::var("OMNI_FORCE_CLANG_C_INGEST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let mut native_err: Option<String> = None;
+    if !is_cpp && !force_clang {
+        match super::c_frontend::compile_c_file_to_ll(src_path, include_dirs, target_triple) {
+            Ok(ll) => return Ok(ll),
+            Err(e) => native_err = Some(e),
+        }
+    }
+
+    let clang = match find_clang_executable() {
+        Some(c) => c,
+        None => {
+            return Err(native_err.unwrap_or_else(|| {
+                "Pure-Rust C99 frontend could not lower file and Clang compiler not found on host"
+                    .to_string()
+            }));
+        }
+    };
     let seq = IR_INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
     let out_ll = std::env::temp_dir().join(format!("omni_csrc_{}_{}.ll", std::process::id(), seq));
 

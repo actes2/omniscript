@@ -1,5 +1,6 @@
 pub mod arm64;
 pub mod binfmt;
+pub mod c_frontend;
 pub mod ext_abi;
 pub mod ir_ingest;
 pub mod x86_64;
@@ -409,8 +410,19 @@ pub fn ingest_and_splice_c_dependencies(
         &spliced_blocks,
     );
 
-    // Prune fully internalized C artifacts from `foreign_c_files` so ZERO external `.so`/`.dll`/`.dylib`/`.a` is linked!
-    foreign_c_files.retain(|f| !report.internalized_files.contains(f));
+    // Prune fully internalized C artifacts from `foreign_c_files` so ZERO external `.so`/`.dll`/`.dylib`/`.a`/`.c` is linked!
+    let canon_internalized: HashSet<PathBuf> = report
+        .internalized_files
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    foreign_c_files.retain(|f| {
+        if report.internalized_files.contains(f) {
+            return false;
+        }
+        let cf = fs::canonicalize(f).unwrap_or_else(|_| f.clone());
+        !canon_internalized.contains(&cf)
+    });
 
     report
 }
