@@ -10,7 +10,7 @@ It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **G
 OmniScript lowers directly to **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution; **completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
 
 ____
-#### Check out our latest [major release here!](https://github.com/actes2/omniscript/releases/v0.3.0)
+#### Check out our latest [major release here (`v0.4.0`)!](https://github.com/actes2/omniscript/releases/tag/v0.4.0)
 ____
 
 ## What is OmniScript?
@@ -36,31 +36,36 @@ def main():
 > *test.omni*
 
 and invoke it with:
+`omnic run ./test.omni` (zero external compilers required — verified & JIT-executed in-process via Cranelift!)
+or compile a standalone native binary with:
 `omnic build ./test.omni -o test && ./test`
 
-Make sure you have `Clang` installed on your system!
-
-* `pacman -S clang`
-* `apt install clang`
-* `brew install llvm`
-
-Or for windows folks:
-Make sure you've installed `clang.exe` and its available in your `%PATH%`
+> **Zero-Clang Core**: `omnic run`, `omnic repl`, `omnic check`, and bare-metal `--platform pico*` firmware builds require - IR verification, JIT execution, and Cortex-M Thumb-2 codegen all run natively in-process. A system C linker (`cc` / `gcc` / `clang`) is only used when `omnic build` links a desktop executable against host C shared libraries.
 
 ___
 #### What OmniScript Actually Compiles Today (Beyond Syntax Mixing)
 Unlike other compilers or frameworks aiming to map across ecosystems, we don't embed other compilers or shims. We focus entirely on, converting **your instructions** to LLVM, in any way possible. This is done through clever parsing and mixing of different lexicological algorithms to infer syntax intent based on a magnitude of languages
 * **Dependency Carving:**
-`omni_preamble` statically traces reachable call spines across **C/C++**, **Python**, **Go**, **Rust**, **Java/JVM Bytecode**, **JavaScript/TypeScript**, **C#**, and **Lua** (plus procedural idioms from Zig, Julia, Nim, Ruby, Kotlin, and Swift), dead-stripping 99%+ of unused package code and compiling the surviving cross-language graph into **one single LLVM IR translation unit** (`clang -O2` inlines across Python, Go, and C simultaneously, linking only the OS syscall libc).
+`omni_preamble` statically traces reachable call spines across **C/C++**, **Python**, **Go**, **Rust**, **Java/JVM Bytecode**, **JavaScript/TypeScript**, **C#**, and **Lua** (plus procedural idioms from Zig, Julia, Nim, Ruby, Kotlin, and Swift), dead-stripping 99%+ of unused package code and compiling the surviving cross-language graph into **one single LLVM IR translation unit** lowered natively by Cranelift (or our pure-Rust Cortex-M backend).
 > We basically drill through every dependency chain until we find the lowest level possible and translate back-up the 'spine' the intentions of those dependencies; which are converted to LLVM IR
 
 - **Direct Cross-ISA / Cross-OS C Binary Lifting (`c_lifter`)**: Lifts precompiled C objects, static archives, and shared libraries (`ELF`, `Mach-O` thin & universal, `PE/COFF`, `.a`, `.lib`, `Wasm`, `.bc`/`.ll`) across `x86_64`, `AArch64`, `RISC-V 64`, and `Wasm32` directly into target-neutral LLVM IR.
 
 > Omnic is notoriously good at consuming C into LLVM IR
 
-- **Zero-Toolchain Bare-Metal ARM Cortex-M & PIO Firmware (`--platform rp2040` / `rp2350`)**: Emits flashable `.uf2` and `.elf` microcontroller firmware for Raspberry Pi Pico / Pico 2 W (including inline `.pio` state-machine assembly) using a pure-Rust Thumb-1/Thumb-2 backend—zero `arm-none-eabi-gcc`, `clang`, `lld`, `cmake`, or `pioasm` required.
+- **Zero-Toolchain Bare-Metal ARM Cortex-M, Wi-Fi/TCP/WebSocket & PIO Firmware (`--platform pico` / `picow` / `pico2` / `pico2w`)**: Emits flashable `.uf2` and `.elf` microcontroller firmware for Raspberry Pi Pico / Pico 2 W—including inline `.pio` state-machine assembly, USB CDC-ACM (`/dev/ttyACM0`) with hands-free 1200-baud BOOTSEL, and a self-hosted OmniScript CYW43439 Wi-Fi / DHCP / ICMP / raw TCP / RFC 6455 WebSocket stack—using a pure-Rust Thumb-1/Thumb-2 backend with zero `arm-none-eabi-gcc`, `clang`, `lld`, `cmake`, or `pico-sdk` required.
 
-- **Abductive Semantic Verification & Known Frontier Boundaries**: Lowered blocks are checked against both Clang SSA/type verification and a **Semantic Obligation Ledger** (live-operand dataflow, destination stores, and proof-bearing abductive diagnostics with edit-distance symbol evidence rather than silent no-op fallbacks). Active frontier limitations include mutable heap-captured closures, dynamic trait vtables, and CPython C-API extension `.so` modules.
+- **Self-Hosting Multi-Architecture Compiler (`bootstrap/omnic_stage1.omni`)**: OmniScript compiles itself to a 3-stage bit-identical fixpoint (`Stage-2 === Stage-3`) with `0` LLM sites and emits **7 target formats** directly from OmniScript with zero external assembler/toolchain dependencies:
+  - `.obc` (`OBC1` portable bytecode)
+  - `.o` (`ELF64` `x86_64` relocatable object)
+  - `.elf` (standalone zero-`cc` / zero-`libc` Linux `x86_64` executable)
+  - `.arm64.o` (`ELF64` `AArch64` relocatable object — Canadian-cross `x86_64` <-> `AArch64` bit-identical fixpoint verified live)
+  - `.exe` (standalone zero-MinGW Windows `x86_64` PE32+ executable)
+  - `.macho.o` (Apple Silicon `arm64` Mach-O relocatable object)
+  - `.uf2` (bare-metal RP2350 Thumb-2 firmware)
+  - Paired with a pure-OmniScript **GGUF v3 binary reader & `Q4_K`/`f16` dequantizer** ([`bootstrap/omni_gguf.omni`](./bootstrap/omni_gguf.omni)) and a **freestanding zero-`libc` Linux `x86_64` syscall runtime** ([`bootstrap/omni_rt_linux.omni`](./bootstrap/omni_rt_linux.omni)).
+
+- **Abductive Semantic Verification & Known Frontier Boundaries**: Lowered blocks are checked against both Cranelift/Clang SSA verification and a **Semantic Obligation Ledger** (live-operand dataflow, destination stores, and proof-bearing abductive diagnostics with edit-distance symbol evidence rather than silent no-op fallbacks). Active frontier limitations include mutable heap-captured closures, dynamic trait vtables, and CPython C-API extension `.so` modules.
 ___
 ### Background
 OmniScript is a language I wrote over a weekend, after considering the paradigm of: *"What if I could just put python, into my Go, and Java, and C, and Rust, and Javascript"* 
@@ -114,10 +119,9 @@ We get to run through a whole host of different mechanisms to try and infer what
 > These overly verbose comments on this *IR Contract* are what we 'tell' the LLM ahead of schedule to help in it's inference **when creating the LLVM Instructions**
 > > At the moment, we do not batch these tasks, we just sequentially hand them off down the line to the LLM; though I have plans of introducing batching in the future and this comment will be dated.
 
-During this task-processing portion we do a *lot of things*, one of those things is the LLM tests the LLVM code against CLANG to make sure things compile right, then if it doesn't it reads the failure and tries to fix it 2 more times (failing with a proper English result on why it was stumped if it completely gives up)
+During this task-processing portion we do a *lot of things*, one of those things is the LLM tests the synthesized IR against our in-process Cranelift IR verifier to make sure things lower cleanly, then if it doesn't it reads the failure and tries to fix it 2 more times (failing with a proper English result on why it was stumped if it completely gives up).
 
-Afterwards we walk through all the 'tasks' delegated to the LLM, we end up with a fully functional LLVM-glomp that we save in `./omnicache/llvm.ll` this serves as a cache to help with recompilation.
-Clang then ingests the `.ll` and includes any `.so` shared objects or `.a` static archives; along with any identified C source files that the `omni_preamble` found during it's hunt through imports.
+Afterwards we walk through all the 'tasks' delegated to the LLM, we end up with a fully functional LLVM IR module that we cache under `.omnicache/` for fast recompilation. For `omnic run`, Cranelift JIT-compiles and executes it directly in memory; for `omnic build`, Cranelift emits native object code (or our pure-Rust Cortex-M backend emits `.uf2`/`.elf` directly) and links any `.so`/`.a` dependencies discovered by `omni_preamble`.
 
 Finally, we link against:
 * `omni_fiber.c` for our assembly fibers
@@ -136,7 +140,7 @@ Finally, we link against:
 3. **Pure-Rust In-Process Archive Engine**: All tarball (`.crate`, `.tar.gz`, `.tgz`) and ZIP (`.whl`, `.jar`, `.nupkg`) extraction is executed directly in compiler memory via `flate2`, `tar`, and `zip`. Zero reliance on host CLI utilities (`tar`, `unzip`, `curl`, `powershell`).
 4. **Deterministic Zero-GC Systems Runtime**: Zero tracing garbage collection overhead. Memory is managed via **Unified Memory Operations (UMO)**, per-request monotonic **Scope Arenas** (`omni_arena.c`) with $O(1)$ bulk resets, and deterministic **RAII scope destruction** for slices, Robin Hood hash maps, and channels.
 5. **Cross-Platform Systems Portability**: Native execution across **Linux** (`x86_64`, `aarch64`), **macOS** (Apple Silicon `arm64-apple-darwin` and Intel `x86_64-apple-darwin`), and **Windows** (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`). Hand-rolled naked assembly context switches for System V (x86_64) and AAPCS64 (ARM64), dual-path POSIX/Windows virtual memory guard pages (`mprotect` / `VirtualProtect`), and Winsock2 socket boundaries.
-6. **Physical Source Interpretive Anchoring & Local AI Lowering**: Ambiguous polyglot idioms (`:=`, `=>`, dynamic duck-typing) are preserved in non-destructive Dual-Representation AST nodes, packed into **SSA Context Envelopes** (`<omni_ir_task>`), and lowered via an in-process 1.5B Candle GGUF model backed by an in-memory Clang self-repair loop.
+6. **Physical Source Interpretive Anchoring & Local AI Lowering**: Ambiguous polyglot idioms (`:=`, `=>`, dynamic duck-typing) are preserved in non-destructive Dual-Representation AST nodes, packed into **SSA Context Envelopes** (`<omni_ir_task>`), and lowered via an in-process 1.5B GGUF model backed by an in-memory Cranelift IR self-repair loop.
 
 ---
 
@@ -154,10 +158,10 @@ flowchart TD
     PARSER --> MEM["omni_mem<br/>(UMO Normalization & Autonomous Borrow Audit)"]
     MEM --> CODEGEN["omni_codegen<br/>(Monomorphized Structs, Jump Tables, ScopeTree RAII)"]
     
-    PARSER -. "Ambiguous Idioms / Anchors" .-> ENG["omni_engine<br/>(SSA Context Envelopes & Candle GGUF Lowering)"]
+    PARSER -. "Ambiguous Idioms / Anchors" .-> ENG["omni_engine<br/>(SSA Context Envelopes & Native GGUF Lowering)"]
     ENG -. "Synthesized LLVM IR Blocks" .-> CODEGEN
     
-    CODEGEN --> VERIFY["omni_verify<br/>(Clang Diagnostic & LLVM Type Verifier)"]
+    CODEGEN --> VERIFY["omni_verify<br/>(In-Process Cranelift IR Verifier & Cortex-M Backend)"]
     VERIFY --> JIT["In-Memory JIT Execution<br/>(omnic run / omnic repl)"]
     VERIFY --> AOT["Native ELF / Mach-O / PE Binary<br/>(omnic build)"]
     
@@ -176,8 +180,8 @@ The OmniScript compiler workspace is structured into modular Rust crates and an 
 | **`omni_mem`** | [`crates/omni_mem`](./crates/omni_mem) | Autonomous lifetime auditor and memory normalizer. Enforces static borrow disciplines and validates ownership lifecycles via `UnifiedMemOp`. |
 | **`omni_parser`** | [`crates/omni_parser`](./crates/omni_parser) | Polyglot parser supporting Rust `struct`, `impl`, `enum`, and `match`; Go walrus declarations (`:=`) and channel primitives (`<-`); Python indentation, classes, and decorators (`@app.route`). |
 | **`omni_runtime`** | [`crates/omni_runtime`](./crates/omni_runtime) | Statically-linked C systems runtime: cooperative fibers (AAPCS64 & System V AMD64), MPMC channels, zero-GC slices, Robin Hood hash maps, raw OS socket syscalls, and arena-backed allocators (`omni_arena.c`). Dynamically resolves host target triples. |
-| **`omni_verify`** | [`crates/omni_verify`](./crates/omni_verify) | Clang/LLVM validation subsystem. Cross-platform toolchain discovery (Linux, Homebrew macOS, Windows LLVM), in-memory JIT runners (`run_jit`, `run_jit_captured`), and native linker drivers. |
-| **`omni_engine`** | [`crates/omni_engine`](./crates/omni_engine) | SSA Context Envelope generator, in-process Candle GGUF inference engine, Clang self-repair loop with Attempt 1 failover, and synthetic training dataset generator. |
+| **`omni_verify`** | [`crates/omni_verify`](./crates/omni_verify) | Zero-`clang` in-process Cranelift SSA verifier, JIT runner (`run_jit`, `run_jit_captured`), native object emitter, linker driver, and pure-Rust Cortex-M Thumb-1/Thumb-2 `.uf2`/`.elf` backend. |
+| **`omni_engine`** | [`crates/omni_engine`](./crates/omni_engine) | SSA Context Envelope generator, zero-Candle pure-Rust GGUF inference engine (AVX2/NEON `Q4_K`/`Q6_K`), Cranelift self-repair loop with Attempt 1 failover, and synthetic training dataset generator. |
 | **`omni_codegen`** | [`crates/omni_codegen`](./crates/omni_codegen) | LLVM IR emitter with lexical `ScopeTree`, string interning, tagged union switch jump tables, static devirtualized method calls, and RAII `CleanupOp` lifecycle management. |
 | **`omni_cli`** | [`crates/omni_cli`](./crates/omni_cli) | CLI compiler driver (`omnic`) implementing `build`, `run`, `install`, `repl`, and `export-dataset`. Incorporates BLAKE3 bitcode caching keyed on host target triple. |
 
@@ -226,29 +230,33 @@ omnic build --auto-resolve-dependencies app.omni -o app_bin
 > [!TIP]
 > **Zero-Sourcing `oenv`**: You never need to run `source oenv/bin/activate`. `omnic run` and `omnic build` automatically scan for `./oenv` or `./.oenv` in the project root, giving its packages and git clones strict priority over local paths and host caches (defaulting as an `OR` fall-through).
 
-### Build Native Standalone Binary
-Compiles source into a standalone executable linked against the host target triple:
+### Build Native Standalone Binary or Bare-Metal Pico Firmware
+Compiles source into a standalone executable linked against the host target triple, or directly to bare-metal `.uf2` + `.elf` firmware:
 ```bash
 omnic build examples/rust_structs_and_enums.omni -o rust_structs_bin
 ./rust_structs_bin
+
+# Bare-metal Raspberry Pi Pico 2 W (zero external ARM toolchain)
+omnic build --platform pico2w examples/pico2w_blink/blink_pico2w.omni -o blink_pico2w.uf2
 ```
 
-### Direct JIT Execution
-Directly compiles to LLVM IR, verifies the module via Clang, and executes in-memory:
+### Direct JIT Execution & Static Diagnostics
+Directly compiles and executes in-memory, or runs fast static polyglot checking (including JSON output for Vim & VS Code extensions):
 ```bash
 omnic run examples/channel_concurrency.omni
+omnic check --json app.omni
 ```
 
-### Interactive Polyglot REPL
-Launches an interactive REPL maintaining active lexical bindings and evaluating polyglot statements incrementally:
+### Interactive Multi-Line Polyglot REPL
+Launches an interactive REPL maintaining active lexical bindings and evaluating multi-line polyglot blocks incrementally:
 ```bash
-cargo run -q -p omni_cli -- repl
+omnic repl
 ```
 
-### Synthetic Training Dataset Exporter
-Generates verified paired datasets (`<omni_ir_task>` XML micro-tags paired with verified LLVM IR basic blocks) for fine-tuning the 1.5B student model:
+### Synthetic Dataset Generation & Retraining
+Generates Cranelift-verified `<omni_ir_task>` + ORPO contrastive training datasets for the local 1.5B `omni-coder.gguf` model (with standalone GPU bootstrapper in [`scripts/setup_and_train_gpu.sh`](./scripts/setup_and_train_gpu.sh)):
 ```bash
-cargo run -q -p omni_cli -- export-dataset --count 500 --output datasets/training_pairs.jsonl
+omnic synth-dataset --count 6000 --output tests/outputs/synthetic_training_dataset.jsonl
 ```
 
 ---
@@ -514,10 +522,22 @@ Runs all 8 language modules (Python, JavaScript, Rust, Go, C, Java, C#, Lua) and
 cargo test --test test_polyglot_matrix -- --test-threads=1
 ```
 
-### 3. Full Workspace Test Suite
-Execute the entire test suite across all crates:
+### 3. Self-Hosting & Multi-Arch Litmus Suite (`scripts/litmus_multiarch.sh`)
+Verifies the RP2350 `ThumbCpuEmu` proof, the 15-proof 3-stage self-hosting bootstrap gate (`.obc`, `x86_64` `.o`/`.elf`, `AArch64` `.o`, Win64 Wine `.exe`, Apple Silicon Mach-O `.o`, RP2350 `.uf2`, `f64`/maps/Python syntax), and live Docker `linux/arm64` Canadian-cross fixpoint:
 ```bash
-cargo test --all -- --test-threads=1
+./scripts/litmus_multiarch.sh
+```
+
+### 4. Polyglot Hardening Matrix & Core Release Suites
+Runs the 7-file cross-ecosystem hardening matrix (up to 7 simultaneous ecosystems in a single binary) and all core crate unit tests in `--release`:
+```bash
+cargo test --release -p omni_parser --lib && \
+cargo test --release -p omni_preamble --lib && \
+cargo test --release -p omni_codegen --lib && \
+cargo test --release -p omni_engine --lib && \
+cargo test --release -p omni_verify --lib
+
+cargo test --release -p omni_cli --test test_hardening_matrix
 ```
 
 ---
@@ -540,6 +560,7 @@ Comprehensive technical whitepapers and specifications are cataloged in [`docs/`
 | [`docs/STOLEN_COMPILER_CONCEPTS.md`](./docs/STOLEN_COMPILER_CONCEPTS.md) | Borrowed compiler paradigms synthesized from Zig, Rust, Go, Mojo, and Swift. |
 | [`docs/SYNTAX_SPEC_AND_EXAMPLES.md`](./docs/SYNTAX_SPEC_AND_EXAMPLES.md) | Grammar specification, operator disambiguation, and multi-syntax examples. |
 | [`docs/POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md`](./docs/POLYGLOT_PARADIGM_QUIRKS_AND_CANONICALIZATION.md) | Edge-case handling across language semantics and syntax normalization. |
+| [`AGENTS.md`](./AGENTS.md) | Engineering operating guide, universal dynamism PR policy, Cortex-M bare-metal playbook, and LLM retraining workflow. |
 | [`docs/GPU_TRAINING_WORKFLOW.md`](./docs/GPU_TRAINING_WORKFLOW.md) | Fine-tuning and distillation pipeline for the local compiler model. |
 
 ---
