@@ -10,7 +10,7 @@ It unifies syntax, idioms, and package ecosystems from **Rust**, **Python**, **G
 OmniScript lowers directly to **LLVM IR**, native ELF/Mach-O/PE executables, and in-memory JIT execution; **completely eliminating tracing garbage collectors** and without delegating to foreign host compilers (`rustc`, `javac`, `python`, `node`, `go`).
 
 ____
-#### Check out our latest [major release here (`v0.4.0`)!](https://github.com/actes2/omniscript/releases/tag/v0.4.0)
+#### Check out our latest [major release here (`v0.4.0`)!](https://github.com/actes2/omnic/releases/tag/v0.4.0)
 ____
 
 ## What is OmniScript?
