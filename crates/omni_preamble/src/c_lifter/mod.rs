@@ -513,7 +513,7 @@ fn compute_lifted_cache_key(
     ret_hints: &HashMap<String, CReturnHint>,
 ) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"omni_c_lifter_v1");
+    h.update(b"omni_c_lifter_v2");
     h.update(path.to_string_lossy().as_bytes());
     h.update(&img.image_bytes);
     for (sym, vma) in matched_entries {

@@ -769,6 +769,50 @@ pub fn rectify_omni_call_line(line: &str) -> String {
     s
 }
 
+/// Rectifies hallucinated `@__omni_fn_<stem>` calls that are NOT declared user functions
+/// in the current module's carved function table, mapping them via `FUZZY_STEM_MAP` to
+/// their canonical universal runtime intrinsic (e.g. `@__omni_fn_GetInt32` -> `@__omni_random_range`).
+pub fn rectify_undeclared_fn_prefix_calls(
+    ir: &str,
+    import_chain: &[String],
+    enclosing_fn: &str,
+) -> String {
+    let mut carved_fns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    carved_fns.insert(enclosing_fn);
+    for imp in import_chain {
+        if let Some(fn_name) = imp.strip_prefix("__OMNI_CARVED_FN__:") {
+            carved_fns.insert(fn_name);
+        }
+    }
+
+    let mut out = String::with_capacity(ir.len());
+    for line in ir.lines() {
+        let mut updated = line.to_string();
+        if updated.contains("call ") {
+            if let Some(at_idx) = updated.find("@__omni_fn_") {
+                let after_at = &updated[at_idx + 1..];
+                if let Some(lparen_rel) = after_at.find('(') {
+                    let sym_name = after_at[..lparen_rel].trim().to_string();
+                    if let Some(bare_name) = sym_name.strip_prefix("__omni_fn_") {
+                        if !carved_fns.contains(bare_name) {
+                            let lower = bare_name.to_lowercase();
+                            if let Some((_, target_sym)) = FUZZY_STEM_MAP
+                                .iter()
+                                .find(|(stems, _)| stems.iter().any(|stem| lower.contains(stem)))
+                            {
+                                updated = updated.replacen(&sym_name, target_sym, 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(&updated);
+        out.push('\n');
+    }
+    out
+}
+
 /// Strips markdown fences, natural language chat, and trims lines to pure LLVM IR
 pub fn sanitize_llvm_ir(raw: &str) -> String {
     let mut out = String::new();
@@ -1455,6 +1499,11 @@ impl<'a> InferenceEngine for VerifiedSynthesisEngine<'a> {
             sanitized = Self::alpha_rename_internal_labels(
                 &sanitized,
                 envelope.anchor_id.unwrap_or(envelope.next_ssa_idx),
+            );
+            sanitized = rectify_undeclared_fn_prefix_calls(
+                &sanitized,
+                &envelope.import_chain,
+                &envelope.enclosing_fn,
             );
 
             // Check if Attempt 0 from the AI satisfied the extracted frontier dataflow obligations.

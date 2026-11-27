@@ -151,10 +151,12 @@ pub enum BinaryLoadOutcome {
 
 pub fn normalize_ext_sym_name(raw: &str) -> String {
     let mut s = raw.trim();
+    let mut has_elf_version = false;
     // Strip ELF symbol version suffix (`memcpy@@GLIBC_2.14` or `malloc@GLIBC_2.2.5`)
     if let Some(at_idx) = s.find('@') {
         if at_idx > 0 {
             s = &s[..at_idx];
+            has_elf_version = true;
         }
     }
     // Strip PE `__imp_` prefix
@@ -162,12 +164,19 @@ pub fn normalize_ext_sym_name(raw: &str) -> String {
         s = rest;
     }
     // Strip Mach-O single leading underscore on standard C/libc names (`_malloc` -> `malloc`,
-    // `___assert_rtn` -> `__assert_rtn`, `___chkstk_darwin` -> `__chkstk_darwin`)
-    if s.starts_with("___") {
-        s = &s[1..];
-    } else if let Some(rest) = s.strip_prefix('_') {
-        if !rest.starts_with('_') && !rest.is_empty() {
-            s = rest;
+    // `___assert_rtn` -> `__assert_rtn`, `___chkstk_darwin` -> `__chkstk_darwin`).
+    // Never strip on ELF versioned symbols (`_Exit@GLIBC_2.2.5`) or ISO C99 / POSIX
+    // single-underscore libc symbols (`_Exit`, `_exit`, `_setjmp`, `_longjmp`).
+    const PRESERVE_SINGLE_UNDERSCORE: &[&str] = &[
+        "_Exit", "_exit", "_setjmp", "_longjmp", "_tolower", "_toupper",
+    ];
+    if !has_elf_version && !PRESERVE_SINGLE_UNDERSCORE.contains(&s) {
+        if s.starts_with("___") {
+            s = &s[1..];
+        } else if let Some(rest) = s.strip_prefix('_') {
+            if !rest.starts_with('_') && !rest.is_empty() {
+                s = rest;
+            }
         }
     }
     s.to_string()

@@ -33,23 +33,76 @@ curl -fSL "$SERVER_URL/bundle.tar.gz" -o omni_retrain_bundle.tar.gz
 tar -xzf omni_retrain_bundle.tar.gz
 ls -lh train_omni_model.py synthetic_training_dataset.jsonl imatrix_calib.txt
 
-echo "[2/7] Creating isolated Python virtual environment (./venv) ..."
-if [ ! -d venv ]; then
-    python3 -m venv venv
+echo "[2/7] Selecting compatible Python (3.10-3.12) & creating ./venv ..."
+PY_BIN=""
+for cand in python3.12 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        VER="$("$cand" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        MINOR="$("$cand" -c 'import sys; print(sys.version_info.minor)')"
+        if [ "$MINOR" -ge 10 ] && [ "$MINOR" -le 12 ]; then
+            PY_BIN="$cand"
+            echo "  -> Using $PY_BIN (Python $VER)"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PY_BIN" ]; then
+    HOST_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
+    echo "  -> Host python3 is $HOST_VER (PyTorch CUDA wheels require 3.10-3.12); bootstrapping standalone Python 3.12 via uv (zero sudo)..."
+    if ! command -v uv >/dev/null 2>&1; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    fi
+    if [ ! -x venv/bin/python3 ] || ! venv/bin/python3 -c 'import sys; raise SystemExit(0 if 10 <= sys.version_info.minor <= 12 else 1)' 2>/dev/null; then
+        rm -rf venv
+        uv venv --python 3.12 --seed venv
+    fi
+else
+    if [ ! -d venv ]; then
+        "$PY_BIN" -m venv venv
+    fi
 fi
+
 # shellcheck disable=SC1091
 source venv/bin/activate
+python3 --version
 pip install --upgrade pip wheel setuptools
 
 echo "[3/7] Installing PyTorch (auto-detecting CUDA) + HF/TRL/GGUF stack ..."
 if command -v nvidia-smi >/dev/null 2>&1; then
     echo "  -> NVIDIA GPU detected:"
     nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
-    pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    TORCH_OK=0
+    for idx in \
+        "https://download.pytorch.org/whl/cu128" \
+        "https://download.pytorch.org/whl/cu126" \
+        "https://download.pytorch.org/whl/cu124" \
+        "https://download.pytorch.org/whl/cu121" \
+        ""; do
+        if [ -n "$idx" ]; then
+            echo "  -> Trying PyTorch index: $idx"
+            if pip install --upgrade torch torchvision torchaudio --index-url "$idx"; then
+                TORCH_OK=1
+                break
+            fi
+        else
+            echo "  -> Trying default PyPI PyTorch wheel"
+            if pip install --upgrade torch torchvision torchaudio; then
+                TORCH_OK=1
+                break
+            fi
+        fi
+    done
+    if [ "$TORCH_OK" -ne 1 ]; then
+        echo "ERROR: Could not install PyTorch for $(python3 --version) on $(uname -m)"
+        exit 1
+    fi
 else
     echo "  -> No nvidia-smi found; installing standard PyTorch"
     pip install --upgrade torch
 fi
+python3 -c 'import torch; dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"; print("  -> PyTorch", torch.__version__, "| CUDA:", torch.cuda.is_available(), "| Device:", dev)'
 pip install --upgrade \
     transformers \
     datasets \

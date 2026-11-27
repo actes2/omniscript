@@ -1630,14 +1630,36 @@ mod tests {
             return;
         }
 
-        let prompt = "<omni_ir_task>\n  <target_abi>x86_64-pc-linux-gnu</target_abi>\n  <platform_abi>input=call i8* @__omni_input(i8* null)</platform_abi>\n  <function name=\"main\" ret=\"i32\"/>\n  <next_ssa_idx>5</next_ssa_idx>\n  <intent>Console.ReadLine()</intent>\n</omni_ir_task>\n";
+        let env = crate::SsaContextEnvelope {
+            target_abi: "x86_64-pc-linux-gnu".to_string(),
+            enclosing_fn: "main".to_string(),
+            return_type: "i32".to_string(),
+            next_ssa_idx: 5,
+            active_symbols: vec![crate::SsaVariable {
+                name: "line".to_string(),
+                llvm_name: "%var_line_1".to_string(),
+                type_hint: "i8*".to_string(),
+            }],
+            struct_definitions: vec![],
+            raw_intent: "line = Console.ReadLine()".to_string(),
+            idiom_hint: Some("ForeignModuleAssignment".to_string()),
+            ecosystem_context: Some("csharp (module: System)".to_string()),
+            import_chain: vec![],
+            physical_source: Some("line = Console.ReadLine()".to_string()),
+            anchor_id: None,
+            concurrency_mode: None,
+            yield_expectation: None,
+            action_directive: None,
+            lifetime_context: None,
+        };
+        let prompt = env.to_prompt_micro_tags();
 
         let t0 = Instant::now();
         let model = NativeGgufModel::from_file(&model_path).expect("Native GGUF load");
         let native_load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let prompt_ids = model.tokenizer.encode(prompt);
-        let mut kv = NativeKvCache::new(&model.config, prompt_ids.len() + 32);
+        let prompt_ids = model.tokenizer.encode(&prompt);
+        let mut kv = NativeKvCache::new(&model.config, prompt_ids.len() + 64);
 
         let t_prefill = Instant::now();
         let logits = model.forward_prefill_batch(&prompt_ids, 0, &mut kv);
@@ -1646,7 +1668,7 @@ mod tests {
         let t_gen = Instant::now();
         let mut gen_ids = Vec::new();
         let mut next_tok = NativeGgufModel::argmax(&logits);
-        for step in 0..24 {
+        for step in 0..48 {
             if next_tok == model.config.eos_token_id {
                 break;
             }
