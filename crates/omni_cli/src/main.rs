@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
                         .iter()
                         .map(|s| std::ffi::CString::new(s.as_str()).unwrap_or_else(|_| std::ffi::CString::new("").unwrap()))
                         .collect();
-                    let mut ptrs: Vec<*const i8> = cstrings.iter().map(|c| c.as_ptr()).collect();
+                    let mut ptrs: Vec<*const std::ffi::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
                     ptrs.push(std::ptr::null());
                     vm.call_by_name("main", &[cstrings.len() as u64, ptrs.as_ptr() as u64])? as i32
                 } else {
